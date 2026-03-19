@@ -33,13 +33,13 @@ function Read-State {
   return $null
 }
 
-function Test-ProcessAlive([object]$Pid) {
-  if (-not $Pid) {
+function Test-ProcessAlive([object]$ProcessId) {
+  if (-not $ProcessId) {
     return $false
   }
 
   try {
-    Get-Process -Id ([int]$Pid) -ErrorAction Stop | Out-Null
+    Get-Process -Id ([int]$ProcessId) -ErrorAction Stop | Out-Null
     return $true
   } catch {
     return $false
@@ -65,10 +65,10 @@ function Test-HealthyState([pscustomobject]$State) {
 
 function Stop-ManagedProcesses {
   $state = Read-State
-  foreach ($pid in @($state.bridgePid, $state.cloudflaredPid)) {
-    if ($pid) {
+  foreach ($processId in @($state.bridgePid, $state.cloudflaredPid)) {
+    if ($processId) {
       try {
-        Stop-Process -Id ([int]$pid) -Force -ErrorAction Stop
+        Stop-Process -Id ([int]$processId) -Force -ErrorAction Stop
       } catch {
       }
     }
@@ -85,9 +85,24 @@ function Stop-PortListener([int]$Port) {
   }
 }
 
+function Reset-LogFile([string]$Path) {
+  for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
+    try {
+      if (Test-Path $Path) {
+        Remove-Item $Path -Force
+      }
+      return
+    } catch {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+
+  throw "Failed to reset log file: $Path"
+}
+
 function Start-LoggedProcess([string]$FilePath, [string[]]$Arguments, [string]$OutputPath, [string]$ErrorPath) {
-  if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
-  if (Test-Path $ErrorPath) { Remove-Item $ErrorPath -Force }
+  Reset-LogFile -Path $OutputPath
+  Reset-LogFile -Path $ErrorPath
 
   return Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $OutputPath -RedirectStandardError $ErrorPath
 }
@@ -180,10 +195,6 @@ $cloudflared = Start-LoggedProcess -FilePath $CloudflaredExe -Arguments @(
 ) -OutputPath $TunnelOut -ErrorPath $TunnelErr
 $tunnelUrl = Wait-TunnelUrl -LogPaths @($TunnelOut, $TunnelErr)
 
-if (-not $SkipDeploy -and ($null -eq $previousState -or [string]$previousState.tunnelUrl -ne $tunnelUrl)) {
-  Update-VercelBackendUrl -BackendUrl $tunnelUrl
-}
-
 [pscustomobject]@{
   updatedAt = (Get-Date).ToString('o')
   websiteRoot = $WebsiteRoot
@@ -193,6 +204,18 @@ if (-not $SkipDeploy -and ($null -eq $previousState -or [string]$previousState.t
   tunnelUrl = $tunnelUrl
 } | ConvertTo-Json | Set-Content $StatePath -Encoding UTF8
 
+if (-not $SkipDeploy -and ($null -eq $previousState -or [string]$previousState.tunnelUrl -ne $tunnelUrl)) {
+  try {
+    Update-VercelBackendUrl -BackendUrl $tunnelUrl
+  } catch {
+    Write-Warning ("Failed to update Vercel backend URL or trigger deploy: {0}" -f $_.Exception.Message)
+  }
+}
+
 Write-Output "Cateo public stack is running."
 Write-Output "Site bridge: http://127.0.0.1:$SitePort"
 Write-Output "Tunnel: $tunnelUrl"
+
+
+
+
