@@ -42,6 +42,11 @@ function getPowerShellPath(): string {
   return path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
+function getPowerShellModulePath(): string {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:/Windows";
+  return path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules");
+}
+
 function runPowerShell(script: string, envVars: Record<string, string>): string {
   const executable = getPowerShellPath();
   const result = spawnSync(
@@ -49,7 +54,7 @@ function runPowerShell(script: string, envVars: Record<string, string>): string 
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     {
       encoding: "utf-8",
-      env: { ...process.env, ...envVars },
+      env: process.platform === "win32" ? { ...process.env, PSModulePath: getPowerShellModulePath(), ...envVars } : { ...process.env, ...envVars },
       windowsHide: true,
     },
   );
@@ -68,7 +73,7 @@ function protectMasterKey(plain: string): string {
   }
 
   return runPowerShell(
-    "$secure = ConvertTo-SecureString -String $env:CATEO_SECRET -AsPlainText -Force; ConvertFrom-SecureString -SecureString $secure",
+    "$secure = Microsoft.PowerShell.Security\\ConvertTo-SecureString -String $env:CATEO_SECRET -AsPlainText -Force; Microsoft.PowerShell.Security\\ConvertFrom-SecureString -SecureString $secure",
     { CATEO_SECRET: plain },
   );
 }
@@ -79,7 +84,7 @@ function unprotectMasterKey(blob: string): string {
   }
 
   return runPowerShell(
-    "$secure = ConvertTo-SecureString -String $env:CATEO_BLOB; $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) } }",
+    "$secure = Microsoft.PowerShell.Security\\ConvertTo-SecureString -String $env:CATEO_BLOB; $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) } }",
     { CATEO_BLOB: blob },
   );
 }
@@ -213,3 +218,4 @@ export function readProtectedSecret(name: string): string | undefined {
 export function deleteProtectedSecret(name: string): void {
   removeProtectedFile(path.join(getSecretDir(), `${sanitizeSecretName(name)}.secret`));
 }
+
