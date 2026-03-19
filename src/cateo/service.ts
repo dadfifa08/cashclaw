@@ -93,16 +93,21 @@ function assertLocalCateoRuntime(runtime: CateoModelRuntime): void {
   }
 }
 
-function buildRoute(input: CateoAssistInput, context: CateoContextBundle): CateoRoutingDecision {
+function buildRoute(input: CateoAssistInput, context: CateoContextBundle, actor: string): CateoRoutingDecision {
   const requestedArtifacts = inferRequestedArtifacts(input, context.taskClass);
+  const isPublicSite = actor === "site";
   const useChallenger = context.taskClass === "troubleshooting"
     || context.taskClass === "root-cause-analysis"
     || requestedArtifacts.includes("diagnostic-reasoning-log")
     || context.serviceHistory.length >= 2
     || context.digitalTwin?.status === "fail";
   const useStructure = requestedArtifacts.length > 1
-    || context.taskClass === "inspection"
-    || context.taskClass === "documentation";
+    || context.taskClass === "documentation"
+    || context.taskClass === "root-cause-analysis"
+    || context.digitalTwin?.status === "fail"
+    || context.serviceHistory.length >= 2
+    || context.attachments.length >= 2
+    || (!isPublicSite && context.taskClass === "inspection");
 
   return {
     taskClass: context.taskClass,
@@ -116,6 +121,7 @@ function buildRoute(input: CateoAssistInput, context: CateoContextBundle): Cateo
       context.digitalTwin?.status === "fail" ? "Digital twin deviations require challenge and evidence handling." : "",
       useChallenger ? "Challenger stage enabled for competing hypotheses and blind-spot review." : "",
       useStructure ? "Structure stage enabled for artifact packaging and quality gates." : "",
+      isPublicSite && !useStructure ? "Public site request kept on the lean path to reduce local inference latency." : "",
     ]),
   };
 }
@@ -581,7 +587,7 @@ export async function generateCateoArtifacts(
   const sanitizedInput = sanitizeAssistInputForPersistence(input);
   const attachmentEvidence = ingestMediaAttachments(caseId, input.attachments, options.requestId);
   const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence);
-  const route = buildRoute(sanitizedInput, context);
+  const route = buildRoute(sanitizedInput, context, actor);
   const promptPayload = buildPromptPayload(sanitizedInput, context, route);
   const leadStage = await callJsonStage({
     stage: "lead_plan",
@@ -810,4 +816,5 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
 
