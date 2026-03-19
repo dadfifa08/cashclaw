@@ -13,9 +13,9 @@ interface StepDef {
 
 const ALL_STEPS: StepDef[] = [
   { id: "wallet", label: "WALLET" },
-  { id: "register", label: "REGISTER" },
-  { id: "llm", label: "BRAIN" },
-  { id: "specialization", label: "DEPLOY" },
+  { id: "register", label: "PROFILE" },
+  { id: "llm", label: "MODEL" },
+  { id: "specialization", label: "RUNTIME" },
 ];
 
 interface SetupProps {
@@ -50,23 +50,21 @@ export function Setup({ onComplete }: SetupProps) {
 
   return (
     <div className="min-h-screen flex flex-col scanlines">
-      {/* Header */}
       <header className="border-b border-red-500/8 px-5 py-2.5 bg-zinc-950/95">
         <div className="flex items-center gap-3">
           <div className="w-2 h-5 bg-red-500 rounded-[1px] glow-red" />
           <div>
             <h1 className="text-sm font-bold tracking-wide text-zinc-100 font-mono leading-none">
-              CASHCLAW
+              CATEO
             </h1>
             <p className="text-[8px] text-red-500/50 font-mono tracking-[0.25em] leading-none mt-0.5">
-              SYSTEM SETUP
+              RUNTIME INITIALIZATION
             </p>
           </div>
         </div>
       </header>
 
       <main className="flex-1 flex flex-col items-center px-6 py-12">
-        {/* Progress */}
         {step > 0 && (
           <div className="flex items-center gap-1 mb-10">
             {steps.map((s, i) => (

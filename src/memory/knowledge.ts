@@ -1,41 +1,45 @@
-import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
-import { getConfigDir } from "../config.js";
+import { getConfigDir, loadConfig } from "../config.js";
+import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import { redactText } from "../security/redact.js";
 
 export interface KnowledgeEntry {
   id: string;
-  topic: "feedback_analysis" | "specialty_research" | "task_simulation";
+  topic: "feedback_analysis" | "specialty_research" | "task_simulation" | "diagnostic_pattern" | "procedure_guidance";
   specialty: string;
   insight: string;
   source: string;
   timestamp: number;
 }
 
-const MAX_ENTRIES = 50;
+const MAX_ENTRIES = 200;
 
 function getKnowledgePath(): string {
   return path.join(getConfigDir(), "knowledge.json");
 }
 
+function shouldPersist(): boolean {
+  return loadConfig()?.security.persistence.persistKnowledge ?? true;
+}
+
 let cache: KnowledgeEntry[] | null = null;
 
+function isKnowledgeEntry(entry: unknown): entry is KnowledgeEntry {
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    typeof (entry as KnowledgeEntry).id === "string" &&
+    typeof (entry as KnowledgeEntry).topic === "string" &&
+    typeof (entry as KnowledgeEntry).specialty === "string" &&
+    typeof (entry as KnowledgeEntry).insight === "string" &&
+    typeof (entry as KnowledgeEntry).source === "string" &&
+    typeof (entry as KnowledgeEntry).timestamp === "number"
+  );
+}
+
 function readFromDisk(): KnowledgeEntry[] {
-  const p = getKnowledgePath();
-  if (!fs.existsSync(p)) return [];
-  try {
-    const raw = fs.readFileSync(p, "utf-8");
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (e): e is KnowledgeEntry =>
-        typeof e === "object" && e !== null &&
-        typeof (e as KnowledgeEntry).id === "string" &&
-        typeof (e as KnowledgeEntry).insight === "string",
-    );
-  } catch {
-    return [];
-  }
+  const parsed = readProtectedJson<KnowledgeEntry[]>(getKnowledgePath(), []);
+  return Array.isArray(parsed) ? parsed.filter(isKnowledgeEntry) : [];
 }
 
 export function loadKnowledge(): KnowledgeEntry[] {
@@ -46,55 +50,73 @@ export function loadKnowledge(): KnowledgeEntry[] {
 
 export function storeKnowledge(entry: KnowledgeEntry): void {
   import("./search.js")
-    .then((m) => m.invalidateIndex())
+    .then((module) => module.invalidateIndex())
     .catch((err) => console.error("Failed to invalidate search index:", err));
 
   const entries = loadKnowledge();
-  entries.push(entry);
 
-  const trimmed = entries.slice(-MAX_ENTRIES);
+  const normalized: KnowledgeEntry = {
+    ...entry,
+    specialty: entry.specialty.trim() || "general",
+    insight: redactText(entry.insight.trim()),
+    source: redactText(entry.source.trim() || "unknown"),
+  };
+
+  const duplicateIndex = entries.findIndex(
+    (existing) =>
+      existing.topic === normalized.topic &&
+      existing.specialty.toLowerCase() === normalized.specialty.toLowerCase() &&
+      existing.insight.trim().toLowerCase() === normalized.insight.trim().toLowerCase(),
+  );
+
+  if (duplicateIndex >= 0) {
+    entries[duplicateIndex] = {
+      ...entries[duplicateIndex],
+      ...normalized,
+      id: entries[duplicateIndex].id,
+      timestamp: normalized.timestamp,
+    };
+  } else {
+    entries.push(normalized);
+  }
+
+  const trimmed = entries
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-MAX_ENTRIES);
+
   cache = trimmed;
-
-  const p = getKnowledgePath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(trimmed, null, 2));
-  fs.renameSync(tmp, p);
+  if (shouldPersist()) {
+    writeProtectedJson(getKnowledgePath(), trimmed);
+  }
 }
 
 export function deleteKnowledge(id: string): boolean {
   const entries = loadKnowledge();
-  const idx = entries.findIndex((e) => e.id === id);
-  if (idx === -1) return false;
+  const index = entries.findIndex((entry) => entry.id === id);
+  if (index === -1) return false;
 
-  entries.splice(idx, 1);
-  cache = entries;
+  entries.splice(index, 1);
+  cache = [...entries];
 
   import("./search.js")
-    .then((m) => m.invalidateIndex())
+    .then((module) => module.invalidateIndex())
     .catch((err) => console.error("Failed to invalidate search index:", err));
 
-  const p = getKnowledgePath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(entries, null, 2));
-  fs.renameSync(tmp, p);
+  if (shouldPersist()) {
+    writeProtectedJson(getKnowledgePath(), entries);
+  }
   return true;
 }
 
-/** Returns entries matching any of the given specialties, most recent first */
-export function getRelevantKnowledge(
-  specialties: string[],
-  limit = 5,
-): KnowledgeEntry[] {
+export function getRelevantKnowledge(specialties: string[], limit = 5): KnowledgeEntry[] {
   const entries = loadKnowledge();
-  const lowerSpecs = new Set(specialties.map((s) => s.toLowerCase()));
+  const lowerSpecs = new Set(specialties.map((entry) => entry.trim().toLowerCase()).filter(Boolean));
 
   const matching = entries.filter(
-    (e) => lowerSpecs.has(e.specialty.toLowerCase()) || e.specialty === "general",
+    (entry) => entry.specialty.toLowerCase() === "general" || lowerSpecs.has(entry.specialty.toLowerCase()),
   );
 
   return matching
-    .sort((a, b) => b.timestamp - a.timestamp)
+    .sort((left, right) => right.timestamp - left.timestamp)
     .slice(0, limit);
 }

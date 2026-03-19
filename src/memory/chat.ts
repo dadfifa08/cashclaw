@@ -1,7 +1,8 @@
-import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { getConfigDir } from "../config.js";
+import { getConfigDir, loadConfig } from "../config.js";
+import { readProtectedJson, removeProtectedFile, writeProtectedJson } from "../security/secure_store.js";
+import { redactText } from "../security/redact.js";
 
 export interface ChatMessage {
   role: "user" | "assistant";
@@ -15,42 +16,44 @@ function getChatPath(): string {
   return path.join(getConfigDir(), "chat.json");
 }
 
+function shouldPersist(): boolean {
+  return loadConfig()?.security.persistence.persistOperatorChat ?? true;
+}
+
+let cache: ChatMessage[] | null = null;
+
+function sanitizeMessage(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    content: redactText(message.content),
+  };
+}
+
 export function loadChat(): ChatMessage[] {
-  const p = getChatPath();
-  if (!fs.existsSync(p)) return [];
-  try {
-    const raw = fs.readFileSync(p, "utf-8");
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (e): e is ChatMessage =>
-        typeof e === "object" && e !== null &&
-        typeof (e as ChatMessage).role === "string" &&
-        typeof (e as ChatMessage).content === "string",
-    );
-  } catch {
-    return [];
-  }
+  if (cache) return cache;
+  const parsed = readProtectedJson<ChatMessage[]>(getChatPath(), []);
+  cache = Array.isArray(parsed)
+    ? parsed.filter((entry) => typeof entry?.role === "string" && typeof entry?.content === "string")
+    : [];
+  return cache;
 }
 
 export function appendChat(message: ChatMessage): void {
   const messages = loadChat();
-  messages.push(message);
-
+  messages.push(sanitizeMessage(message));
   const trimmed = messages.slice(-MAX_MESSAGES);
+  cache = trimmed;
 
-  const p = getChatPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${crypto.randomUUID()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(trimmed, null, 2));
-  fs.renameSync(tmp, p);
+  if (shouldPersist()) {
+    writeProtectedJson(getChatPath(), trimmed);
+  }
 }
 
 export function clearChat(): void {
-  const p = getChatPath();
-  if (fs.existsSync(p)) {
-    const tmp = `${p}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, "[]");
-    fs.renameSync(tmp, p);
+  cache = [];
+  if (shouldPersist()) {
+    writeProtectedJson(getChatPath(), []);
+  } else {
+    removeProtectedFile(getChatPath());
   }
 }

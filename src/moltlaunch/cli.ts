@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { Task, Bounty, WalletInfo, RegisterResult, AgentInfo } from "./types.js";
 
-const execFileAsync = promisify(execFile);
-
-const MLTL_BIN = "mltl";
+const MLTL_BIN = process.platform === "win32" ? "mltl.cmd" : "mltl";
 const DEFAULT_TIMEOUT = 30_000;
 const REGISTER_TIMEOUT = 120_000;
 
@@ -13,17 +10,86 @@ interface CliError {
   code?: string;
 }
 
+function quoteWindowsArg(arg: string): string {
+  const escaped = arg
+    .replace(/%/g, "%%")
+    .replace(/(\*)"/g, "$1$1\"")
+    .replace(/(\+)$/g, "$1$1");
+
+  return `"${escaped}"`;
+}
+
+function runCommand(args: string[], timeout: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    const child = process.platform === "win32"
+      ? spawn(
+          process.env.ComSpec ?? "cmd.exe",
+          [
+            "/d",
+            "/s",
+            "/c",
+            `${quoteWindowsArg(MLTL_BIN)} ${args.map(quoteWindowsArg).join(" ")}`,
+          ],
+          {
+            env,
+            windowsHide: true,
+          },
+        )
+      : spawn(MLTL_BIN, args, { env });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      settled = true;
+      child.kill();
+      reject(new Error(`mltl command timed out after ${timeout}ms`));
+    }, timeout);
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+
+      const trimmed = stderr.trim();
+      if (process.platform === "win32" && trimmed.includes("is not recognized")) {
+        reject(new Error("mltl CLI not found. Install it with: npm install -g moltlaunch"));
+        return;
+      }
+
+      reject(new Error(trimmed || `mltl exited with code ${code ?? "unknown"}`));
+    });
+  });
+}
+
 async function mltl<T>(
   args: string[],
   timeout = DEFAULT_TIMEOUT,
 ): Promise<T> {
   try {
-    // --json is a per-subcommand flag, appended at the end
-    const { stdout } = await execFileAsync(MLTL_BIN, [...args, "--json"], {
-      timeout,
-      env: { ...process.env },
-    });
-
+    const stdout = await runCommand([...args, "--json"], timeout);
     const parsed = JSON.parse(stdout.trim()) as T | CliError;
 
     if (
@@ -43,7 +109,7 @@ async function mltl<T>(
     if (err instanceof Error) {
       if ("code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
         throw new Error(
-          "mltl CLI not found. Install it with: npm install -g @moltlaunch/cli",
+          "mltl CLI not found. Install it with: npm install -g moltlaunch",
         );
       }
       throw new Error(`mltl error: ${err.message}`);
@@ -51,8 +117,6 @@ async function mltl<T>(
     throw err;
   }
 }
-
-// --- Setup ---
 
 export async function walletShow(): Promise<WalletInfo> {
   return mltl<WalletInfo>(["wallet", "show"]);
@@ -96,8 +160,6 @@ export async function registerAgent(opts: RegisterOpts): Promise<RegisterResult>
   return mltl<RegisterResult>(args, REGISTER_TIMEOUT);
 }
 
-// --- Agent lookup ---
-
 export async function getAgentByWallet(address: string): Promise<AgentInfo | null> {
   try {
     const res = await fetch(
@@ -123,8 +185,6 @@ export async function getAgentByWallet(address: string): Promise<AgentInfo | nul
     return null;
   }
 }
-
-// --- Task operations ---
 
 export async function getInbox(agentId?: string): Promise<Task[]> {
   const args = ["inbox"];

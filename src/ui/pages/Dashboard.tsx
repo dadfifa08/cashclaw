@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
-import { api, type StatusData, type ActivityEvent, type StatsData, type KnowledgeEntry, type FeedbackEntry, type WalletInfo, type AgentCashBalance } from "../lib/api.js";
+import { useEffect, useState } from "react";
+import { api, type AgentCashBalance } from "../lib/api.js";
+import { useLiveRuntime } from "../lib/live.js";
 import { ethToUsd } from "../lib/ethPrice.js";
 
 function formatUptime(ms: number): string {
@@ -34,6 +35,7 @@ const EVENT_COLORS: Record<string, string> = {
   error: "text-red-400",
   ws: "text-zinc-600",
   study: "text-amber-300",
+  approval: "text-amber-300",
 };
 
 const EVENT_LABELS: Record<string, string> = {
@@ -45,6 +47,7 @@ const EVENT_LABELS: Record<string, string> = {
   error: "error",
   ws: "link",
   study: "learn",
+  approval: "gate",
 };
 
 const EVENT_BAR_COLORS: Record<string, string> = {
@@ -56,12 +59,14 @@ const EVENT_BAR_COLORS: Record<string, string> = {
   error: "bg-red-500",
   ws: "bg-zinc-700",
   study: "bg-amber-400",
+  approval: "bg-amber-300",
 };
 
 const FILTER_OPTIONS: { label: string; type: string | null }[] = [
   { label: "All", type: null },
   { label: "Exec", type: "loop_start" },
   { label: "Tools", type: "tool_call" },
+  { label: "Approvals", type: "approval" },
   { label: "Errors", type: "error" },
   { label: "Learn", type: "study" },
 ];
@@ -70,76 +75,54 @@ const TOPIC_COLORS: Record<string, string> = {
   feedback_analysis: "bg-blue-500/15 text-blue-400 border-blue-500/20",
   specialty_research: "bg-violet-500/15 text-violet-400 border-violet-500/20",
   task_simulation: "bg-amber-500/15 text-amber-400 border-amber-500/20",
+  diagnostic_pattern: "bg-emerald-500/15 text-emerald-400 border-emerald-500/20",
+  procedure_guidance: "bg-cyan-500/15 text-cyan-400 border-cyan-500/20",
 };
 
 type IntelTab = "knowledge" | "feedback";
 
 export function Dashboard() {
-  const [status, setStatus] = useState<StatusData | null>(null);
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [stats, setStats] = useState<StatsData | null>(null);
-  const [wallet, setWallet] = useState<WalletInfo | null>(null);
-  const [knowledge, setKnowledge] = useState<KnowledgeEntry[]>([]);
-  const [feedback, setFeedback] = useState<FeedbackEntry[]>([]);
+  const { snapshot, connectionState, error: liveError } = useLiveRuntime();
+  const status = snapshot?.status;
+  const events = snapshot ? [...snapshot.events].reverse() : [];
+  const stats = snapshot?.stats ?? null;
+  const wallet = snapshot?.wallet;
+  const knowledge = snapshot?.knowledge ?? [];
+  const feedback = snapshot?.feedback ?? [];
+  const approvals = snapshot?.approvals ?? [];
+  const audit = snapshot?.audit ?? [];
+  const config = snapshot?.config;
+  const pendingApprovals = approvals.filter((entry) => entry.status === "pending");
+  const auditErrors = audit.filter((entry) => entry.severity === "error").length;
+
   const [agentCashBalance, setAgentCashBalance] = useState<AgentCashBalance | null>(null);
-  const [agentCashEnabled, setAgentCashEnabled] = useState(false);
   const [ethPrice, setEthPrice] = useState<number>(0);
-  const [error, setError] = useState<string | null>(null);
   const [eventFilter, setEventFilter] = useState<string | null>(null);
   const [intelTab, setIntelTab] = useState<IntelTab>("knowledge");
   const [expandedKnowledge, setExpandedKnowledge] = useState<string | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
-
-    async function poll() {
-      try {
-        const [s, t, st, w, k, f, cfg] = await Promise.all([
-          api.getStatus(),
-          api.getTasks(),
-          api.getStats(),
-          api.getWalletCached().catch(() => null),
-          api.getKnowledge().catch(() => ({ entries: [] })),
-          api.getFeedback().catch(() => ({ entries: [] })),
-          api.getConfig().catch(() => null),
-        ]);
-        if (!active) return;
-        setStatus(s);
-        setEvents([...t.events].reverse());
-        setStats(st);
-        setWallet(w);
-        setKnowledge(k.entries);
-        setFeedback(f.entries);
-        setError(null);
-
-        const cashEnabled = cfg?.agentCashEnabled ?? false;
-        setAgentCashEnabled(cashEnabled);
-        if (cashEnabled) {
-          api.getAgentCashBalance()
-            .then((b) => { if (active) setAgentCashBalance(b); })
-            .catch(() => { if (active) setAgentCashBalance(null); });
-        }
-      } catch (err) {
-        if (!active) return;
-        setError(err instanceof Error ? err.message : "Connection failed");
-      }
-    }
-
-    void poll();
-    const interval = setInterval(() => void poll(), 3000);
-
-    // Fetch ETH price once (has its own server-side cache)
-    api.getEthPrice()
-      .then(({ price }) => { if (active) setEthPrice(price); })
-      .catch(() => {});
-
+    api.getEthPrice().then(({ price }) => { if (active) setEthPrice(price); }).catch(() => {});
     return () => {
       active = false;
-      clearInterval(interval);
     };
   }, []);
 
-  const [toggleError, setToggleError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    if (!config?.agentCashEnabled) {
+      setAgentCashBalance(null);
+      return () => {
+        active = false;
+      };
+    }
+    api.getAgentCashBalance().then((balance) => { if (active) setAgentCashBalance(balance); }).catch(() => { if (active) setAgentCashBalance(null); });
+    return () => {
+      active = false;
+    };
+  }, [config?.agentCashEnabled, status?.running]);
 
   async function toggleAgent() {
     if (!status) return;
@@ -155,12 +138,12 @@ export function Dashboard() {
     }
   }
 
-  if (error) {
+  if (liveError && !status) {
     return (
       <div className="text-center py-32">
-        <p className="text-xl text-zinc-300 mb-2">Connection Lost</p>
-        <p className="text-sm text-zinc-600 mb-6">{error}</p>
-        <p className="text-sm text-zinc-600">Run <code className="text-zinc-400 bg-zinc-800 px-2 py-0.5 rounded-sm font-mono text-xs">cashclaw start</code> to reconnect</p>
+        <p className="text-xl text-zinc-300 mb-2">Live Connection Lost</p>
+        <p className="text-sm text-zinc-600 mb-6">{liveError}</p>
+        <p className="text-sm text-zinc-600">Cateo will keep trying to reconnect.</p>
       </div>
     );
   }
@@ -169,240 +152,201 @@ export function Dashboard() {
     return (
       <div className="text-center py-32">
         <div className="w-5 h-5 border-2 border-zinc-700 border-t-zinc-400 rounded-full animate-spin mx-auto mb-3" />
-        <p className="text-sm text-zinc-600">Connecting...</p>
+        <p className="text-sm text-zinc-600">Connecting to live runtime...</p>
       </div>
     );
   }
 
-  const isStudying = events.length > 0
-    && events[0]?.type === "study"
-    && events[0]?.message.startsWith("Starting");
-
+  const isStudying = events.length > 0 && events[0]?.type === "study" && events[0]?.message.startsWith("Starting");
   const agentState = isStudying ? "studying" : status.running ? "active" : "idle";
-
-  const filteredEvents = eventFilter
-    ? events.filter((ev) => ev.type === eventFilter)
-    : events;
-
+  const filteredEvents = eventFilter ? events.filter((event) => event.type === eventFilter) : events;
   const balanceEth = wallet?.balance ? parseFloat(wallet.balance).toFixed(4) : null;
-  const balanceDisplay = balanceEth
-    ? ethPrice > 0
-      ? `${balanceEth} ETH (~$${ethToUsd(balanceEth, ethPrice)})`
-      : `${balanceEth} ETH`
-    : "--";
-
+  const balanceDisplay = balanceEth ? ethPrice > 0 ? `${balanceEth} ETH (~$${ethToUsd(balanceEth, ethPrice)})` : `${balanceEth} ETH` : "--";
   const recentKnowledge = knowledge.slice(-10).reverse();
   const recentFeedback = feedback.slice(-10).reverse();
+  const liveModeLabel = status.transportMode === "live" ? "REALTIME" : connectionState === "reconnecting" ? "RECONNECTING" : "FALLBACK";
 
   return (
     <div className="space-y-6">
-      {/* Hero */}
       <div className="flex items-start justify-between">
         <div>
           <div className="flex items-center gap-3 mb-1.5">
-            <div className={`w-2 h-2 rounded-sm ${
-              agentState === "studying" ? "bg-amber-400" : agentState === "active" ? "bg-emerald-400" : "bg-zinc-600"
-            }`} />
-            <h1 className="text-3xl font-bold text-zinc-100 tracking-tight">Monitor</h1>
+            <div className={`w-2 h-2 rounded-sm ${agentState === "studying" ? "bg-amber-400" : agentState === "active" ? "bg-emerald-400" : "bg-zinc-600"}`} />
+            <h1 className="text-3xl font-bold text-zinc-100 tracking-tight">Cateo Control</h1>
+            <span className="text-[10px] font-mono text-zinc-600 border border-zinc-800 rounded px-1.5 py-0.5">{liveModeLabel}</span>
           </div>
           <p className="text-sm text-zinc-500 font-mono">
             {agentState === "studying" ? "STUDYING" : agentState === "active" ? "OPERATIONAL" : "STOPPED"}
-            {status.running && ` \u2022 ${formatUptime(status.uptime)}`}
-            {status.running && status.totalPolls > 0 && ` \u2022 ${status.totalPolls} polls`}
+            {status.running && ` • ${formatUptime(status.uptime)}`}
+            {status.running && status.totalPolls > 0 && ` • ${status.totalPolls} syncs`}
           </p>
         </div>
         <div className="flex items-center gap-3">
           {toggleError && <span className="text-xs text-red-400 font-mono">{toggleError}</span>}
           <button
             onClick={() => void toggleAgent()}
-            className={`px-5 py-2 rounded-md text-sm font-medium transition-colors ${
-              status.running
-                ? "text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/50"
-                : "text-white bg-red-600 hover:bg-red-500"
-            }`}
+            className={`px-5 py-2 rounded-md text-sm font-medium transition-colors ${status.running ? "text-zinc-300 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/50" : "text-white bg-red-600 hover:bg-red-500"}`}
           >
             {status.running ? "Stop Agent" : "Start Agent"}
           </button>
         </div>
       </div>
 
-      {/* Stats Row 1 */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
         <StatCard label="Active Tasks" value={String(status.activeTasks)} highlight={status.activeTasks > 0} />
-        <StatCard label="Completed" value={stats ? String(stats.totalTasks) : "0"} />
-        <StatCard label="Avg Score" value={stats && stats.avgScore > 0 ? stats.avgScore.toFixed(1) + "/5" : "--"} />
-        <StatCard label="Balance" value={balanceDisplay} />
+        <StatCard label="Pending Approvals" value={String(pendingApprovals.length)} highlight={pendingApprovals.length > 0} />
+        <StatCard label="Completed Work" value={stats ? String(stats.totalTasks) : "0"} />
+        <StatCard label="Avg Score" value={stats && stats.avgScore > 0 ? `${stats.avgScore.toFixed(1)}/5` : "--"} />
+        <StatCard label="Wallet Balance" value={balanceDisplay} />
       </div>
 
-      {/* Stats Row 2 — conditional */}
-      {(agentCashEnabled || (stats && (stats.completionRate > 0 || stats.knowledgeEntries > 0 || stats.studySessions > 0))) && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {agentCashEnabled && (
-            <StatCard
-              label="USDC Balance"
-              value={agentCashBalance ? `$${parseFloat(agentCashBalance.balance).toFixed(2)}` : "--"}
-            />
-          )}
-          <StatCard label="Success Rate" value={stats && stats.totalTasks > 0 ? `${stats.completionRate}%` : "--"} />
-          <StatCard label="Knowledge" value={stats ? String(stats.knowledgeEntries) : "0"} />
-          <StatCard label="Study Sessions" value={stats ? String(stats.studySessions) : "0"} />
-        </div>
-      )}
+      <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
+        <StatCard label="Success Rate" value={stats && stats.totalTasks > 0 ? `${stats.completionRate}%` : "--"} />
+        <StatCard label="Knowledge" value={stats ? String(stats.knowledgeEntries) : "0"} />
+        <StatCard label="Study Sessions" value={stats ? String(stats.studySessions) : "0"} />
+        <StatCard label="Audit Errors" value={String(auditErrors)} highlight={auditErrors > 0} />
+        {config?.agentCashEnabled ? (
+          <StatCard label="USDC Balance" value={agentCashBalance ? `$${parseFloat(agentCashBalance.balance).toFixed(2)}` : "--"} />
+        ) : (
+          <StatCard label="Transport" value={status.transportMode.toUpperCase()} />
+        )}
+      </div>
 
-      {/* Event Log + Intelligence side by side */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
-        {/* Event log — takes 3 cols */}
-        <div className="lg:col-span-3">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2.5">
-              <h2 className="text-lg font-bold text-zinc-200 tracking-tight">Activity</h2>
-              <span className="text-xs text-zinc-600 font-mono readout">{filteredEvents.length}</span>
-            </div>
-            <div className="flex gap-0.5">
-              {FILTER_OPTIONS.map((f) => (
-                <button
-                  key={f.label}
-                  onClick={() => setEventFilter(eventFilter === f.type ? null : f.type)}
-                  className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
-                    eventFilter === f.type
-                      ? "bg-zinc-700 text-zinc-200"
-                      : "text-zinc-600 hover:text-zinc-400 hover:bg-zinc-800/60"
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="card overflow-hidden">
-            {filteredEvents.length === 0 ? (
-              <p className="text-zinc-600 py-20 text-center text-sm">No events yet</p>
-            ) : (
-              <div className="max-h-[560px] overflow-y-auto divide-y divide-zinc-800/40">
-                {filteredEvents.map((ev, idx) => (
-                  <div
-                    key={`${ev.timestamp}-${ev.type}-${ev.taskId ?? ""}`}
-                    className={`flex items-center gap-3 hover:bg-zinc-800/25 transition-colors ${
-                      idx === 0 ? "bg-zinc-800/15" : ""
-                    }`}
+        <div className="lg:col-span-3 space-y-5">
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2.5">
+                <h2 className="text-lg font-bold text-zinc-200 tracking-tight">Runtime Activity</h2>
+                <span className="text-xs text-zinc-600 font-mono readout">{filteredEvents.length}</span>
+              </div>
+              <div className="flex gap-0.5">
+                {FILTER_OPTIONS.map((filter) => (
+                  <button
+                    key={filter.label}
+                    onClick={() => setEventFilter(eventFilter === filter.type ? null : filter.type)}
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${eventFilter === filter.type ? "bg-zinc-700 text-zinc-200" : "text-zinc-600 hover:text-zinc-400 hover:bg-zinc-800/60"}`}
                   >
-                    <div className={`w-[2px] self-stretch shrink-0 ${EVENT_BAR_COLORS[ev.type] ?? "bg-zinc-700"}`} />
-                    <span className="text-[11px] text-zinc-600 font-mono tabular-nums shrink-0 w-14 py-2.5">
-                      {formatTime(ev.timestamp)}
-                    </span>
-                    <span className={`text-[11px] font-semibold font-mono shrink-0 w-9 uppercase ${EVENT_COLORS[ev.type] ?? "text-zinc-600"}`}>
-                      {EVENT_LABELS[ev.type] ?? ev.type.slice(0, 5)}
-                    </span>
-                    {ev.taskId && (
-                      <code className="text-[10px] text-zinc-700 font-mono shrink-0">{ev.taskId.slice(0, 8)}</code>
-                    )}
-                    <span className="text-[13px] text-zinc-400 truncate pr-3">{ev.message}</span>
-                  </div>
+                    {filter.label}
+                  </button>
                 ))}
               </div>
-            )}
-          </div>
-        </div>
-
-        {/* Intelligence — takes 2 cols */}
-        <div className="lg:col-span-2">
-          <div className="flex items-center gap-3 mb-3">
-            <h2 className="text-lg font-bold text-zinc-200 tracking-tight">Intelligence</h2>
-            <div className="flex gap-0.5 ml-auto">
-              <button
-                onClick={() => setIntelTab("knowledge")}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
-                  intelTab === "knowledge" ? "bg-zinc-700 text-zinc-200" : "text-zinc-600 hover:text-zinc-400"
-                }`}
-              >
-                Knowledge ({knowledge.length})
-              </button>
-              <button
-                onClick={() => setIntelTab("feedback")}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
-                  intelTab === "feedback" ? "bg-zinc-700 text-zinc-200" : "text-zinc-600 hover:text-zinc-400"
-                }`}
-              >
-                Feedback ({feedback.length})
-              </button>
             </div>
-          </div>
 
-          <div className="card overflow-hidden max-h-[560px] overflow-y-auto">
-            {intelTab === "knowledge" ? (
-              recentKnowledge.length === 0 ? (
-                <p className="text-zinc-600 py-20 text-center text-sm">No knowledge yet</p>
+            <div className="card overflow-hidden">
+              {filteredEvents.length === 0 ? (
+                <p className="text-zinc-600 py-20 text-center text-sm">No runtime events yet</p>
               ) : (
-                <div className="divide-y divide-zinc-800/40">
-                  {recentKnowledge.map((k) => {
-                    const isExpanded = expandedKnowledge === k.id;
-                    return (
-                      <div key={k.id} className="px-4 py-3.5 hover:bg-zinc-800/25 transition-colors">
-                        <div className="flex items-center gap-2 mb-1.5">
-                          <span className={`px-2 py-0.5 rounded-sm text-[10px] font-semibold border ${
-                            TOPIC_COLORS[k.topic] ?? "bg-zinc-800 text-zinc-400 border-zinc-700/50"
-                          }`}>
-                            {k.topic.replace(/_/g, " ")}
-                          </span>
-                          <span className="text-[11px] text-zinc-600 font-mono">{k.specialty}</span>
-                          <span className="text-[10px] text-zinc-700 ml-auto font-mono">{formatRelative(k.timestamp)}</span>
-                        </div>
-                        <button
-                          onClick={() => setExpandedKnowledge(isExpanded ? null : k.id)}
-                          className="text-left w-full"
-                        >
-                          <p className={`text-[13px] text-zinc-400 leading-relaxed ${isExpanded ? "" : "line-clamp-3"}`}>
-                            {k.insight}
-                          </p>
-                        </button>
-                        <div className="flex items-center gap-2 mt-1">
-                          {k.source && (
-                            <p className="text-[10px] text-zinc-700 truncate font-mono">src: {k.source}</p>
-                          )}
-                          {isExpanded && (
-                            <button
-                              onClick={() => {
-                                api.deleteKnowledge(k.id)
-                                  .then(() => setKnowledge((prev) => prev.filter((e) => e.id !== k.id)))
-                                  .catch((err) => console.error("Failed to delete:", err));
-                              }}
-                              className="text-[10px] text-zinc-700 hover:text-red-400 transition-colors font-mono ml-auto shrink-0"
-                            >
-                              delete
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )
-            ) : (
-              recentFeedback.length === 0 ? (
-                <p className="text-zinc-600 py-20 text-center text-sm">No feedback yet</p>
-              ) : (
-                <div className="divide-y divide-zinc-800/40">
-                  {recentFeedback.map((f) => (
-                    <div key={f.taskId} className="px-4 py-3.5 hover:bg-zinc-800/25 transition-colors">
-                      <div className="flex items-center gap-2.5 mb-1.5">
-                        <span className={`text-sm font-bold font-mono ${
-                          f.score >= 4 ? "text-emerald-400" : f.score >= 3 ? "text-amber-400" : "text-red-400"
-                        }`}>
-                          {f.score}/5
-                        </span>
-                        <ScorePips score={f.score} />
-                        <span className="text-[10px] text-zinc-700 ml-auto font-mono">{formatRelative(f.timestamp)}</span>
-                      </div>
-                      <p className="text-[13px] text-zinc-400 leading-relaxed">{f.taskDescription}</p>
-                      {f.comments && (
-                        <p className="text-[12px] text-zinc-600 mt-1 italic">&ldquo;{f.comments}&rdquo;</p>
-                      )}
+                <div className="max-h-[560px] overflow-y-auto divide-y divide-zinc-800/40">
+                  {filteredEvents.map((event, idx) => (
+                    <div key={`${event.timestamp}-${event.type}-${event.taskId ?? ""}`} className={`flex items-center gap-3 hover:bg-zinc-800/25 transition-colors ${idx === 0 ? "bg-zinc-800/15" : ""}`}>
+                      <div className={`w-[2px] self-stretch shrink-0 ${EVENT_BAR_COLORS[event.type] ?? "bg-zinc-700"}`} />
+                      <span className="text-[11px] text-zinc-600 font-mono tabular-nums shrink-0 w-14 py-2.5">{formatTime(event.timestamp)}</span>
+                      <span className={`text-[11px] font-semibold font-mono shrink-0 w-9 uppercase ${EVENT_COLORS[event.type] ?? "text-zinc-600"}`}>{EVENT_LABELS[event.type] ?? event.type.slice(0, 5)}</span>
+                      {event.taskId && <code className="text-[10px] text-zinc-700 font-mono shrink-0">{event.taskId.slice(0, 8)}</code>}
+                      <span className="text-[13px] text-zinc-400 truncate pr-3">{event.message}</span>
                     </div>
                   ))}
                 </div>
-              )
-            )}
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="lg:col-span-2 space-y-5">
+          <div>
+            <div className="flex items-center gap-3 mb-3">
+              <h2 className="text-lg font-bold text-zinc-200 tracking-tight">Approval Queue</h2>
+              <span className="text-xs text-zinc-600 font-mono readout">{pendingApprovals.length}</span>
+            </div>
+            <div className="card overflow-hidden">
+              {pendingApprovals.length === 0 ? (
+                <p className="text-zinc-600 py-12 text-center text-sm">No pending operator approvals.</p>
+              ) : (
+                <div className="divide-y divide-zinc-800/40">
+                  {pendingApprovals.slice(0, 6).map((entry) => (
+                    <div key={entry.id} className="px-4 py-3.5 hover:bg-zinc-800/25 transition-colors">
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className="px-2 py-0.5 rounded-sm text-[10px] font-semibold border bg-amber-500/10 text-amber-300 border-amber-500/20">PENDING</span>
+                        <span className="text-[11px] text-zinc-600 font-mono">{entry.toolName}</span>
+                        <span className="text-[10px] text-zinc-700 ml-auto font-mono">{formatRelative(entry.updatedAt)}</span>
+                      </div>
+                      <p className="text-[13px] text-zinc-300 leading-relaxed">{entry.summary}</p>
+                      <p className="text-[11px] text-zinc-500 mt-1">{entry.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center gap-3 mb-3">
+              <h2 className="text-lg font-bold text-zinc-200 tracking-tight">Cateo Memory</h2>
+              <div className="flex gap-0.5 ml-auto">
+                <button onClick={() => setIntelTab("knowledge")} className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${intelTab === "knowledge" ? "bg-zinc-700 text-zinc-200" : "text-zinc-600 hover:text-zinc-400"}`}>
+                  Knowledge ({knowledge.length})
+                </button>
+                <button onClick={() => setIntelTab("feedback")} className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${intelTab === "feedback" ? "bg-zinc-700 text-zinc-200" : "text-zinc-600 hover:text-zinc-400"}`}>
+                  Feedback ({feedback.length})
+                </button>
+              </div>
+            </div>
+
+            <div className="card overflow-hidden max-h-[560px] overflow-y-auto">
+              {intelTab === "knowledge" ? (
+                recentKnowledge.length === 0 ? (
+                  <p className="text-zinc-600 py-20 text-center text-sm">No retained knowledge yet</p>
+                ) : (
+                  <div className="divide-y divide-zinc-800/40">
+                    {recentKnowledge.map((entry) => {
+                      const isExpanded = expandedKnowledge === entry.id;
+                      return (
+                        <div key={entry.id} className="px-4 py-3.5 hover:bg-zinc-800/25 transition-colors">
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <span className={`px-2 py-0.5 rounded-sm text-[10px] font-semibold border ${TOPIC_COLORS[entry.topic] ?? "bg-zinc-800 text-zinc-400 border-zinc-700/50"}`}>{entry.topic.replace(/_/g, " ")}</span>
+                            <span className="text-[11px] text-zinc-600 font-mono">{entry.specialty}</span>
+                            <span className="text-[10px] text-zinc-700 ml-auto font-mono">{formatRelative(entry.timestamp)}</span>
+                          </div>
+                          <button onClick={() => setExpandedKnowledge(isExpanded ? null : entry.id)} className="text-left w-full">
+                            <p className={`text-[13px] text-zinc-400 leading-relaxed ${isExpanded ? "" : "line-clamp-3"}`}>{entry.insight}</p>
+                          </button>
+                          <div className="flex items-center gap-2 mt-1">
+                            {entry.source && <p className="text-[10px] text-zinc-700 truncate font-mono">src: {entry.source}</p>}
+                            {isExpanded && (
+                              <button
+                                onClick={() => { void api.deleteKnowledge(entry.id).catch(() => {}); }}
+                                className="text-[10px] text-zinc-700 hover:text-red-400 transition-colors font-mono ml-auto shrink-0"
+                              >
+                                delete
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
+              ) : (
+                recentFeedback.length === 0 ? (
+                  <p className="text-zinc-600 py-20 text-center text-sm">No feedback yet</p>
+                ) : (
+                  <div className="divide-y divide-zinc-800/40">
+                    {recentFeedback.map((entry) => (
+                      <div key={entry.taskId} className="px-4 py-3.5 hover:bg-zinc-800/25 transition-colors">
+                        <div className="flex items-center gap-2.5 mb-1.5">
+                          <span className={`text-sm font-bold font-mono ${entry.score >= 4 ? "text-emerald-400" : entry.score >= 3 ? "text-amber-400" : "text-red-400"}`}>{entry.score}/5</span>
+                          <ScorePips score={entry.score} />
+                          <span className="text-[10px] text-zinc-700 ml-auto font-mono">{formatRelative(entry.timestamp)}</span>
+                        </div>
+                        <p className="text-[13px] text-zinc-400 leading-relaxed">{entry.taskDescription}</p>
+                        {entry.comments && <p className="text-[12px] text-zinc-600 mt-1 italic">&ldquo;{entry.comments}&rdquo;</p>}
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -414,14 +358,7 @@ function ScorePips({ score }: { score: number }) {
   return (
     <div className="flex gap-[2px]">
       {[1, 2, 3, 4, 5].map((i) => (
-        <div
-          key={i}
-          className={`w-2.5 h-[5px] rounded-[1px] ${
-            i <= score
-              ? score >= 4 ? "bg-emerald-500" : score >= 3 ? "bg-amber-500" : "bg-red-500"
-              : "bg-zinc-800"
-          }`}
-        />
+        <div key={i} className={`w-2.5 h-[5px] rounded-[1px] ${i <= score ? score >= 4 ? "bg-emerald-500" : score >= 3 ? "bg-amber-500" : "bg-red-500" : "bg-zinc-800"}`} />
       ))}
     </div>
   );
@@ -431,9 +368,7 @@ function StatCard({ label, value, highlight }: { label: string; value: string; h
   return (
     <div className="card px-4 py-4">
       <p className="text-[11px] text-zinc-500 font-medium uppercase tracking-wider mb-1.5">{label}</p>
-      <p className={`text-2xl font-bold font-mono readout ${highlight ? "text-zinc-100" : "text-zinc-300"}`}>
-        {value}
-      </p>
+      <p className={`text-2xl font-bold font-mono readout ${highlight ? "text-zinc-100" : "text-zinc-300"}`}>{value}</p>
     </div>
   );
 }

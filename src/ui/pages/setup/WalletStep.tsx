@@ -17,11 +17,17 @@ export function WalletStep({ onNext }: WalletStepProps) {
   const [lookingUp, setLookingUp] = useState(false);
   const [lookupDone, setLookupDone] = useState(false);
 
+  const walletBlocked =
+    error.includes("mltl") ||
+    error.includes("Moltlaunch") ||
+    error.includes("wallet") ||
+    error.includes("not found");
+
   useEffect(() => {
     api.getWallet()
       .then((w) => {
         setWallet(w);
-        doLookup();
+        void doLookup();
       })
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
@@ -78,7 +84,7 @@ export function WalletStep({ onNext }: WalletStepProps) {
       </div>
 
       {error && (
-        <div className="panel px-4 py-3 space-y-2">
+        <div className="panel px-4 py-3 space-y-3">
           <p className="text-[11px] text-red-400 font-mono">{error}</p>
           {error.includes("mltl") && (
             <div className="text-[10px] text-zinc-500 font-mono space-y-1">
@@ -87,6 +93,18 @@ export function WalletStep({ onNext }: WalletStepProps) {
               <p className="text-zinc-700">Then refresh this page.</p>
             </div>
           )}
+
+          <div className="pt-1">
+            <button
+              onClick={() => onNext()}
+              className="w-full py-2.5 bg-zinc-100 text-zinc-900 rounded-sm text-[11px] font-mono font-bold tracking-wider hover:bg-white transition-colors"
+            >
+              CONTINUE IN LOCAL MODE
+            </button>
+            <p className="text-[9px] text-zinc-700 font-mono mt-2 leading-relaxed">
+              Skip wallet bootstrap for now. You can still configure the LLM, dashboard, and local workflow.
+            </p>
+          </div>
         </div>
       )}
 
@@ -167,12 +185,21 @@ export function WalletStep({ onNext }: WalletStepProps) {
         </button>
       )}
 
-      {!wallet && !showImport && (
+      {!wallet && !showImport && !walletBlocked && (
         <button
           onClick={() => setShowImport(true)}
           className="text-[10px] text-zinc-600 hover:text-zinc-400 transition-colors font-mono"
         >
           Import existing private key
+        </button>
+      )}
+
+      {!wallet && !showImport && (
+        <button
+          onClick={() => onNext()}
+          className="w-full py-2.5 border border-zinc-800 text-zinc-300 rounded-sm text-[11px] font-mono font-bold tracking-wider hover:bg-zinc-900/50 transition-colors"
+        >
+          SKIP WALLET FOR NOW
         </button>
       )}
 
@@ -215,3 +242,4 @@ export function WalletStep({ onNext }: WalletStepProps) {
     </div>
   );
 }
+

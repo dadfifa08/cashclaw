@@ -1,21 +1,24 @@
 import { startAgent } from "./agent.js";
+import { getDashboardUrl } from "./system/runtime_paths.js";
+
+async function openBrowser(url: string) {
+  const { execFile: execFileCb } = await import("node:child_process");
+
+  if (process.platform === "win32") {
+    execFileCb("cmd", ["/c", "start", "", url], { windowsHide: true }, () => {});
+    return;
+  }
+
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  execFileCb(opener, [url], () => {});
+}
 
 async function main() {
-  console.log("Starting CashClaw...");
+  console.log("Starting Cateo...");
 
   const server = await startAgent();
+  await openBrowser(getDashboardUrl());
 
-  // Open browser
-  const url = "http://localhost:3777";
-  const { execFile: execFileCb } = await import("node:child_process");
-  const opener = process.platform === "darwin"
-    ? "open"
-    : process.platform === "win32"
-      ? "start"
-      : "xdg-open";
-  execFileCb(opener, [url], () => {});
-
-  // Graceful shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
     server.close();

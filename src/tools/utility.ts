@@ -7,7 +7,7 @@ import * as cli from "../moltlaunch/cli.js";
 export const checkWalletBalance: Tool = {
   definition: {
     name: "check_wallet_balance",
-    description: "Check your wallet's ETH balance on Base mainnet.",
+    description: "Check your operational wallet status on Base. Use this when funding, quoting, or task execution may depend on wallet readiness.",
     input_schema: {
       type: "object",
       properties: {},
@@ -17,7 +17,12 @@ export const checkWalletBalance: Tool = {
     const wallet = await cli.walletShow();
     return {
       success: true,
-      data: `Address: ${wallet.address}\nBalance: ${wallet.balance ?? "unknown"} ETH`,
+      data: [
+        "## Wallet Status",
+        `- Address: ${wallet.address}`,
+        `- Balance: ${wallet.balance ?? "unknown"} ETH`,
+
+      ].join("\n"),
     };
   },
 };
@@ -25,11 +30,11 @@ export const checkWalletBalance: Tool = {
 export const readFeedbackHistory: Tool = {
   definition: {
     name: "read_feedback_history",
-    description: "Read past task feedback scores and comments. Useful for learning from past performance.",
+    description: "Read past task ratings and comments to improve future technical work, delivery quality, and revision handling.",
     input_schema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Max entries to return (default 10)" },
+        limit: { type: "number", description: "Maximum entries to return (default 10)" },
       },
     },
   },
@@ -42,9 +47,12 @@ export const readFeedbackHistory: Tool = {
       return { success: true, data: "No feedback history yet." };
     }
 
-    const summary = recent.map((f) =>
-      `- Task "${f.taskDescription.slice(0, 60)}": ${f.score}/5 — ${f.comments || "(no comment)"}`,
-    ).join("\n");
+    const summary = [
+      "## Recent Feedback History",
+      ...recent.map((f, i) =>
+        `${i + 1}. Score: ${f.score}/5\n   Task: ${f.taskDescription.slice(0, 120)}\n   Comment: ${f.comments || "(no comment)"}`,
+      ),
+    ].join("\n");
 
     return { success: true, data: summary };
   },
@@ -54,19 +62,17 @@ export const memorySearch: Tool = {
   definition: {
     name: "memory_search",
     description:
-      "Search your knowledge base and past feedback for relevant context. " +
-      "Use when you need to recall past experiences, lessons learned, or " +
-      "feedback patterns related to a topic or task type.",
+      "Search prior knowledge, lessons learned, and historical feedback for context relevant to a current technical task. Use this before pricing, diagnosing, revising, or submitting work when prior experience may improve quality.",
     input_schema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Search query — keywords describing what you're looking for",
+          description: "Search query describing the issue, task type, failure mode, procedure, or domain topic",
         },
         limit: {
           type: "number",
-          description: "Max results to return (default 5)",
+          description: "Maximum results to return (default 5)",
         },
       },
       required: ["query"],
@@ -77,17 +83,18 @@ export const memorySearch: Tool = {
     if (typeof query !== "string" || !query.trim()) {
       return { success: false, data: "Missing required field: query" };
     }
-    const limit = (input.limit as number) || 5;
 
+    const limit = (input.limit as number) || 5;
     const hits = searchMemory(query, limit);
 
     if (hits.length === 0) {
       return { success: true, data: "No relevant memories found." };
     }
 
-    const summary = hits
-      .map((h, i) => `${i + 1}. [${h.type}] ${h.text.slice(0, 300)}`)
-      .join("\n\n");
+    const summary = [
+      `## Memory Search Results for: ${query}`,
+      ...hits.map((h, i) => `${i + 1}. [${h.type}] ${h.text.slice(0, 300)}`),
+    ].join("\n\n");
 
     return { success: true, data: summary };
   },
@@ -96,7 +103,7 @@ export const memorySearch: Tool = {
 export const logActivity: Tool = {
   definition: {
     name: "log_activity",
-    description: "Write an entry to the daily activity log.",
+    description: "Write a structured operational note to the activity log. Use this for meaningful state changes, important findings, blockers, or delivery milestones.",
     input_schema: {
       type: "object",
       properties: {
@@ -110,7 +117,8 @@ export const logActivity: Tool = {
     if (typeof entry !== "string" || !entry.trim()) {
       return { success: false, data: "Missing required field: entry" };
     }
+
     appendLog(entry);
-    return { success: true, data: "Logged." };
+    return { success: true, data: "Logged activity entry." };
   },
 };

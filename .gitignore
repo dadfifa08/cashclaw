@@ -5,3 +5,5 @@ dist/
 .cashclaw/
 *.log
 .DS_Store
+
+.codex/

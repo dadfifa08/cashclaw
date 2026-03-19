@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
-import { api, type ChatMessage } from "../lib/api.js";
+import { api } from "../lib/api.js";
+import { useLiveRuntime } from "../lib/live.js";
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit" });
@@ -62,10 +63,10 @@ function parseMarkdown(text: string): React.ReactNode[] {
       continue;
     }
 
-    if (/^\d+[\.\\)]\s/.test(line)) {
+    if (/^\d+[\.\)]\s/.test(line)) {
       const items: string[] = [];
-      while (i < lines.length && /^\d+[\.\\)]\s/.test(lines[i])) {
-        items.push(lines[i].replace(/^\d+[\.\\)]\s/, ""));
+      while (i < lines.length && /^\d+[\.\)]\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+[\.\)]\s/, ""));
         i++;
       }
       result.push(
@@ -114,28 +115,24 @@ function renderInline(text: string): React.ReactNode[] {
 }
 
 const SUGGESTIONS = [
-  "How are you performing today?",
-  "What tasks have you completed recently?",
-  "What are your specialties?",
-  "What have you learned so far?",
+  "Give me a runtime health summary.",
+  "What have you learned so far that could improve future tasks?",
+  "What would you do if a new troubleshooting task arrived right now?",
+  "What are the biggest gaps before production readiness?",
 ];
 
 export function Chat() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const { snapshot } = useLiveRuntime();
+  const messages = snapshot?.chat ?? [];
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    api.getChat()
-      .then((data) => setMessages(data.messages))
-      .catch((err) => console.warn("Failed to load chat history:", err));
-  }, []);
-
-  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, sending]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -145,23 +142,16 @@ export function Chat() {
   }, [input]);
 
   async function send(text?: string) {
-    const msg = text ?? input.trim();
-    if (!msg || sending) return;
+    const message = text ?? input.trim();
+    if (!message || sending) return;
     setInput("");
     setSending(true);
-
-    const userMsg: ChatMessage = { role: "user", content: msg, timestamp: Date.now() };
-    setMessages((prev) => [...prev, userMsg]);
+    setSendError(null);
 
     try {
-      const { reply } = await api.sendChat(msg);
-      setMessages((prev) => [...prev, { role: "assistant", content: reply, timestamp: Date.now() }]);
+      await api.sendChat(message);
     } catch (err) {
-      setMessages((prev) => [...prev, {
-        role: "assistant",
-        content: `[ERROR] ${err instanceof Error ? err.message : "Failed to respond"}`,
-        timestamp: Date.now(),
-      }]);
+      setSendError(err instanceof Error ? err.message : "Failed to respond");
     } finally {
       setSending(false);
       textareaRef.current?.focus();
@@ -169,16 +159,20 @@ export function Chat() {
   }
 
   async function handleClear() {
-    await api.clearChat();
-    setMessages([]);
+    try {
+      await api.clearChat();
+      setSendError(null);
+    } catch (err) {
+      setSendError(err instanceof Error ? err.message : "Failed to clear chat");
+    }
   }
 
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)]">
       <div className="flex items-center justify-between mb-5">
         <div>
-          <h1 className="text-3xl font-bold text-zinc-100 tracking-tight mb-1.5">Chat</h1>
-          <p className="text-sm text-zinc-500">Talk directly with your agent</p>
+          <h1 className="text-3xl font-bold text-zinc-100 tracking-tight mb-1.5">Operator Console</h1>
+          <p className="text-sm text-zinc-500">Directly inspect Cateo runtime state, capabilities, learning, and readiness</p>
         </div>
         {messages.length > 0 && (
           <button
@@ -194,16 +188,16 @@ export function Chat() {
         {messages.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center max-w-md">
-              <p className="text-zinc-300 text-base font-semibold mb-1">Start a conversation</p>
-              <p className="text-zinc-600 text-sm mb-5">Ask your agent anything about its status, tasks, or capabilities</p>
+              <p className="text-zinc-300 text-base font-semibold mb-1">Start an operator session</p>
+              <p className="text-zinc-600 text-sm mb-5">Ask Cateo about runtime health, task readiness, memory, or technical workflow state</p>
               <div className="grid grid-cols-2 gap-2">
-                {SUGGESTIONS.map((s) => (
+                {SUGGESTIONS.map((suggestion) => (
                   <button
-                    key={s}
-                    onClick={() => void send(s)}
+                    key={suggestion}
+                    onClick={() => void send(suggestion)}
                     className="text-left px-3.5 py-2.5 rounded-md border border-zinc-800/80 bg-zinc-900/60 text-[13px] text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 hover:bg-zinc-800/40 transition-colors"
                   >
-                    {s}
+                    {suggestion}
                   </button>
                 ))}
               </div>
@@ -211,18 +205,18 @@ export function Chat() {
           </div>
         ) : (
           <div className="p-5 space-y-3">
-            {messages.map((msg) => (
+            {messages.map((message) => (
               <div
-                key={`${msg.timestamp}-${msg.role}`}
-                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                key={`${message.timestamp}-${message.role}`}
+                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div className={`max-w-[75%] rounded-lg px-4 py-3 ${
-                  msg.role === "user"
+                  message.role === "user"
                     ? "bg-zinc-800 text-zinc-200"
                     : "bg-zinc-900/80 border border-zinc-800/60"
                 }`}>
-                  <div><MarkdownContent text={msg.content} /></div>
-                  <p className="text-[10px] mt-2 text-zinc-700 tabular-nums font-mono">{formatTime(msg.timestamp)}</p>
+                  <div><MarkdownContent text={message.content} /></div>
+                  <p className="text-[10px] mt-2 text-zinc-700 tabular-nums font-mono">{formatTime(message.timestamp)}</p>
                 </div>
               </div>
             ))}
@@ -246,7 +240,7 @@ export function Chat() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
-          placeholder="Type a message..."
+          placeholder="Ask Cateo about runtime status, tasks, learning, or next steps..."
           disabled={sending}
           rows={1}
           className="flex-1 bg-zinc-900/80 border border-zinc-800/80 rounded-lg px-4 py-3 text-[13px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-600 transition-colors disabled:opacity-40 resize-none leading-relaxed"
@@ -259,6 +253,8 @@ export function Chat() {
           Send
         </button>
       </div>
+
+      {sendError && <p className="text-[12px] text-red-400 mt-2 font-mono">{sendError}</p>}
     </div>
   );
 }

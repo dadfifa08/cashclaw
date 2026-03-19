@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
-import { api, type TaskData } from "../lib/api.js";
+import { useEffect, useState } from "react";
 import { formatEther } from "viem";
+import { api } from "../lib/api.js";
+import { useLiveRuntime } from "../lib/live.js";
 import { formatEthUsd } from "../lib/ethPrice.js";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -17,46 +18,36 @@ const STATUS_COLORS: Record<string, string> = {
 const STATUSES = ["all", "requested", "quoted", "accepted", "submitted", "completed", "declined"] as const;
 
 export function Tasks() {
-  const [tasks, setTasks] = useState<TaskData[]>([]);
-  const [selected, setSelected] = useState<TaskData | null>(null);
+  const { snapshot, error: liveError } = useLiveRuntime();
+  const tasks = snapshot?.tasks ?? [];
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("all");
-  const [error, setError] = useState<string | null>(null);
   const [ethPrice, setEthPrice] = useState<number>(0);
 
   useEffect(() => {
     let active = true;
-
-    async function poll() {
-      try {
-        const data = await api.getTasks();
-        if (active) {
-          setTasks(data.tasks);
-          setError(null);
-        }
-      } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : "Failed to load tasks");
-      }
-    }
-
-    void poll();
-    const interval = setInterval(() => void poll(), 5000);
-
     api.getEthPrice()
       .then(({ price }) => { if (active) setEthPrice(price); })
       .catch(() => {});
-
     return () => {
       active = false;
-      clearInterval(interval);
     };
   }, []);
 
+  useEffect(() => {
+    if (!selectedId) return;
+    if (!tasks.some((task) => task.id === selectedId)) {
+      setSelectedId(null);
+    }
+  }, [tasks, selectedId]);
+
   const filtered = statusFilter === "all"
     ? tasks
-    : tasks.filter((t) => t.status === statusFilter);
+    : tasks.filter((task) => task.status === statusFilter);
 
-  const statusCounts = tasks.reduce<Record<string, number>>((acc, t) => {
-    acc[t.status] = (acc[t.status] ?? 0) + 1;
+  const selected = tasks.find((task) => task.id === selectedId) ?? null;
+  const statusCounts = tasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.status] = (acc[task.status] ?? 0) + 1;
     return acc;
   }, {});
 
@@ -64,35 +55,34 @@ export function Tasks() {
     <div className="space-y-5">
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-zinc-100 tracking-tight mb-1.5">Tasks</h1>
-          <p className="text-sm text-zinc-500 font-mono">{tasks.length} task{tasks.length !== 1 ? "s" : ""}</p>
+          <h1 className="text-3xl font-bold text-zinc-100 tracking-tight mb-1.5">Work Queue</h1>
+          <p className="text-sm text-zinc-500 font-mono">{tasks.length} work item{tasks.length !== 1 ? "s" : ""}</p>
         </div>
       </div>
 
-      {error && tasks.length === 0 && (
+      {liveError && tasks.length === 0 && (
         <div className="card text-center py-12">
-          <p className="text-sm text-red-400 mb-1">Connection error</p>
-          <p className="text-xs text-zinc-600 font-mono">{error}</p>
+          <p className="text-sm text-red-400 mb-1">Live connection error</p>
+          <p className="text-xs text-zinc-600 font-mono">{liveError}</p>
         </div>
       )}
 
-      {/* Status filter tabs */}
       {tasks.length > 0 && (
         <div className="flex gap-1 flex-wrap">
-          {STATUSES.map((s) => {
-            const count = s === "all" ? tasks.length : (statusCounts[s] ?? 0);
-            if (s !== "all" && count === 0) return null;
+          {STATUSES.map((status) => {
+            const count = status === "all" ? tasks.length : (statusCounts[status] ?? 0);
+            if (status !== "all" && count === 0) return null;
             return (
               <button
-                key={s}
-                onClick={() => setStatusFilter(statusFilter === s ? "all" : s)}
+                key={status}
+                onClick={() => setStatusFilter(statusFilter === status ? "all" : status)}
                 className={`px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors ${
-                  statusFilter === s
+                  statusFilter === status
                     ? "bg-zinc-700 text-zinc-200"
                     : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/60"
                 }`}
               >
-                {s === "all" ? "All" : s.charAt(0).toUpperCase() + s.slice(1)}
+                {status === "all" ? "All" : status.charAt(0).toUpperCase() + status.slice(1)}
                 <span className="text-zinc-600 ml-1.5 font-mono text-[11px]">{count}</span>
               </button>
             );
@@ -103,10 +93,10 @@ export function Tasks() {
       {filtered.length === 0 ? (
         <div className="card text-center py-24">
           <p className="text-zinc-400 text-base mb-1.5">
-            {tasks.length === 0 ? "No active tasks" : "No matching tasks"}
+            {tasks.length === 0 ? "No active work items" : "No matching work items"}
           </p>
           <p className="text-zinc-600 text-sm">
-            {tasks.length === 0 ? "Tasks will appear here when dispatched" : "Try a different filter"}
+            {tasks.length === 0 ? "Work items will appear here when dispatched from Moltlaunch" : "Try a different filter"}
           </p>
         </div>
       ) : (
@@ -114,48 +104,48 @@ export function Tasks() {
           <table className="w-full">
             <thead>
               <tr className="border-b border-zinc-800/60">
-                {["ID", "Task", "Status", "Value", "Score"].map((h, i) => (
+                {["ID", "Work Item", "Status", "Value", "Score"].map((heading, idx) => (
                   <th
-                    key={h}
+                    key={heading}
                     className={`px-4 py-3 text-[11px] text-zinc-500 font-semibold uppercase tracking-wider ${
-                      i >= 3 ? "text-right" : "text-left"
+                      idx >= 3 ? "text-right" : "text-left"
                     }`}
                   >
-                    {h}
+                    {heading}
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-800/30">
-              {filtered.map((t) => (
+              {filtered.map((task) => (
                 <tr
-                  key={t.id}
-                  onClick={() => setSelected(selected?.id === t.id ? null : t)}
+                  key={task.id}
+                  onClick={() => setSelectedId(selectedId === task.id ? null : task.id)}
                   className={`cursor-pointer transition-colors ${
-                    selected?.id === t.id ? "bg-zinc-800/35" : "hover:bg-zinc-800/20"
+                    selectedId === task.id ? "bg-zinc-800/35" : "hover:bg-zinc-800/20"
                   }`}
                 >
                   <td className="px-4 py-3.5">
-                    <code className="text-zinc-500 text-[13px] font-mono">{t.id.slice(0, 8)}</code>
+                    <code className="text-zinc-500 text-[13px] font-mono">{task.id.slice(0, 8)}</code>
                   </td>
                   <td className="px-4 py-3.5 max-w-lg">
-                    <p className="text-[13px] text-zinc-300 truncate">{t.task}</p>
+                    <p className="text-[13px] text-zinc-300 truncate">{task.task}</p>
                   </td>
                   <td className="px-4 py-3.5">
                     <span className="inline-flex items-center gap-1.5 text-[13px] text-zinc-400">
-                      <span className={`w-1.5 h-1.5 rounded-sm shrink-0 ${STATUS_COLORS[t.status] ?? "bg-zinc-600"}`} />
-                      {t.status}
+                      <span className={`w-1.5 h-1.5 rounded-sm shrink-0 ${STATUS_COLORS[task.status] ?? "bg-zinc-600"}`} />
+                      {task.status}
                     </span>
                   </td>
                   <td className="px-4 py-3.5 text-right text-[13px] font-mono text-zinc-500 readout">
-                    {t.quotedPriceWei
+                    {task.quotedPriceWei
                       ? ethPrice > 0
-                        ? formatEthUsd(formatEther(BigInt(t.quotedPriceWei)), ethPrice)
-                        : `${formatEther(BigInt(t.quotedPriceWei))} ETH`
+                        ? formatEthUsd(formatEther(BigInt(task.quotedPriceWei)), ethPrice)
+                        : `${formatEther(BigInt(task.quotedPriceWei))} ETH`
                       : "--"}
                   </td>
                   <td className="px-4 py-3.5 text-right text-[13px] font-mono text-zinc-500">
-                    {t.ratedScore !== undefined ? `${t.ratedScore}/5` : "--"}
+                    {task.ratedScore !== undefined ? `${task.ratedScore}/5` : "--"}
                   </td>
                 </tr>
               ))}
@@ -175,7 +165,7 @@ export function Tasks() {
               <span className="text-[12px] text-zinc-500 font-mono uppercase">{selected.status}</span>
             </div>
             <button
-              onClick={() => setSelected(null)}
+              onClick={() => setSelectedId(null)}
               className="text-[12px] text-zinc-600 hover:text-zinc-300 transition-colors font-medium"
             >
               Close
@@ -187,7 +177,7 @@ export function Tasks() {
           <div className="flex gap-6 pt-1">
             {selected.quotedPriceWei && (
               <div>
-                <p className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider mb-0.5">Value</p>
+                <p className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider mb-0.5">Quoted Value</p>
                 <p className="text-sm font-mono text-zinc-300">
                   {ethPrice > 0
                     ? formatEthUsd(formatEther(BigInt(selected.quotedPriceWei)), ethPrice)
@@ -197,7 +187,7 @@ export function Tasks() {
             )}
             {selected.ratedScore !== undefined && (
               <div>
-                <p className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider mb-0.5">Score</p>
+                <p className="text-[10px] text-zinc-500 font-semibold uppercase tracking-wider mb-0.5">Client Score</p>
                 <p className="text-sm font-mono text-zinc-300">{selected.ratedScore}/5</p>
               </div>
             )}
@@ -205,7 +195,7 @@ export function Tasks() {
 
           {selected.result && (
             <div className="pt-1">
-              <p className="text-[11px] text-zinc-500 font-semibold uppercase tracking-wider mb-2">Output</p>
+              <p className="text-[11px] text-zinc-500 font-semibold uppercase tracking-wider mb-2">Deliverable</p>
               <pre className="text-[13px] text-zinc-400 bg-zinc-950 p-4 rounded-md overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap border border-zinc-800/60 font-mono leading-relaxed">
                 {selected.result}
               </pre>

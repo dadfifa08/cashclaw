@@ -11,8 +11,8 @@ export interface MemoryHit {
   meta: KnowledgeEntry | FeedbackEntry;
 }
 
-// Temporal decay: half-life of 30 days
-const DECAY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
+// Temporal decay: half-life of 45 days
+const DECAY_HALF_LIFE_MS = 45 * 24 * 60 * 60 * 1000;
 const DECAY_LAMBDA = Math.LN2 / DECAY_HALF_LIFE_MS;
 
 interface IndexDoc {
@@ -32,8 +32,8 @@ function createIndex(): MiniSearch<IndexDoc> {
     fields: ["text"],
     storeFields: ["type", "timestamp"],
     searchOptions: {
-      boost: { text: 1 },
-      fuzzy: 0.2,
+      boost: { text: 2 },
+      fuzzy: 0.1,
       prefix: true,
     },
   });
@@ -45,7 +45,6 @@ function syncIndex(): void {
   const feedback = loadFeedback();
   const currentTotal = knowledge.length + feedback.length;
 
-  // Full rebuild needed: first init, or entries were trimmed (fewer than indexed)
   const needsFullRebuild = !index || (dirty && currentTotal < indexedIds.size);
   if (needsFullRebuild) {
     index = createIndex();
@@ -53,14 +52,20 @@ function syncIndex(): void {
     docs.clear();
   }
 
-  // After the branch above, index is guaranteed non-null
   const idx = index!;
   const newDocs: IndexDoc[] = [];
 
   for (const k of knowledge) {
     const id = `k:${k.id}`;
     if (indexedIds.has(id)) continue;
-    const text = `${k.topic} ${k.specialty} ${k.insight}`;
+
+    const text = [
+      k.topic,
+      k.specialty,
+      k.source,
+      k.insight,
+    ].join(" ");
+
     newDocs.push({ id, type: "knowledge", text, timestamp: k.timestamp });
     docs.set(id, { type: "knowledge", meta: k });
     indexedIds.add(id);
@@ -69,7 +74,13 @@ function syncIndex(): void {
   for (const f of feedback) {
     const id = `f:${f.taskId}`;
     if (indexedIds.has(id)) continue;
-    const text = `${f.taskDescription} score:${f.score} ${f.comments}`;
+
+    const text = [
+      f.taskDescription,
+      `score ${f.score}`,
+      f.comments || "",
+    ].join(" ");
+
     newDocs.push({ id, type: "feedback", text, timestamp: f.timestamp });
     docs.set(id, { type: "feedback", meta: f });
     indexedIds.add(id);
@@ -104,7 +115,6 @@ export function searchMemory(query: string, limit = 5): MemoryHit[] {
   if (!index) return [];
 
   const results = index.search(query);
-
   const now = Date.now();
 
   const scored: MemoryHit[] = results
@@ -122,7 +132,7 @@ export function searchMemory(query: string, limit = 5): MemoryHit[] {
         text = `[${k.topic}/${k.specialty}] ${k.insight}`;
       } else {
         const f = doc.meta as FeedbackEntry;
-        text = `[${f.score}/5] "${f.taskDescription}" — ${f.comments || "no comment"}`;
+        text = `[feedback ${f.score}/5] "${f.taskDescription}" - ${f.comments || "no comment"}`;
       }
 
       return {

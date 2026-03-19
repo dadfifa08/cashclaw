@@ -63,7 +63,6 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
       if (imageFile) {
         imageData = await fileToDataUrl(imageFile);
       }
-      // Convert USD price â†’ ETH for on-chain registration
       const priceEth = ethPrice > 0 ? usdToEth(parseFloat(price) || 0, ethPrice) : price.trim();
 
       const res = await api.registerAgent({
@@ -82,6 +81,11 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
     } finally {
       setRegistering(false);
     }
+  }
+
+  function handleLocalContinue() {
+    const localAgentId = `local-${Date.now()}`;
+    onNext(localAgentId);
   }
 
   if (result) {
@@ -145,7 +149,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
   const TOKEN_OPTIONS: { value: TokenChoice; label: string; desc: string; detail: string }[] = [
     { value: "none", label: "NO TOKEN", desc: "Direct ETH payments", detail: "Clients pay you in ETH. Simple, no token needed." },
     { value: "launch", label: "LAUNCH TOKEN", desc: "New Flaunch token", detail: "Launch a tradeable token. You earn 10% of all trading fees forever. Requires an image." },
-    { value: "existing", label: "USE EXISTING", desc: "Existing ERC-20", detail: "Link an existing token on Base. Cosmetic â€” displayed on your profile." },
+    { value: "existing", label: "USE EXISTING", desc: "Existing ERC-20", detail: "Link an existing token on Base. Cosmetic only — displayed on your profile." },
   ];
 
   const needsImage = tokenChoice === "launch";
@@ -158,7 +162,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
       <div>
         <h2 className="text-base font-mono font-bold text-zinc-200 mb-1">Register Agent</h2>
         <p className="text-[11px] text-zinc-600 font-mono leading-relaxed">
-          Deploy to the marketplace. Accepts paid tasks 24/7 once live.
+          Deploy to the marketplace. Accept paid tasks once live, or continue locally for now.
         </p>
       </div>
 
@@ -186,7 +190,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
           <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">BASE PRICE (USD)</label>
           <input type="text" value={price} onChange={(e) => setPrice(e.target.value)} placeholder="10" className={inputCls} />
           {ethPrice > 0 && (
-            <p className="text-[9px] text-zinc-800 mt-0.5 font-mono">â‰ˆ {usdToEth(parseFloat(price) || 0, ethPrice)} ETH</p>
+            <p className="text-[9px] text-zinc-800 mt-0.5 font-mono">˜ {usdToEth(parseFloat(price) || 0, ethPrice)} ETH</p>
           )}
         </div>
 
@@ -240,7 +244,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
                   onClick={() => fileRef.current?.click()}
                   className="w-full py-3 border border-dashed border-zinc-800 rounded-sm text-[10px] text-zinc-600 font-mono hover:border-zinc-700 hover:text-zinc-500 transition-colors"
                 >
-                  Click to upload â€” PNG, JPG, GIF, WebP, SVG (max 5MB)
+                  Click to upload — PNG, JPG, GIF, WebP, SVG (max 5MB)
                 </button>
               )}
               {missingImage && (
@@ -263,26 +267,38 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
         </div>
       </div>
 
-      <button
-        onClick={handleRegister}
-        disabled={registering || !name.trim() || !description.trim() || missingImage}
-        className="w-full py-2.5 bg-red-600 text-white rounded-sm text-[11px] font-mono font-bold tracking-wider hover:bg-red-500 disabled:opacity-40 transition-colors"
-      >
-        {registering ? (
-          <span className="flex items-center justify-center gap-2">
-            <span className="w-3 h-3 border-2 border-red-300 border-t-white rounded-full animate-spin" />
-            REGISTERING ON-CHAIN...
-          </span>
-        ) : (
-          "REGISTER"
-        )}
-      </button>
+      <div className="space-y-2">
+        <button
+          onClick={handleRegister}
+          disabled={registering || !name.trim() || !description.trim() || missingImage}
+          className="w-full py-2.5 bg-red-600 text-white rounded-sm text-[11px] font-mono font-bold tracking-wider hover:bg-red-500 disabled:opacity-40 transition-colors"
+        >
+          {registering ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="w-3 h-3 border-2 border-red-300 border-t-white rounded-full animate-spin" />
+              REGISTERING ON-CHAIN...
+            </span>
+          ) : (
+            "REGISTER"
+          )}
+        </button>
+
+        <button
+          onClick={handleLocalContinue}
+          disabled={!name.trim() || !description.trim()}
+          className="w-full py-2.5 border border-zinc-800 text-zinc-300 rounded-sm text-[11px] font-mono font-bold tracking-wider hover:bg-zinc-900/50 disabled:opacity-40 transition-colors"
+        >
+          CONTINUE LOCALLY
+        </button>
+      </div>
 
       {registering && (
         <p className="text-[9px] text-zinc-700 text-center font-mono tracking-wider">
-          TX PENDING â€” MAY TAKE 30+ SECONDS
+          TX PENDING — MAY TAKE 30+ SECONDS
         </p>
       )}
     </div>
   );
 }
+
+

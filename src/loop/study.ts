@@ -1,5 +1,9 @@
-import type { LLMProvider, LLMMessage } from "../llm/types.js";
+import crypto from "node:crypto";
 import type { CashClawConfig } from "../config.js";
+import type { CateoModelRuntime, CateoRuntimeModelInfo } from "../llm/runtime.js";
+import { isCateoModelRuntime } from "../llm/runtime.js";
+import type { LLMMessage, LLMProvider } from "../llm/types.js";
+import { appendStudySession } from "../memory/datasets.js";
 import { loadFeedback, type FeedbackEntry } from "../memory/feedback.js";
 import {
   loadKnowledge,
@@ -11,33 +15,57 @@ export interface StudyResult {
   topic: KnowledgeEntry["topic"];
   insight: string;
   tokensUsed: number;
+  model: CateoRuntimeModelInfo;
 }
 
 const STUDY_TOPICS: KnowledgeEntry["topic"][] = [
   "feedback_analysis",
   "specialty_research",
   "task_simulation",
+  "diagnostic_pattern",
+  "procedure_guidance",
 ];
 
 const MAX_STUDY_TURNS = 3;
 
-/** Pick the next topic by rotating through the list based on past entries */
+type StudyModelInput = LLMProvider | CateoModelRuntime;
+
+function resolveStudyModel(runtime: StudyModelInput, config: CashClawConfig): { llm: LLMProvider; model: CateoRuntimeModelInfo } {
+  if (isCateoModelRuntime(runtime)) {
+    return {
+      llm: runtime.study,
+      model: runtime.meta.study,
+    };
+  }
+
+  return {
+    llm: runtime,
+    model: {
+      role: "study",
+      provider: config.llm.provider,
+      model: config.llm.model,
+      baseUrl: config.llm.baseUrl,
+    },
+  };
+}
+
 function pickTopic(existing: KnowledgeEntry[], feedback: FeedbackEntry[]): KnowledgeEntry["topic"] {
-  // Skip feedback_analysis if there's no feedback to analyze
   const eligible = feedback.length > 0
     ? STUDY_TOPICS
-    : STUDY_TOPICS.filter((t) => t !== "feedback_analysis");
+    : STUDY_TOPICS.filter((topic) => topic !== "feedback_analysis");
 
   const counts = new Map<string, number>();
   for (const topic of eligible) counts.set(topic, 0);
-  for (const e of existing) {
-    if (eligible.includes(e.topic)) {
-      counts.set(e.topic, (counts.get(e.topic) ?? 0) + 1);
+
+  for (const entry of existing) {
+    if (eligible.includes(entry.topic)) {
+      counts.set(entry.topic, (counts.get(entry.topic) ?? 0) + 1);
     }
   }
 
   let minTopic = eligible[0];
   let minCount = Infinity;
+
   for (const topic of eligible) {
     const count = counts.get(topic) ?? 0;
     if (count < minCount) {
@@ -45,6 +73,7 @@ function pickTopic(existing: KnowledgeEntry[], feedback: FeedbackEntry[]): Knowl
       minTopic = topic;
     }
   }
+
   return minTopic;
 }
 
@@ -56,56 +85,103 @@ function buildStudyPrompt(
 ): string {
   const specialties = config.specialties.length > 0
     ? config.specialties.join(", ")
-    : "general-purpose tasks";
+    : "general-purpose diagnostics";
 
   const recentFeedback = feedback.slice(-10);
   const feedbackSummary = recentFeedback.length > 0
     ? recentFeedback
-        .map((f) => `- Score ${f.score}/5: "${f.taskDescription}" — ${f.comments || "no comment"}`)
+        .map((entry) => `- Score ${entry.score}/5: "${entry.taskDescription}" - ${entry.comments || "no comment"}`)
         .join("\n")
     : "No feedback yet.";
 
   const existingKnowledge = knowledge.slice(-5)
-    .map((k) => `- [${k.topic}] ${k.insight.slice(0, 150)}`)
+    .map((entry) => `- [${entry.topic}] ${entry.insight.slice(0, 150)}`)
     .join("\n") || "None yet.";
 
-  const base = `You are a self-improving autonomous agent specializing in: ${specialties}.
-You are conducting a study session to improve your future task performance.
+  const base = `You are Cateo, a self-improving engineering agent specializing in: ${specialties}.
+You are conducting a study session to improve future task performance in inspection, troubleshooting, preventive maintenance, documentation, and technical workflow support.
 
-## Your existing knowledge
+## Existing knowledge
 ${existingKnowledge}
 
-## Recent feedback from clients
+## Recent client feedback
 ${feedbackSummary}
 `;
 
   switch (topic) {
     case "feedback_analysis":
       return `${base}
-## Task: Feedback Analysis
+## Study Task: Feedback Analysis
 
-Analyze the feedback patterns above. What patterns emerge? What kinds of tasks scored well vs poorly? What specific improvements should you make?
+Analyze the feedback patterns above.
+Identify:
+1. What types of work scored well
+2. What types of work scored poorly
+3. What recurring mistakes or weaknesses may be present
+4. What concrete improvements should be applied to future work
 
-Produce a concise insight (2-3 paragraphs) that will help you perform better on future tasks. Focus on actionable takeaways.`;
+Produce a concise insight with actionable takeaways.`;
 
     case "specialty_research":
       return `${base}
-## Task: Specialty Deep-Dive
+## Study Task: Specialty Deep-Dive
 
-As a specialist in ${specialties}, research and articulate:
-1. Common best practices and quality standards
-2. Frequent pitfalls and how to avoid them
-3. Patterns that distinguish excellent work from mediocre work
+For the specialties ${specialties}, articulate:
+1. Best practices and quality standards
+2. Common pitfalls and failure patterns
+3. What distinguishes strong work from mediocre work
+4. Practical methods to increase reliability and usefulness
 
-Produce a concise insight (2-3 paragraphs) with concrete, actionable knowledge.`;
+Produce a concise insight with concrete, actionable knowledge.`;
 
     case "task_simulation":
       return `${base}
-## Task: Practice Simulation
+## Study Task: Practice Simulation
 
-Generate a realistic task request that a client might submit for your specialties (${specialties}). Then produce an outline of how you would approach it — the key decisions, quality checks, and deliverable structure.
+Generate a realistic client request related to ${specialties}.
+Then explain:
+1. How Cateo should approach the task
+2. What evidence or context would matter most
+3. What a strong deliverable should include
+4. What mistakes should be avoided
 
-Produce a concise insight (2-3 paragraphs) covering the approach and lessons learned.`;
+Produce a concise insight covering the approach and lessons learned.`;
+
+    case "diagnostic_pattern":
+      return `${base}
+## Study Task: Diagnostic Pattern Extraction
+
+Identify a realistic technical failure pattern or recurring troubleshooting scenario related to ${specialties}.
+Then explain:
+1. Typical symptoms
+2. Likely root causes
+3. Evidence that helps distinguish causes
+4. Corrective actions
+5. Preventive actions
+
+Produce a concise diagnostic pattern that would improve future technical reasoning.`;
+
+    case "procedure_guidance":
+      return `${base}
+## Study Task: Procedure and Guidance Improvement
+
+Develop a compact set of guidance for producing stronger technical procedures, checklists, or troubleshooting instructions in the domain of ${specialties}.
+Focus on:
+1. Clarity
+2. Sequence
+3. Decision points
+4. Safety / risk awareness
+5. Common omissions
+
+Produce a concise insight that would help generate better structured deliverables in future tasks.`;
+
+    default: {
+      const _exhaustive: never = topic;
+      return `${base}
+## Study Task
+
+Produce a concise technical insight that improves future work quality.`;
+    }
   }
 }
 
@@ -114,16 +190,16 @@ function generateId(): string {
 }
 
 export async function runStudySession(
-  llm: LLMProvider,
+  runtimeInput: StudyModelInput,
   config: CashClawConfig,
 ): Promise<StudyResult> {
+  const resolved = resolveStudyModel(runtimeInput, config);
   const feedback = loadFeedback();
   const knowledge = loadKnowledge();
   const topic = pickTopic(knowledge, feedback);
 
-  // Rotate through specialties instead of always using the first one
   const specialtyPool = config.specialties.length > 0 ? config.specialties : ["general"];
-  const topicEntries = knowledge.filter((k) => k.topic === topic);
+  const topicEntries = knowledge.filter((entry) => entry.topic === topic);
   const specialty = specialtyPool[topicEntries.length % specialtyPool.length];
   const prompt = buildStudyPrompt(topic, config, feedback, knowledge);
 
@@ -134,17 +210,15 @@ export async function runStudySession(
   let totalTokens = 0;
   let lastText = "";
 
-  // Run up to MAX_STUDY_TURNS — no tools, pure reasoning
-  for (let turn = 0; turn < MAX_STUDY_TURNS; turn++) {
-    const response = await llm.chat(messages);
+  for (let turn = 0; turn < MAX_STUDY_TURNS; turn += 1) {
+    const response = await resolved.llm.chat(messages);
     totalTokens += response.usage.inputTokens + response.usage.outputTokens;
 
     const textBlocks = response.content.filter(
-      (b): b is { type: "text"; text: string } => b.type === "text",
+      (block): block is { type: "text"; text: string } => block.type === "text",
     );
-    lastText = textBlocks.map((b) => b.text).join("\n");
+    lastText = textBlocks.map((block) => block.text).join("\n");
 
-    // Single turn is usually enough for study sessions
     if (response.stopReason === "end_turn") break;
 
     messages.push({ role: "assistant", content: response.content });
@@ -156,9 +230,8 @@ export async function runStudySession(
 
   const insight = lastText.trim() || "No insight produced.";
 
-  // Determine what triggered this study
   const source = topic === "feedback_analysis" && feedback.length > 0
-    ? `${feedback.length} feedback entries (avg ${(feedback.reduce((s, f) => s + f.score, 0) / feedback.length).toFixed(1)}/5)`
+    ? `${feedback.length} feedback entries (avg ${(feedback.reduce((sum, entry) => sum + entry.score, 0) / feedback.length).toFixed(1)}/5)`
     : `scheduled ${topic} session`;
 
   const entry: KnowledgeEntry = {
@@ -172,5 +245,18 @@ export async function runStudySession(
 
   storeKnowledge(entry);
 
-  return { topic, insight, tokensUsed: totalTokens };
+  appendStudySession({
+    schemaVersion: "1.0",
+    kind: "study_session",
+    timestamp: entry.timestamp,
+    topic,
+    specialty,
+    insight,
+    source,
+    tokensUsed: totalTokens,
+    modelProvider: resolved.model.provider,
+    modelName: resolved.model.model,
+  });
+
+  return { topic, insight, tokensUsed: totalTokens, model: resolved.model };
 }

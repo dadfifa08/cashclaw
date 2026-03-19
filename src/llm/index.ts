@@ -34,7 +34,7 @@ function createAnthropicProvider(config: LLMConfig): LLMProvider {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": config.apiKey,
+          "x-api-key": config.apiKey ?? "",
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(body),
@@ -236,7 +236,14 @@ export function createLLMProvider(config: LLMConfig): LLMProvider {
         config,
         "https://openrouter.ai/api/v1",
       );
+    case "ollama":
+      return createOpenAICompatibleProvider(
+        config,
+        config.baseUrl ?? "http://localhost:11434/v1",
+      );
     default:
       throw new Error(`Unknown LLM provider: ${config.provider}`);
   }
 }
+
+

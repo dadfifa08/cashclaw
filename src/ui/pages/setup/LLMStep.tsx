@@ -9,11 +9,13 @@ const PROVIDERS = [
   { value: "anthropic", label: "ANTHROPIC", desc: "Claude models", model: "claude-sonnet-4-20250514" },
   { value: "openai", label: "OPENAI", desc: "GPT-4o", model: "gpt-4o" },
   { value: "openrouter", label: "OPENROUTER", desc: "Multi-provider", model: "openai/gpt-5.4" },
+  { value: "ollama", label: "OLLAMA", desc: "Local OpenAI-compatible endpoint", model: "qwen3-coder-next" },
 ];
 
 export function LLMStep({ onNext }: LLMStepProps) {
   const [provider, setProvider] = useState("anthropic");
   const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("http://localhost:11434/v1");
   const [model, setModel] = useState(PROVIDERS[0].model);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -21,21 +23,33 @@ export function LLMStep({ onNext }: LLMStepProps) {
   const [testPassed, setTestPassed] = useState(false);
   const [error, setError] = useState("");
 
+  const isOllama = provider === "ollama";
+  const canTest = model.trim() !== "" && (isOllama ? baseUrl.trim() !== "" : apiKey.trim() !== "");
+
   function handleProviderChange(p: string) {
     setProvider(p);
     const prov = PROVIDERS.find((pr) => pr.value === p);
     setModel(prov?.model ?? "");
+    if (p === "ollama" && !baseUrl.trim()) {
+      setBaseUrl("http://localhost:11434/v1");
+    }
     setTestPassed(false);
     setTestResult(null);
+    setError("");
   }
 
   async function handleTest() {
-    if (!apiKey.trim()) return;
+    if (!canTest) return;
     setTesting(true);
     setError("");
     setTestResult(null);
     try {
-      const result = await api.testLLM({ provider, model, apiKey });
+      const result = await api.testLLM({
+        provider,
+        model,
+        apiKey: isOllama ? undefined : apiKey,
+        baseUrl: isOllama ? baseUrl : undefined,
+      });
       setTestResult(result.response);
       setTestPassed(true);
     } catch (err) {
@@ -50,7 +64,12 @@ export function LLMStep({ onNext }: LLMStepProps) {
     setSaving(true);
     setError("");
     try {
-      await api.saveLLM({ provider, model, apiKey });
+      await api.saveLLM({
+        provider,
+        model,
+        apiKey: isOllama ? undefined : apiKey,
+        baseUrl: isOllama ? baseUrl : undefined,
+      });
       onNext();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save");
@@ -97,26 +116,46 @@ export function LLMStep({ onNext }: LLMStepProps) {
           </div>
         </div>
 
-        <div>
-          <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">API KEY</label>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => { setApiKey(e.target.value); setTestPassed(false); }}
-            placeholder="sk-..."
-            className={inputCls}
-          />
-        </div>
+        {!isOllama && (
+          <div>
+            <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">API KEY</label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => { setApiKey(e.target.value); setTestPassed(false); }}
+              placeholder="sk-..."
+              className={inputCls}
+            />
+          </div>
+        )}
+
+        {isOllama && (
+          <div>
+            <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">BASE URL</label>
+            <input
+              type="text"
+              value={baseUrl}
+              onChange={(e) => { setBaseUrl(e.target.value); setTestPassed(false); }}
+              placeholder="http://localhost:11434/v1"
+              className={inputCls}
+            />
+          </div>
+        )}
 
         <div>
           <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">MODEL</label>
-          <input type="text" value={model} onChange={(e) => setModel(e.target.value)} className={inputCls} />
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => { setModel(e.target.value); setTestPassed(false); }}
+            className={inputCls}
+          />
         </div>
       </div>
 
       <button
         onClick={handleTest}
-        disabled={testing || !apiKey.trim()}
+        disabled={testing || !canTest}
         className="w-full py-2 border border-zinc-800 rounded-sm text-[10px] text-zinc-500 hover:bg-zinc-900/50 disabled:opacity-40 font-mono tracking-wider transition-colors"
       >
         {testing ? (
