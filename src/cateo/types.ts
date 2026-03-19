@@ -402,6 +402,7 @@ export interface CateoCaseRecord {
   input: CateoAssistInput;
   context: CateoContextBundle;
   artifacts: string[];
+  interaction?: CateoInteractionProjection;
   trace: CateoReasoningTrace;
 }
 
@@ -454,15 +455,82 @@ export interface CateoFinalSynthesis {
   operatorNotes: string[];
 }
 
+export interface CateoBuilderArtifactDraft {
+  artifactType: CateoArtifactType;
+  title: string;
+  content: CateoArtifactContent;
+  generationMode: "model" | "deterministic-fallback";
+  validationErrors: string[];
+  notes: string[];
+}
+
+export interface CateoBuilderPackage {
+  packageSummary: string;
+  artifactPlans: CateoStructureBlueprintLine[];
+  artifactDrafts: CateoBuilderArtifactDraft[];
+}
+
+export interface CateoReviewerDecision {
+  overallStatus: "pass" | "needs-revision";
+  technicalAccuracy: "pass" | "needs-attention";
+  completeness: "pass" | "needs-attention";
+  compliance: "pass" | "needs-attention";
+  findings: string[];
+  approvedArtifactTypes: CateoArtifactType[];
+  approvalState: CateoApprovalState;
+  confidence: CateoConfidence;
+  summary: string;
+  requiredFollowUp: string[];
+}
+
+export type CateoCheckpointStage =
+  | "accepted"
+  | "planning"
+  | "building"
+  | "reviewing"
+  | "persisting"
+  | "rendering"
+  | "completed"
+  | "failed";
+
+export type CateoCheckpointStatus = "running" | "completed" | "failed";
+
+export interface CateoInteractionCheckpoint {
+  checkpointId: string;
+  stage: CateoCheckpointStage;
+  status: CateoCheckpointStatus;
+  label: string;
+  summary: string;
+  occurredAt: number;
+  taskClass?: CateoTaskClass;
+  confidence?: CateoConfidence;
+  artifactTypes?: CateoArtifactType[];
+  artifactCount?: number;
+}
+export interface CateoInteractionProjection {
+  message: string;
+  highlights: string[];
+  nextActions: string[];
+  confidence: CateoConfidence;
+  artifactCount: number;
+  artifactLabels: string[];
+  renderedAt: string;
+  rendererVersion: string;
+}
+
 export interface CateoReasoningTrace {
   route: CateoRoutingDecision;
   leadPlan: CateoLeadPlan;
   challengerCritique?: CateoChallengerCritique;
   structureBlueprint?: CateoStructureBlueprint;
+  builderPackage?: CateoBuilderPackage;
+  reviewerDecision?: CateoReviewerDecision;
   finalSynthesis: CateoFinalSynthesis;
   rawLeadPlan?: string;
   rawChallengerCritique?: string;
   rawStructureBlueprint?: string;
+  rawBuilderPackage?: string;
+  rawReviewerDecision?: string;
   rawFinalSynthesis?: string;
 }
 
@@ -470,6 +538,8 @@ export interface CateoAssistResult {
   caseId: string;
   runId: string;
   summary: string;
+  interaction: CateoInteractionProjection;
+  checkpoints: CateoInteractionCheckpoint[];
   context: CateoContextBundle;
   trace: CateoReasoningTrace;
   artifacts: CateoArtifactRecord[];
@@ -491,3 +561,4 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+

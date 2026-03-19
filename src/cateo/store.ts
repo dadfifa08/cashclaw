@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import { upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
 import type {
   CateoArtifactContent,
   CateoArtifactRecord,
@@ -10,6 +11,46 @@ import type {
   CateoCaseRecord,
   CateoJsonDiffEntry,
 } from "./types.js";
+
+const DATABASE_VERSION = "cateo-document-db-v1";
+
+interface ArtifactCatalogRow {
+  artifactId: string;
+  caseId: string;
+  artifactType: string;
+  assetId?: string;
+  workOrderId?: string;
+  schemaId: string;
+  schemaVersion: string;
+  approvalState: string;
+  revisionNumber: number;
+  summary: string;
+  updatedAt: string;
+}
+
+interface ArtifactCatalogFile {
+  version: string;
+  updatedAt: string;
+  rows: ArtifactCatalogRow[];
+}
+
+interface CaseCatalogRow {
+  caseId: string;
+  runId: string;
+  title: string;
+  taskClass: string;
+  assetId?: string;
+  workOrderId?: string;
+  artifactIds: string[];
+  interactionSummary?: string;
+  updatedAt: string;
+}
+
+interface CaseCatalogFile {
+  version: string;
+  updatedAt: string;
+  rows: CaseCatalogRow[];
+}
 
 function getCateoDir(): string {
   return path.join(getConfigDir(), "cateo");
@@ -21,6 +62,10 @@ function getArtifactDir(): string {
 
 function getCaseDir(): string {
   return path.join(getCateoDir(), "cases");
+}
+
+function getDatabaseDir(): string {
+  return path.join(getCateoDir(), "db");
 }
 
 function ensureDir(dir: string): void {
@@ -35,6 +80,16 @@ function artifactPath(artifactId: string): string {
 function casePath(caseId: string): string {
   ensureDir(getCaseDir());
   return path.join(getCaseDir(), `${caseId}.json`);
+}
+
+function artifactCatalogPath(): string {
+  ensureDir(getDatabaseDir());
+  return path.join(getDatabaseDir(), "artifacts.json");
+}
+
+function caseCatalogPath(): string {
+  ensureDir(getDatabaseDir());
+  return path.join(getDatabaseDir(), "cases.json");
 }
 
 function stableStringify(value: unknown): string {
@@ -83,6 +138,73 @@ function diffRecursive(before: unknown, after: unknown, currentPath: string, dif
   });
 }
 
+function loadArtifactCatalog(): ArtifactCatalogFile {
+  return readProtectedJson<ArtifactCatalogFile>(artifactCatalogPath(), {
+    version: DATABASE_VERSION,
+    updatedAt: new Date(0).toISOString(),
+    rows: [],
+  });
+}
+
+function saveArtifactCatalog(file: ArtifactCatalogFile): void {
+  writeProtectedJson(artifactCatalogPath(), file);
+}
+
+function upsertArtifactCatalog(record: CateoArtifactRecord): void {
+  const current = record.revisions[record.revisions.length - 1];
+  const next: ArtifactCatalogRow = {
+    artifactId: record.artifactId,
+    caseId: record.caseId,
+    artifactType: record.artifactType,
+    assetId: record.assetId,
+    workOrderId: record.workOrderId,
+    schemaId: record.schema.id,
+    schemaVersion: record.schema.version,
+    approvalState: current.approvalState,
+    revisionNumber: current.revisionNumber,
+    summary: current.summary,
+    updatedAt: record.updatedAt,
+  };
+
+  const file = loadArtifactCatalog();
+  const rows = file.rows.filter((entry) => entry.artifactId !== record.artifactId);
+  rows.push(next);
+  rows.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+  saveArtifactCatalog({ version: DATABASE_VERSION, updatedAt: new Date().toISOString(), rows });
+}
+
+function loadCaseCatalog(): CaseCatalogFile {
+  return readProtectedJson<CaseCatalogFile>(caseCatalogPath(), {
+    version: DATABASE_VERSION,
+    updatedAt: new Date(0).toISOString(),
+    rows: [],
+  });
+}
+
+function saveCaseCatalog(file: CaseCatalogFile): void {
+  writeProtectedJson(caseCatalogPath(), file);
+}
+
+function upsertCaseCatalog(record: CateoCaseRecord): void {
+  const next: CaseCatalogRow = {
+    caseId: record.caseId,
+    runId: record.runId,
+    title: record.context.title,
+    taskClass: record.context.taskClass,
+    assetId: record.context.asset?.assetId,
+    workOrderId: record.context.workOrder?.workOrderId,
+    artifactIds: record.artifacts,
+    interactionSummary: record.interaction?.message,
+    updatedAt: record.updatedAt,
+  };
+
+  const file = loadCaseCatalog();
+  const rows = file.rows.filter((entry) => entry.caseId !== record.caseId);
+  rows.push(next);
+  rows.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+  saveCaseCatalog({ version: DATABASE_VERSION, updatedAt: new Date().toISOString(), rows });
+}
+
 export function buildJsonDiff(before: unknown, after: unknown): CateoJsonDiffEntry[] {
   const diff: CateoJsonDiffEntry[] = [];
   diffRecursive(before, after, "", diff);
@@ -115,6 +237,8 @@ export function fingerprintEvidence(value: unknown): string {
 
 export function saveArtifactRecord(record: CateoArtifactRecord): CateoArtifactRecord {
   writeProtectedJson(artifactPath(record.artifactId), record);
+  upsertArtifactCatalog(record);
+  upsertArtifactVectorEntry(record);
   return record;
 }
 
@@ -125,6 +249,8 @@ export function loadArtifactRecord(artifactId: string): CateoArtifactRecord | nu
 
 export function saveCaseRecord(record: CateoCaseRecord): CateoCaseRecord {
   writeProtectedJson(casePath(record.caseId), record);
+  upsertCaseCatalog(record);
+  upsertCaseVectorEntry(record);
   return record;
 }
 

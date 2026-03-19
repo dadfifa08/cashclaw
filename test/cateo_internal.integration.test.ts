@@ -37,21 +37,21 @@ const mocks = vi.hoisted(() => {
           assumptions: ["The reported asset tag is correct."],
           risks: ["Do not release the asset without objective verification."],
           decisionBasis: ["Symptom, history, and geometry must align."],
-          artifactPriorities: ["troubleshooting-procedure", "service-report", "diagnostic-reasoning-log"],
+          artifactPriorities: ["inspection-checklist", "service-report", "diagnostic-reasoning-log"],
           maintenanceConsiderations: ["Tie deliverables to the work order."],
           partsConsiderations: ["Bearing kit is a candidate part."],
         });
-      } else if (system.includes("alternateHypotheses")) {
+      } else if (system.includes("artifactDrafts")) {
         text = JSON.stringify({
-          alternateHypotheses: ["Bearing wear is causing the temperature alarm."],
-          blindSpots: ["Lubrication quality has not been verified."],
-          missingAssumptions: ["Process load at the time of the event is not confirmed."],
-          evidenceGaps: ["Need a dimensional check on shaft runout."],
-          recommendedAdjustments: ["Add a verification step for lubrication condition."],
-        });
-      } else if (system.includes("artifactPlans")) {
-        text = JSON.stringify({
+          packageSummary: "Structured troubleshooting package ready for review.",
           artifactPlans: [
+            {
+              artifactType: "inspection-checklist",
+              title: "Pump inspection checklist",
+              sectionOrder: ["scope", "prep", "checks", "completion"],
+              qualityGates: ["Schema valid", "Traceable"],
+              requiredEvidence: ["Alarm confirmation", "Thermal evidence"],
+            },
             {
               artifactType: "troubleshooting-procedure",
               title: "Pump troubleshooting procedure",
@@ -74,15 +74,107 @@ const mocks = vi.hoisted(() => {
               requiredEvidence: ["All evidence gaps"],
             },
           ],
+          artifactDrafts: [
+            {
+              artifactType: "inspection-checklist",
+              title: "Pump inspection checklist",
+              content: {
+                title: "Pump inspection checklist",
+                scope: "Controlled inspection package for the pump overtemperature alarm.",
+                prepSteps: ["Review thermal evidence and work order context."],
+                safetyNotes: ["Lock out the pump before intrusive inspection."],
+                checklist: [
+                  {
+                    id: "ic-1",
+                    check: "Verify housing temperature against the approved range.",
+                    method: "Measurement or functional verification",
+                    passCriteria: "Measured result is within the allowed tolerance or specification.",
+                    evidenceRequired: "Calibrated measurement, screenshot, or instrument capture",
+                    severityIfFailed: "high",
+                  },
+                ],
+                completionCriteria: ["All required checks have objective evidence attached or referenced."],
+              },
+            },
+            {
+              artifactType: "troubleshooting-procedure",
+              title: "Pump troubleshooting procedure",
+              content: {
+                title: "Pump troubleshooting procedure",
+                objective: "Control the pump overtemperature fault through verified inspection and diagnosis.",
+                failureCode: "E-441",
+                symptoms: ["Pump temperature alarm is triggering during normal load."],
+                assumptions: ["The reported asset tag is correct."],
+                evidenceSummary: ["Alarm history reviewed.", "Maintenance history reviewed.", "Runout measurement required."],
+                safetyPrecautions: ["Lock out the pump before intrusive inspection."],
+                requiredParts: ["BRG-100: Bearing kit"],
+                requiredTools: ["Calibrated multimeter", "Dial indicator"],
+                steps: [
+                  {
+                    id: "ts-1",
+                    action: "Verify the alarm state.",
+                    rationale: "Confirms the active fault condition before part replacement.",
+                    expectedResult: "Alarm behavior is confirmed under controlled conditions.",
+                  },
+                ],
+                acceptanceCriteria: ["Fault is cleared with objective evidence."],
+                followUpActions: ["Verify lubrication condition.", "Measure shaft runout."],
+              },
+            },
+            {
+              artifactType: "service-report",
+              title: "Pump service report",
+              content: {
+                title: "Pump service report",
+                summary: "Controlled troubleshooting package prepared for the pump overtemperature alarm.",
+                findings: ["Bearing wear remains the primary root-cause candidate."],
+                actionsPerformed: ["Reviewed history.", "Prepared diagnostic steps."],
+                unresolvedRisks: ["Lubrication quality still needs verification."],
+                recommendations: ["Verify lubrication condition.", "Measure shaft runout."],
+                signoffRequirement: "Quality review required before release.",
+              },
+            },
+            {
+              artifactType: "diagnostic-reasoning-log",
+              title: "Pump diagnostic reasoning log",
+              content: {
+                title: "Pump diagnostic reasoning log",
+                problemStatement: "Pump temperature alarm is triggering during normal load.",
+                hypotheses: [
+                  {
+                    name: "Bearing wear is causing the temperature alarm.",
+                    status: "candidate",
+                    evidenceFor: ["Alarm recurrence aligns with bearing degradation."],
+                    evidenceAgainst: ["Lubrication condition not yet verified."],
+                  },
+                ],
+                assumptions: ["The reported asset tag is correct."],
+                evidenceRequests: ["Verify lubrication condition.", "Measure shaft runout."],
+                rootCauseStatement: "Bearing wear remains the primary root-cause candidate.",
+                confidence: "medium",
+              },
+            },
+          ],
         });
-      } else if (system.includes("executiveSummary")) {
+      } else if (system.includes("reviewDecision")) {
         text = JSON.stringify({
-          executiveSummary: "Prepared a controlled troubleshooting package for the reported pump alarm.",
-          decision: "draft",
-          confidence: "medium",
-          rootCauseStatement: "Bearing wear remains the primary root-cause candidate.",
-          nextActions: ["Verify lubrication condition.", "Measure shaft runout.", "Route the package for review."],
-          operatorNotes: ["Hold for review before release."],
+          alternateHypotheses: ["Bearing wear is causing the temperature alarm."],
+          blindSpots: ["Lubrication quality has not been verified."],
+          missingAssumptions: ["Process load at the time of the event is not confirmed."],
+          evidenceGaps: ["Need a dimensional check on shaft runout."],
+          recommendedAdjustments: ["Add a verification step for lubrication condition."],
+          reviewDecision: {
+            overallStatus: "pass",
+            technicalAccuracy: "pass",
+            completeness: "pass",
+            compliance: "pass",
+            findings: ["Traceability package complete."],
+            approvedArtifactTypes: ["inspection-checklist", "service-report", "diagnostic-reasoning-log"],
+            approvalState: "reviewed",
+            confidence: "high",
+            summary: "Reviewer validated the package.",
+            requiredFollowUp: ["Obtain authorized sign-off before release."],
+          },
         });
       }
       return {
@@ -188,7 +280,7 @@ describe("Cateo internal API", () => {
     expect(allowed.status).toBe(200);
   });
 
-  it("generates, revises, and signs off schema-valid artifacts", async () => {
+  it("generates, revises, signs off, and indexes artifact-first responses", async () => {
     ({ server, baseUrl } = await bootRuntime());
     const assist = await fetch(`${baseUrl}/internal/cateo/assist`, {
       method: "POST",
@@ -206,10 +298,16 @@ describe("Cateo internal API", () => {
       }),
     });
     expect(assist.status).toBe(200);
-    const assistPayload = await assist.json() as { summary: string; artifacts: Array<{ artifactId: string; revisions: Array<{ approvalState: string }> }>; context: { attachments: Array<{ width?: number; height?: number; kind: string }>; digitalTwin?: { status?: string } } };
-    expect(assistPayload.summary).toContain("Prepared");
-    expect(assistPayload.artifacts.length).toBeGreaterThan(1);
-    expect(assistPayload.artifacts[0]?.revisions[0]?.approvalState).toBe("draft");
+    const assistPayload = await assist.json() as {
+      summary: string;
+      interaction: { message: string; artifactCount: number; confidence: string };
+      artifacts: Array<{ artifactId: string; revisions: Array<{ approvalState: string }> }>;
+      context: { attachments: Array<{ width?: number; height?: number; kind: string }>; digitalTwin?: { status?: string } };
+    };
+    expect(assistPayload.summary).toBe(assistPayload.interaction.message);
+    expect(assistPayload.interaction.message).toContain("Bearing wear");
+    expect(assistPayload.interaction.artifactCount).toBeGreaterThan(1);
+    expect(assistPayload.artifacts[0]?.revisions[0]?.approvalState).toBe("reviewed");
     expect(assistPayload.context.attachments[0]?.kind).toBe("image");
     expect(assistPayload.context.attachments[0]?.width).toBe(1);
     expect(assistPayload.context.attachments[0]?.height).toBe(1);
@@ -233,5 +331,24 @@ describe("Cateo internal API", () => {
     expect(signoff.status).toBe(200);
     const signoffPayload = await signoff.json() as { artifact: { revisions: Array<{ approvalState: string }> } };
     expect(signoffPayload.artifact.revisions.at(-1)?.approvalState).toBe("reviewed");
+
+    const { getConfigDir } = await import("../src/config.js");
+    const configDir = getConfigDir();
+    const artifactCatalogPath = path.join(configDir, "cateo", "db", "artifacts.json");
+    const caseCatalogPath = path.join(configDir, "cateo", "db", "cases.json");
+    const vectorIndexPath = path.join(configDir, "cateo", "index", "vector_index.json");
+
+    expect(fs.existsSync(artifactCatalogPath)).toBe(true);
+    expect(fs.existsSync(caseCatalogPath)).toBe(true);
+    expect(fs.existsSync(vectorIndexPath)).toBe(true);
+
+    const artifactCatalog = JSON.parse(fs.readFileSync(artifactCatalogPath, "utf-8")) as { rows: Array<{ artifactId: string }> };
+    const caseCatalog = JSON.parse(fs.readFileSync(caseCatalogPath, "utf-8")) as { rows: Array<{ caseId: string; interactionSummary?: string }> };
+    const vectorIndex = JSON.parse(fs.readFileSync(vectorIndexPath, "utf-8")) as { entries: Array<{ id: string }> };
+
+    expect(artifactCatalog.rows.some((row) => row.artifactId === artifactId)).toBe(true);
+    expect(caseCatalog.rows[0]?.interactionSummary).toContain("Bearing wear");
+    expect(vectorIndex.entries.length).toBeGreaterThan(1);
   });
 });
+
