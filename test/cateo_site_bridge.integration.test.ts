@@ -158,9 +158,9 @@ describe("Cateo site bridge", () => {
     expect(allowed.status).toBe(200);
   });
 
-  it("generates artifacts through the authenticated bridge", async () => {
+  it("queues and completes async assist jobs through the authenticated bridge", async () => {
     ({ server, baseUrl } = await bootBridge());
-    const assist = await fetch(`${baseUrl}/internal/cateo/assist`, {
+    const submit = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
       method: "POST",
       headers: { Authorization: "Bearer cateo-site-bridge-token", "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -171,9 +171,26 @@ describe("Cateo site bridge", () => {
       }),
     });
 
-    expect(assist.status).toBe(200);
-    const payload = await assist.json() as { summary: string; artifacts: Array<{ artifactType: string }> };
-    expect(payload.summary).toContain("Prepared");
-    expect(payload.artifacts[0]?.artifactType).toBe("inspection-checklist");
+    expect(submit.status).toBe(202);
+    const job = await submit.json() as { jobId: string; status: string };
+    expect(job.jobId).toBeTruthy();
+    expect(["queued", "running"]).toContain(job.status);
+
+    let result: { status: string; result?: { summary: string; artifacts: Array<{ artifactType: string }> } } | null = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const poll = await fetch(`${baseUrl}/internal/cateo/jobs/assist/${job.jobId}`, {
+        headers: { Authorization: "Bearer cateo-site-bridge-token" },
+      });
+      expect(poll.status).toBe(200);
+      result = await poll.json() as { status: string; result?: { summary: string; artifacts: Array<{ artifactType: string }> } };
+      if (result.status === "completed") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(result?.status).toBe("completed");
+    expect(result?.result?.summary).toContain("Prepared");
+    expect(result?.result?.artifacts[0]?.artifactType).toBe("inspection-checklist");
   });
 });

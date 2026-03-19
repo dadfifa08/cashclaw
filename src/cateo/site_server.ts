@@ -4,9 +4,12 @@ import { loadConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./http_api.js";
 import { getInternalServiceToken } from "../system/service_auth.js";
+import { getAssistJob, submitAssistJob } from "./site_jobs.js";
+import type { CateoAssistInput } from "./types.js";
 
 const DEFAULT_SITE_BRIDGE_HOST = "127.0.0.1";
 const DEFAULT_SITE_BRIDGE_PORT = 3788;
+const JOBS_PREFIX = `${INTERNAL_CATEO_PREFIX}/jobs/assist`;
 
 export interface CateoSiteBridgeSettings {
   host: string;
@@ -57,6 +60,25 @@ function hasValidInternalToken(req: http.IncomingMessage, expectedToken: string)
   return crypto.timingSafeEqual(expectedBuffer, presentedBuffer);
 }
 
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+function parseJsonBody<T>(raw: string): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+}
+
 export async function startCateoSiteBridge(
   settings: CateoSiteBridgeSettings = resolveCateoSiteBridgeSettings(),
 ): Promise<http.Server> {
@@ -86,6 +108,7 @@ export async function startCateoSiteBridge(
         ok: true,
         configured: !!loadConfig(),
         internalApiPrefix: INTERNAL_CATEO_PREFIX,
+        jobsPrefix: JOBS_PREFIX,
         localOnlyListener: settings.baseUrl,
       });
       return;
@@ -98,6 +121,32 @@ export async function startCateoSiteBridge(
 
     if (!hasValidInternalToken(req, internalServiceToken)) {
       json(res, { error: "Unauthorized" }, 403);
+      return;
+    }
+
+    if (url.pathname === JOBS_PREFIX) {
+      if (req.method !== "POST") {
+        json(res, { error: "POST only" }, 405);
+        return;
+      }
+      const body = parseJsonBody<CateoAssistInput>(await readBody(req));
+      const job = submitAssistJob(body, requestId);
+      json(res, job, 202);
+      return;
+    }
+
+    if (url.pathname.startsWith(`${JOBS_PREFIX}/`)) {
+      if (req.method !== "GET") {
+        json(res, { error: "GET only" }, 405);
+        return;
+      }
+      const jobId = decodeURIComponent(url.pathname.slice(`${JOBS_PREFIX}/`.length));
+      const job = getAssistJob(jobId);
+      if (!job) {
+        json(res, { error: "Job not found" }, 404);
+        return;
+      }
+      json(res, job);
       return;
     }
 
@@ -131,4 +180,3 @@ export async function startCateoSiteBridge(
 
   return server;
 }
-
