@@ -44,6 +44,18 @@ const ARTIFACT_TYPES: CateoArtifactType[] = [
   "diagnostic-reasoning-log",
 ];
 
+const CATEO_STAGE_BUDGET_MS = {
+  planner: 30_000,
+  builder: 45_000,
+  reviewer: 30_000,
+} as const;
+
+const CATEO_STAGE_MAX_TOKENS = {
+  planner: 1_200,
+  builder: 2_200,
+  reviewer: 1_400,
+} as const;
+
 interface StageResult<T> {
   data: T;
   raw?: string;
@@ -88,6 +100,14 @@ function extractText(response: LLMResponse): string {
 
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
+}
+
+function normalizeAssistInput(input: CateoAssistInput): CateoAssistInput {
+  const symptomDescription = input.symptomDescription?.trim() || input.query?.trim() || input.title?.trim() || "No symptom description provided.";
+  return {
+    ...input,
+    symptomDescription,
+  };
 }
 
 function trimCodeFences(raw: string): string {
@@ -292,13 +312,25 @@ async function callJsonStage<T>(params: {
   systemPrompt: string;
   userPrompt: string;
   fallback: T;
+  timeoutMs: number;
+  maxTokens: number;
   requestId?: string;
 }): Promise<StageResult<T>> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, params.timeoutMs);
+
   try {
     const response = await params.llm.chat([
       { role: "system", content: params.systemPrompt },
       { role: "user", content: params.userPrompt },
-    ]);
+    ], undefined, {
+      signal: controller.signal,
+      maxTokens: params.maxTokens,
+    });
     const raw = extractText(response);
     const parsed = parseJsonObject<T>(raw);
     if (!parsed) {
@@ -310,7 +342,13 @@ async function callJsonStage<T>(params: {
         severity: "warn",
         message: `${params.stage} returned non-JSON output; using deterministic fallback`,
         requestId: params.requestId,
-        metadata: { model: params.modelInfo.model, provider: params.modelInfo.provider },
+        metadata: {
+          model: params.modelInfo.model,
+          provider: params.modelInfo.provider,
+          maxTokens: params.maxTokens,
+          timeoutMs: params.timeoutMs,
+          fallbackReason: "non_json",
+        },
       });
       return { data: params.fallback, raw, modelInfo: params.modelInfo };
     }
@@ -322,21 +360,40 @@ async function callJsonStage<T>(params: {
       outcome: "success",
       message: `${params.stage} completed`,
       requestId: params.requestId,
-      metadata: { model: params.modelInfo.model, provider: params.modelInfo.provider },
+      metadata: {
+        model: params.modelInfo.model,
+        provider: params.modelInfo.provider,
+        maxTokens: params.maxTokens,
+        timeoutMs: params.timeoutMs,
+      },
     });
     return { data: parsed, raw, modelInfo: params.modelInfo };
   } catch (error) {
+    const fallbackReason = timedOut ? "timeout" : "error";
+    const raw = timedOut
+      ? `${params.stage} exceeded the local stage budget of ${params.timeoutMs}ms`
+      : (error instanceof Error ? error.message : String(error));
     appendAuditEvent({
       actor: "model",
       category: "cateo_stage",
       action: params.stage,
-      outcome: "error",
+      outcome: "fallback",
       severity: "warn",
-      message: `${params.stage} failed: ${error instanceof Error ? error.message : String(error)}`,
+      message: timedOut
+        ? `${params.stage} exceeded ${params.timeoutMs}ms; using deterministic fallback`
+        : `${params.stage} failed: ${raw}`,
       requestId: params.requestId,
-      metadata: { model: params.modelInfo.model, provider: params.modelInfo.provider },
+      metadata: {
+        model: params.modelInfo.model,
+        provider: params.modelInfo.provider,
+        maxTokens: params.maxTokens,
+        timeoutMs: params.timeoutMs,
+        fallbackReason,
+      },
     });
-    return { data: params.fallback, raw: error instanceof Error ? error.message : String(error), modelInfo: params.modelInfo };
+    return { data: params.fallback, raw, modelInfo: params.modelInfo };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -829,7 +886,7 @@ export async function generateCateoArtifacts(
   const actor = options.actor ?? "system";
   const nowIso = new Date().toISOString();
   const caseId = crypto.randomUUID();
-  const sanitizedInput = sanitizeAssistInputForPersistence(input);
+  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(input));
   const attachmentEvidence = ingestMediaAttachments(caseId, input.attachments, options.requestId);
   const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence);
   const route = buildRoute(sanitizedInput, context);
@@ -877,6 +934,8 @@ export async function generateCateoArtifacts(
       promptPayload,
     ].join("\n\n"),
     fallback: fallbackLeadPlan(route, context, sanitizedInput),
+    timeoutMs: CATEO_STAGE_BUDGET_MS.planner,
+    maxTokens: CATEO_STAGE_MAX_TOKENS.planner,
     requestId: options.requestId,
   });
 
@@ -906,6 +965,8 @@ export async function generateCateoArtifacts(
       artifactPlans: fallbackStructure(route, context).artifactPlans,
       artifactDrafts: [],
     },
+    timeoutMs: CATEO_STAGE_BUDGET_MS.builder,
+    maxTokens: CATEO_STAGE_MAX_TOKENS.builder,
     requestId: options.requestId,
   });
 
@@ -950,6 +1011,8 @@ export async function generateCateoArtifacts(
       ...provisionalCritique,
       reviewDecision: fallbackReviewerDecision(provisionalBuilderPackage, route, provisionalCritique),
     },
+    timeoutMs: CATEO_STAGE_BUDGET_MS.reviewer,
+    maxTokens: CATEO_STAGE_MAX_TOKENS.reviewer,
     requestId: options.requestId,
   });
 

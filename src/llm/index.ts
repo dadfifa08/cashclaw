@@ -6,19 +6,20 @@ import type {
   ToolDefinition,
   ContentBlock,
   ToolResultBlock,
+  LLMRequestOptions,
 } from "./types.js";
 
-export type { LLMProvider, LLMMessage, LLMResponse } from "./types.js";
+export type { LLMProvider, LLMMessage, LLMResponse, LLMRequestOptions } from "./types.js";
 
 function createAnthropicProvider(config: LLMConfig): LLMProvider {
   return {
-    async chat(messages, tools) {
+    async chat(messages, tools, options: LLMRequestOptions = {}) {
       const systemMsg = messages.find((m) => m.role === "system");
       const nonSystem = messages.filter((m) => m.role !== "system");
 
       const body: Record<string, unknown> = {
         model: config.model,
-        max_tokens: 4096,
+        max_tokens: options.maxTokens ?? 4096,
         system: typeof systemMsg?.content === "string" ? systemMsg.content : undefined,
         messages: nonSystem.map((m) => ({
           role: m.role,
@@ -38,6 +39,7 @@ function createAnthropicProvider(config: LLMConfig): LLMProvider {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(body),
+        signal: options.signal,
       });
 
       if (!res.ok) {
@@ -136,7 +138,7 @@ function createOpenAICompatibleProvider(
   baseUrl: string,
 ): LLMProvider {
   return {
-    async chat(messages, tools) {
+    async chat(messages, tools, options: LLMRequestOptions = {}) {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         Authorization: `Bearer ${config.apiKey}`,
@@ -149,7 +151,7 @@ function createOpenAICompatibleProvider(
 
       const body: Record<string, unknown> = {
         model: config.model,
-        max_tokens: 4096,
+        max_tokens: options.maxTokens ?? 4096,
         messages: toOpenAIMessages(messages),
       };
 
@@ -161,6 +163,7 @@ function createOpenAICompatibleProvider(
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        signal: options.signal,
       });
 
       if (!res.ok) {

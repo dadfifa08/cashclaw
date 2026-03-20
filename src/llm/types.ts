@@ -45,7 +45,12 @@ export interface LLMResponse {
   usage: { inputTokens: number; outputTokens: number };
 }
 
+export interface LLMRequestOptions {
+  signal?: AbortSignal;
+  maxTokens?: number;
+}
+
 // Provider interface
 export interface LLMProvider {
-  chat(messages: LLMMessage[], tools?: ToolDefinition[]): Promise<LLMResponse>;
+  chat(messages: LLMMessage[], tools?: ToolDefinition[], options?: LLMRequestOptions): Promise<LLMResponse>;
 }
