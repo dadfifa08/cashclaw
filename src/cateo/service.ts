@@ -12,8 +12,11 @@ import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifact
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
+import { listCateoAdapters } from "./adapter_registry.js";
 import { enrichAssistInputWithOpenAIMedia } from "./openai_media.js";
+import { resolveCateoSkillsForAssistInput, summarizeSkillReasons } from "./skill_registry.js";
 import type {
+  CateoAdapterCapability,
   CateoArtifactContent,
   CateoArtifactEnterpriseMetadata,
   CateoArtifactLookupCandidate,
@@ -44,6 +47,7 @@ import type {
   CateoStructureBlueprint,
   CateoTaskClass,
   CateoTroubleshootingProcedure,
+  CateoSkillActivation,
   CateoStageUsage,
   CateoUsageSummary,
   CateoValidationAttempt,
@@ -988,6 +992,15 @@ export async function generateCateoArtifacts(
     taskClass: template.taskClass,
     requestedArtifacts: template.requiredArtifacts,
   };
+  const adapters: CateoAdapterCapability[] = listCateoAdapters();
+  const activeAdapters = adapters.filter((adapter) => adapter.status === "detected" || adapter.status === "available");
+  const activeSkills: CateoSkillActivation[] = resolveCateoSkillsForAssistInput(sanitizedInput, route.taskClass);
+  route = {
+    ...route,
+    activeSkillIds: activeSkills.map((skill) => skill.id),
+    capabilityTags: [...new Set([...activeSkills.flatMap((skill) => skill.datasetTags), ...activeAdapters.map((adapter) => adapter.id)])],
+    reasons: [...route.reasons, ...summarizeSkillReasons(activeSkills).slice(0, 4)],
+  };
   const templatePayload = renderInstructionTemplate(template);
   const promptPayload = buildPromptPayload(sanitizedInput, context, route);
   const plannerPrompt = [
@@ -1499,6 +1512,16 @@ export async function generateCateoArtifacts(
         evidenceFingerprint,
         promptFingerprint,
         requestId: options.requestId,
+        activeSkills,
+        adapters: activeAdapters,
+        validationStatus: draft.generationMode === "deterministic-fallback" ? "fallback" : "validated",
+        retryCount: validationAttempts.filter((attempt) => attempt.outcome === "retry").length,
+        ruleResults,
+        marketplace: {
+          source: "cateo-public",
+          toolScope: [],
+          toolCalls: [],
+        },
       });
       const approvalState = reviewerDecision.approvedArtifactTypes.includes(draft.artifactType) ? reviewerDecision.approvalState : "draft";
       const lookupText = [
@@ -1678,6 +1701,8 @@ export async function generateCateoArtifacts(
     const trace = {
       route,
       template,
+      activeSkills,
+      adapters: activeAdapters,
       validationAttempts,
       ruleResults,
       lookupCandidates,
@@ -1759,6 +1784,9 @@ export async function generateCateoArtifacts(
         observedConditions: context.observedConditions,
         attachmentCount: context.attachments.length,
         requestedArtifacts: route.requestedArtifacts,
+        activeSkillIds: activeSkills.map((skill) => skill.id),
+        activeAdapterIds: activeAdapters.map((adapter) => adapter.id),
+        capabilityTags: route.capabilityTags,
         artifactTypes: artifacts.map((artifact) => artifact.artifactType),
         interactionMessage: interaction.message,
         highlights: interaction.highlights,
@@ -1884,6 +1912,8 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
+
 
 
 

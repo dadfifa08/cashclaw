@@ -5,6 +5,7 @@ import type { LLMProvider, LLMMessage, LLMResponse, ToolUseBlock, ToolResultBloc
 import type { Task } from "../moltlaunch/types.js";
 import type { ToolContext } from "../tools/types.js";
 import { executeTool, getToolDefinitions } from "../tools/registry.js";
+import { buildCashClawToolScope, resolveCashClawSkillsForTask } from "../cateo/skill_registry.js";
 import { buildTaskPacket } from "./context/task_context.js";
 import { runTaskOrchestration, sumOrchestrationUsage, type OrchestrationTrace } from "./orchestration.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -25,6 +26,8 @@ export interface LoopResult {
   usage: { inputTokens: number; outputTokens: number };
   primaryModel: CateoRuntimeModelInfo;
   orchestration?: OrchestrationTrace;
+  toolScope?: string[];
+  activeSkillIds?: string[];
 }
 
 export interface LoopRuntimeHooks {
@@ -226,20 +229,25 @@ export async function runAgentLoop(
   hooks: LoopRuntimeHooks = {},
 ): Promise<LoopResult> {
   const maxTurns = config.maxLoopTurns ?? DEFAULT_MAX_TURNS;
-  const tools = getToolDefinitions(config);
+  const resolved = resolveLeadModel(runtimeInput, config);
+  const orchestration = resolved.runtime
+    ? await runTaskOrchestration(resolved.runtime, task, config, hooks.recordAudit)
+    : undefined;
+  const activeSkills = orchestration ? resolveCashClawSkillsForTask(task, orchestration.route) : [];
+  const toolScope = orchestration
+    ? buildCashClawToolScope({ task, route: orchestration.route, config, activations: activeSkills })
+    : undefined;
+  const tools = getToolDefinitions(config, toolScope);
   const toolCtx: ToolContext = {
     config,
     taskId: task.id,
     task,
     operatorApproved: hooks.operatorApproved ?? false,
+    allowedToolNames: toolScope,
+    activeSkillIds: activeSkills.map((skill) => skill.id),
     requestApproval: hooks.requestApproval,
     recordAudit: hooks.recordAudit,
   };
-
-  const resolved = resolveLeadModel(runtimeInput, config);
-  const orchestration = resolved.runtime
-    ? await runTaskOrchestration(resolved.runtime, task, config, hooks.recordAudit)
-    : undefined;
   const orchestrationUsage = sumOrchestrationUsage(orchestration);
 
   const messages: LLMMessage[] = [
@@ -278,6 +286,8 @@ export async function runAgentLoop(
         usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
         primaryModel: resolved.primaryModel,
         orchestration,
+        toolScope,
+        activeSkillIds: activeSkills.map((skill) => skill.id),
       };
     }
 
@@ -293,6 +303,8 @@ export async function runAgentLoop(
         usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
         primaryModel: resolved.primaryModel,
         orchestration,
+        toolScope,
+        activeSkillIds: activeSkills.map((skill) => skill.id),
       };
     }
 
@@ -326,5 +338,9 @@ export async function runAgentLoop(
     usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
     primaryModel: resolved.primaryModel,
     orchestration,
+    toolScope,
+    activeSkillIds: activeSkills.map((skill) => skill.id),
   };
 }
+
+

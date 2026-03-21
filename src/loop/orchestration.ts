@@ -4,6 +4,7 @@ import type { LLMMessage, LLMProvider, LLMResponse } from "../llm/types.js";
 import type { Task } from "../moltlaunch/types.js";
 import type { ToolAuditEvent } from "../tools/types.js";
 import { buildTaskPacket } from "./context/task_context.js";
+import { resolveCashClawSkillsForTask, summarizeSkillReasons } from "../cateo/skill_registry.js";
 
 export type CateoTaskClass =
   | "inspection"
@@ -31,6 +32,8 @@ export interface OrchestrationRoute {
   useChallenger: boolean;
   useStructure: boolean;
   reasons: string[];
+  activeSkillIds?: string[];
+  capabilityTags?: string[];
 }
 
 export interface OrchestrationStageTrace {
@@ -384,7 +387,17 @@ export async function runTaskOrchestration(
     return undefined;
   }
 
-  const route = buildRoute(task);
+  const baseRoute = buildRoute(task);
+  const activeSkills = resolveCashClawSkillsForTask(task, baseRoute);
+  const route: OrchestrationRoute = {
+    ...baseRoute,
+    activeSkillIds: activeSkills.map((skill) => skill.id),
+    capabilityTags: [...new Set(activeSkills.flatMap((skill) => skill.datasetTags))],
+    reasons: [
+      ...baseRoute.reasons,
+      ...summarizeSkillReasons(activeSkills).slice(0, 4),
+    ],
+  };
   const stages: OrchestrationStageTrace[] = [];
 
   const lead = await runStage(
@@ -462,3 +475,6 @@ export async function runTaskOrchestration(
     finalContext: buildFinalContext(route, stages),
   };
 }
+
+
+

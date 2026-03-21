@@ -52,7 +52,9 @@ function getEnabledTools(config: CashClawConfig): Tool[] {
 }
 
 function buildToolMap(config: CashClawConfig): Map<string, Tool> {
-  if (cachedConfig === config && cachedToolMap) return cachedToolMap;
+  if (cachedConfig === config && cachedToolMap) {
+    return cachedToolMap;
+  }
 
   const tools = getEnabledTools(config);
   cachedToolMap = new Map(tools.map((tool) => [tool.definition.name, tool]));
@@ -60,9 +62,17 @@ function buildToolMap(config: CashClawConfig): Map<string, Tool> {
   return cachedToolMap;
 }
 
-export function getToolDefinitions(config: CashClawConfig): ToolDefinition[] {
+function filterDefinitions(definitions: ToolDefinition[], allowedToolNames?: string[]): ToolDefinition[] {
+  if (!allowedToolNames || allowedToolNames.length === 0) {
+    return definitions;
+  }
+  const allowed = new Set(allowedToolNames);
+  return definitions.filter((definition) => allowed.has(definition.name));
+}
+
+export function getToolDefinitions(config: CashClawConfig, allowedToolNames?: string[]): ToolDefinition[] {
   const toolMap = buildToolMap(config);
-  return [...toolMap.values()].map((tool) => tool.definition);
+  return filterDefinitions([...toolMap.values()].map((tool) => tool.definition), allowedToolNames);
 }
 
 export async function executeTool(
@@ -72,6 +82,23 @@ export async function executeTool(
 ): Promise<ToolResult> {
   const toolMap = buildToolMap(ctx.config);
   const tool = toolMap.get(name);
+
+  if (ctx.allowedToolNames?.length && !ctx.allowedToolNames.includes(name)) {
+    ctx.recordAudit?.({
+      category: "tool",
+      action: name,
+      outcome: "blocked",
+      severity: "warn",
+      message: `Blocked tool outside scoped capability set: ${name}`,
+      metadata: {
+        taskId: ctx.taskId,
+        allowedToolNames: ctx.allowedToolNames,
+        activeSkillIds: ctx.activeSkillIds,
+        input,
+      },
+    });
+    return { success: false, data: `Blocked by scoped tool policy: ${name} is not active for this task.` };
+  }
 
   if (!tool) {
     ctx.recordAudit?.({
@@ -93,7 +120,7 @@ export async function executeTool(
       outcome: "blocked",
       severity: "warn",
       message: decision.reason ?? `Blocked tool: ${name}`,
-      metadata: { taskId: ctx.taskId, input },
+      metadata: { taskId: ctx.taskId, input, activeSkillIds: ctx.activeSkillIds },
     });
     return { success: false, data: `Blocked by security policy: ${decision.reason ?? "disallowed action"}` };
   }
@@ -117,7 +144,7 @@ export async function executeTool(
       severity: "warn",
       approvalId: approval?.id,
       message: decision.reason ?? "Operator approval required",
-      metadata: { taskId: ctx.taskId, input },
+      metadata: { taskId: ctx.taskId, input, activeSkillIds: ctx.activeSkillIds },
     });
 
     const approvalText = approval
@@ -131,7 +158,7 @@ export async function executeTool(
     action: name,
     outcome: "started",
     message: `Executing ${name}`,
-    metadata: { taskId: ctx.taskId, input },
+    metadata: { taskId: ctx.taskId, input, activeSkillIds: ctx.activeSkillIds },
   });
 
   try {
@@ -142,7 +169,7 @@ export async function executeTool(
       outcome: result.success ? "success" : "error",
       severity: result.success ? "info" : "warn",
       message: result.success ? `${name} completed` : `${name} returned an error`,
-      metadata: { taskId: ctx.taskId, input, result: result.data },
+      metadata: { taskId: ctx.taskId, input, result: result.data, activeSkillIds: ctx.activeSkillIds },
     });
     return result;
   } catch (err) {
@@ -153,7 +180,7 @@ export async function executeTool(
       outcome: "error",
       severity: "error",
       message: `${name} failed: ${message}`,
-      metadata: { taskId: ctx.taskId, input },
+      metadata: { taskId: ctx.taskId, input, activeSkillIds: ctx.activeSkillIds },
     });
     return { success: false, data: `Tool error [${name}]: ${message}` };
   }

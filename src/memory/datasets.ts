@@ -122,6 +122,9 @@ export interface TaskInteractionRecord {
     role: string;
     status: string;
   }>;
+  toolScope?: string[];
+  activeSkillIds?: string[];
+  capabilityTags?: string[];
 }
 
 export interface StudySessionRecord {
@@ -157,6 +160,9 @@ export interface CateoInteractionRecord {
   observedConditions?: string[];
   attachmentCount: number;
   requestedArtifacts: string[];
+  activeSkillIds?: string[];
+  activeAdapterIds?: string[];
+  capabilityTags?: string[];
   artifactTypes: string[];
   interactionMessage: string;
   highlights: string[];
@@ -189,6 +195,9 @@ function sanitizeTaskInteraction(record: TaskInteractionRecord): TaskInteraction
     ratedComment: truncateText(record.ratedComment, 500),
     toolCalls: record.toolCalls?.slice(0, 20),
     orchestrationStages: record.orchestrationStages?.slice(0, 8),
+    toolScope: record.toolScope?.slice(0, 20),
+    activeSkillIds: record.activeSkillIds?.slice(0, 16),
+    capabilityTags: record.capabilityTags?.slice(0, 24),
   };
 }
 
@@ -209,6 +218,9 @@ function sanitizeCateoInteraction(record: CateoInteractionRecord): CateoInteract
     errorCode: truncateText(record.errorCode, 120),
     observedConditions: record.observedConditions?.slice(0, 12).map((entry) => truncateText(entry, 240) ?? "").filter(Boolean),
     requestedArtifacts: record.requestedArtifacts.slice(0, 8),
+    activeSkillIds: record.activeSkillIds?.slice(0, 16),
+    activeAdapterIds: record.activeAdapterIds?.slice(0, 16),
+    capabilityTags: record.capabilityTags?.slice(0, 24),
     artifactTypes: record.artifactTypes.slice(0, 12),
     interactionMessage: truncateText(record.interactionMessage, 4000) ?? "",
     highlights: record.highlights.slice(0, 10).map((entry) => truncateText(entry, 400) ?? "").filter(Boolean),
@@ -236,6 +248,7 @@ export function appendStudySession(record: StudySessionRecord): void {
 export function appendCateoInteraction(record: CateoInteractionRecord): void {
   appendJsonl("cateo_interactions.jsonl", sanitizeCateoInteraction(record));
 }
+
 
 
 

@@ -33,6 +33,8 @@ export interface ToolContext {
   taskId: string;
   task: Task;
   operatorApproved?: boolean;
+  allowedToolNames?: string[];
+  activeSkillIds?: string[];
   requestApproval?: (request: ToolApprovalRequest) => { id: string; created: boolean };
   recordAudit?: (event: ToolAuditEvent) => void;
 }
@@ -41,3 +43,4 @@ export interface Tool {
   definition: ToolDefinition;
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }
+

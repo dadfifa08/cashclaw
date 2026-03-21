@@ -15,10 +15,36 @@ export type CateoTaskClass =
   | "documentation"
   | "mixed";
 
+export type CateoSkillExposure = "public" | "cashclaw" | "both";
+
 export type CateoApprovalState = "draft" | "reviewed" | "approved";
 export type CateoConfidence = "low" | "medium" | "high";
 export type CateoRiskLevel = "low" | "medium" | "high" | "critical";
 export type CateoAttachmentKind = "image" | "video" | "document";
+
+export interface CateoSkillActivation {
+  id: string;
+  title: string;
+  category: string;
+  summary: string;
+  reason: string;
+  exposure: CateoSkillExposure;
+  recommendedArtifacts: CateoArtifactType[];
+  recommendedTools: string[];
+  datasetTags: string[];
+}
+
+export interface CateoAdapterCapability {
+  id: string;
+  title: string;
+  category: string;
+  status: "detected" | "available" | "planned";
+  summary: string;
+  notes: string[];
+  command?: string;
+  envVar?: string;
+  upstream?: string;
+}
 
 export interface CateoAttachmentCalibration {
   referenceName?: string;
@@ -394,6 +420,20 @@ export interface CateoArtifactEnterpriseMetadata {
     digitalTwinStatus?: CateoDigitalTwinResult["status"];
     measuredCriteria: string[];
   };
+  maintenance: {
+    lastServiceAt?: string;
+    serviceHistorySummaries: string[];
+    recurringFailureCodes: string[];
+    recurringPartSkus: string[];
+  };
+  media: {
+    attachmentKinds: CateoAttachmentKind[];
+    imageCount: number;
+    videoCount: number;
+    documentCount: number;
+    derivedMeasurements: string[];
+    analysisSignals: string[];
+  };
   actions: {
     recommendedActions: string[];
     validationSteps: string[];
@@ -417,6 +457,26 @@ export interface CateoArtifactEnterpriseMetadata {
     artifactKeywords: string[];
     recurringSignals: string[];
     estimatedRevisionCount: number;
+  };
+  governance: {
+    schemaId: CateoArtifactSchemaId;
+    schemaVersion: string;
+    templateId?: string;
+    templateVersion?: string;
+    validationStatus: "validated" | "fallback" | "deterministic";
+    ruleEscalationCount: number;
+    retryCount: number;
+    activeSkillIds: string[];
+    activeAdapterIds: string[];
+  };
+  marketplace?: {
+    source: "cashclaw" | "cateo-public";
+    taskId?: string;
+    taskStatus?: string;
+    clientAddress?: string;
+    quotedPriceWei?: string;
+    toolScope: string[];
+    toolCalls: string[];
   };
 }
 
@@ -503,6 +563,8 @@ export interface CateoRoutingDecision {
   useChallenger: boolean;
   useStructure: boolean;
   reasons: string[];
+  activeSkillIds?: string[];
+  capabilityTags?: string[];
 }
 
 export interface CateoLeadPlan {
@@ -689,6 +751,8 @@ export interface CateoInteractionProjection {
 export interface CateoReasoningTrace {
   route: CateoRoutingDecision;
   template: CateoInstructionTemplate;
+  activeSkills?: CateoSkillActivation[];
+  adapters?: CateoAdapterCapability[];
   validationAttempts: CateoValidationAttempt[];
   ruleResults: CateoRuleResult[];
   lookupCandidates: CateoArtifactLookupCandidate[];
@@ -741,6 +805,7 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
 
 
 

@@ -10,6 +10,7 @@ import { storeFeedback } from "./memory/feedback.js";
 import { appendLog } from "./memory/log.js";
 import { appendTaskInteraction } from "./memory/datasets.js";
 import { appendAuditEvent } from "./security/audit.js";
+import { upsertCashClawArtifactsForTask } from "./cateo/cashclaw_bridge.js";
 import { requestApproval as createApproval } from "./security/approvals.js";
 import type { ToolApprovalRequest, ToolAuditEvent } from "./tools/types.js";
 
@@ -505,7 +506,29 @@ export function createHeartbeat(config: CashClawConfig, llm: HeartbeatModelRunti
             status: stage.status,
             model: stage.model,
           })),
+          toolScope: result.toolScope,
+          activeSkillIds: result.activeSkillIds,
+          capabilityTags: result.orchestration?.route.capabilityTags,
         });
+
+        try {
+          upsertCashClawArtifactsForTask({
+            config,
+            task,
+            result,
+          });
+        } catch (bridgeError) {
+          const bridgeMessage = bridgeError instanceof Error ? bridgeError.message : String(bridgeError);
+          appendLog(`Cateo bridge error for ${task.id}: ${bridgeMessage}`);
+          audit("runtime", {
+            category: "cashclaw_cateo_bridge",
+            action: "persist",
+            outcome: "error",
+            severity: "warn",
+            message: `Cateo bridge error: ${bridgeMessage}`,
+            taskId: task.id,
+          });
+        }
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
@@ -698,6 +721,8 @@ export function createHeartbeat(config: CashClawConfig, llm: HeartbeatModelRunti
 }
 
 export type Heartbeat = ReturnType<typeof createHeartbeat>;
+
+
 
 
 
