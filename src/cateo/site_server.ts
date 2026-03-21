@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { getPilotConfig, loadConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./http_api.js";
+import { handleCateoSitePublicApi } from "./public_api.js";
 import { createInternalRequestVerifier, getInternalServiceToken } from "../system/service_auth.js";
 import { readRequestBody } from "../system/request_body.js";
 import { getAssistJob, listAssistBacklog, submitAssistJob, subscribeAssistJob } from "./site_jobs.js";
@@ -416,6 +417,10 @@ export async function startCateoSiteBridge(
           return;
         }
 
+        if (await handleCateoSitePublicApi({ pathname: url.pathname, req, res, config: loadConfig(), requestId, requesterId: getRequesterId(req) })) {
+          return;
+        }
+
         if (url.pathname === JOBS_PREFIX) {
           const requesterId = getRequesterId(req);
           if (!requesterId) {
@@ -566,3 +571,4 @@ export async function startCateoSiteBridge(
 
   return server;
 }
+

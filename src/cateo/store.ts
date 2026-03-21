@@ -265,6 +265,7 @@ export function createRevision(params: {
   approvalState: CateoArtifactRevision["approvalState"];
   content: CateoArtifactContent;
   provenance: CateoArtifactRevision["provenance"];
+  metadata?: CateoArtifactRevision["metadata"];
   note?: string;
   signoffs?: CateoArtifactRevision["signoffs"];
 }): CateoArtifactRecord {
@@ -281,6 +282,7 @@ export function createRevision(params: {
     diffFromPrevious: current ? buildJsonDiff(current.content, params.content) : [],
     signoffs: params.signoffs ?? current?.signoffs ?? [],
     provenance: params.provenance,
+    metadata: params.metadata,
     content: params.content,
   };
 
@@ -373,3 +375,5 @@ export function findSimilarArtifacts(params: {
     .sort((left, right) => right.score - left.score || right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, params.limit ?? 5);
 }
+
+

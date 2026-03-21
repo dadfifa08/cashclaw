@@ -17,6 +17,7 @@ export type CateoTaskClass =
 
 export type CateoApprovalState = "draft" | "reviewed" | "approved";
 export type CateoConfidence = "low" | "medium" | "high";
+export type CateoRiskLevel = "low" | "medium" | "high" | "critical";
 export type CateoAttachmentKind = "image" | "video" | "document";
 
 export interface CateoAttachmentCalibration {
@@ -347,6 +348,78 @@ export interface CateoArtifactSchemaRef {
   version: string;
 }
 
+export interface CateoArtifactEnterpriseMetadata {
+  artifactTitle: string;
+  artifactSummary: string;
+  taskClass: CateoTaskClass;
+  approvalState: CateoApprovalState;
+  confidence: CateoConfidence;
+  riskLevel: CateoRiskLevel;
+  lifecycleState: "active" | "superseded" | "retired";
+  taxonomyTags: string[];
+  componentTitle?: string;
+  partNumber?: string;
+  partDescription?: string;
+  sourceTemplateId?: string;
+  sourceTemplateVersion?: string;
+  classification: {
+    failureCode?: string;
+    failureLabel?: string;
+    failureMode?: string;
+    symptomSummary: string[];
+    rootCause?: string;
+    riskStatement?: string;
+  };
+  asset: {
+    assetId?: string;
+    assetType?: string;
+    manufacturer?: string;
+    model?: string;
+    serialNumber?: string;
+    locationHierarchy: string[];
+    configuration: Record<string, string>;
+  };
+  workOrder: {
+    workOrderId?: string;
+    title?: string;
+    priority?: "low" | "medium" | "high" | "critical";
+    status?: string;
+  };
+  evidence: {
+    attachmentIds: string[];
+    attachmentNames: string[];
+    evidenceSummary: string[];
+    serviceHistoryCount: number;
+    documentRefs: string[];
+    digitalTwinStatus?: CateoDigitalTwinResult["status"];
+    measuredCriteria: string[];
+  };
+  actions: {
+    recommendedActions: string[];
+    validationSteps: string[];
+    requiredParts: string[];
+    requiredTools: string[];
+    followUpActions: string[];
+  };
+  traceability: {
+    caseId: string;
+    runId: string;
+    profileId?: string;
+    requesterId?: string;
+    userId?: string;
+    conversationId?: string;
+    messageId?: string;
+    promptFingerprint: string;
+    evidenceFingerprint: string;
+    requestId?: string;
+  };
+  analytics: {
+    artifactKeywords: string[];
+    recurringSignals: string[];
+    estimatedRevisionCount: number;
+  };
+}
+
 export interface CateoArtifactProvenance {
   runId: string;
   requestId?: string;
@@ -356,7 +429,13 @@ export interface CateoArtifactProvenance {
   taskClass: CateoTaskClass;
   modelsUsed: CateoRuntimeModelInfo[];
   evidenceFingerprint: string;
+  promptFingerprint?: string;
   profileId?: string;
+  userId?: string;
+  conversationId?: string;
+  messageId?: string;
+  templateId?: string;
+  templateVersion?: string;
 }
 
 export interface CateoJsonDiffEntry {
@@ -384,6 +463,7 @@ export interface CateoArtifactRevision {
   diffFromPrevious: CateoJsonDiffEntry[];
   signoffs: CateoElectronicSignoff[];
   provenance: CateoArtifactProvenance;
+  metadata?: CateoArtifactEnterpriseMetadata;
   content: CateoArtifactContent;
 }
 
@@ -394,6 +474,7 @@ export interface CateoArtifactRecord {
   caseId: string;
   assetId?: string;
   workOrderId?: string;
+  linkedConversationIds?: string[];
   currentRevisionId: string;
   createdAt: string;
   updatedAt: string;
@@ -410,6 +491,8 @@ export interface CateoCaseRecord {
   artifacts: string[];
   interaction?: CateoInteractionProjection;
   requester?: CateoRequesterInfo;
+  conversationId?: string;
+  userId?: string;
   usage?: CateoUsageSummary;
   trace: CateoReasoningTrace;
 }
@@ -519,6 +602,9 @@ export interface CateoInteractionCheckpoint {
 export interface CateoRequesterInfo {
   requesterId: string;
   profileId?: string;
+  userId?: string;
+  conversationId?: string;
+  messageId?: string;
   displayName?: string;
   organization?: string;
   emailHash?: string;
@@ -595,6 +681,7 @@ export interface CateoInteractionProjection {
   confidence: CateoConfidence;
   artifactCount: number;
   artifactLabels: string[];
+  conversationTitle?: string;
   renderedAt: string;
   rendererVersion: string;
 }
@@ -654,5 +741,7 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
+
 
 

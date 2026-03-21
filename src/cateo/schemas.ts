@@ -10,11 +10,11 @@ import type {
 } from "./types.js";
 
 const SCHEMA_VERSIONS: Record<CateoArtifactType, CateoArtifactSchemaRef> = {
-  "troubleshooting-procedure": { id: "cateo.troubleshooting-procedure", version: "1.0.0" },
-  "inspection-checklist": { id: "cateo.inspection-checklist", version: "1.0.0" },
-  "service-report": { id: "cateo.service-report", version: "1.0.0" },
-  "parts-tools-list": { id: "cateo.parts-tools-list", version: "1.0.0" },
-  "diagnostic-reasoning-log": { id: "cateo.diagnostic-reasoning-log", version: "1.0.0" },
+  "troubleshooting-procedure": { id: "cateo.troubleshooting-procedure", version: "2.0.0" },
+  "inspection-checklist": { id: "cateo.inspection-checklist", version: "2.0.0" },
+  "service-report": { id: "cateo.service-report", version: "2.0.0" },
+  "parts-tools-list": { id: "cateo.parts-tools-list", version: "2.0.0" },
+  "diagnostic-reasoning-log": { id: "cateo.diagnostic-reasoning-log", version: "2.0.0" },
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -244,3 +244,4 @@ export function validateArtifactContent(artifactType: CateoArtifactType, content
       return ["content: unsupported artifact type"];
   }
 }
+

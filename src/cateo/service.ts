@@ -11,8 +11,11 @@ import { evaluateArtifactPackageRules, summarizeRuleOutcomes } from "./rules.js"
 import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
+import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
+import { enrichAssistInputWithOpenAIMedia } from "./openai_media.js";
 import type {
   CateoArtifactContent,
+  CateoArtifactEnterpriseMetadata,
   CateoArtifactLookupCandidate,
   CateoArtifactPersistAction,
   CateoArtifactRecord,
@@ -933,7 +936,13 @@ function buildProvenance(args: {
   taskClass: CateoTaskClass;
   modelsUsed: CateoRuntimeModelInfo[];
   evidenceFingerprint: string;
+  promptFingerprint?: string;
   profileId?: string;
+  userId?: string;
+  conversationId?: string;
+  messageId?: string;
+  templateId?: string;
+  templateVersion?: string;
 }) {
   return {
     runId: args.runId,
@@ -944,7 +953,13 @@ function buildProvenance(args: {
     taskClass: args.taskClass,
     modelsUsed: args.modelsUsed,
     evidenceFingerprint: args.evidenceFingerprint,
+    promptFingerprint: args.promptFingerprint,
     profileId: args.profileId,
+    userId: args.userId,
+    conversationId: args.conversationId,
+    messageId: args.messageId,
+    templateId: args.templateId,
+    templateVersion: args.templateVersion,
   };
 }
 export async function generateCateoArtifacts(
@@ -959,8 +974,11 @@ export async function generateCateoArtifacts(
   const nowIso = new Date().toISOString();
   const caseId = crypto.randomUUID();
   const requester = options.requester ? { ...options.requester } : undefined;
-  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(input));
-  const attachmentEvidence = ingestMediaAttachments(caseId, input.attachments, options.requestId);
+  const normalizedInput = normalizeAssistInput(input);
+  const mediaEnhanced = await enrichAssistInputWithOpenAIMedia(config, normalizedInput, options.requestId);
+  const enrichedInput = mediaEnhanced.input;
+  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(enrichedInput));
+  const attachmentEvidence = ingestMediaAttachments(caseId, enrichedInput.attachments, options.requestId);
   const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence);
   let route = buildRoute(sanitizedInput, context);
   const requestedTemplate = sanitizedInput.instructionTemplate;
@@ -1440,6 +1458,7 @@ export async function generateCateoArtifacts(
       reviewerDecision,
       finalSynthesis,
     });
+    const promptFingerprint = fingerprintEvidence({ title: sanitizedInput.title, query: sanitizedInput.query, errorCode: sanitizedInput.errorCode, symptomDescription: sanitizedInput.symptomDescription, observedConditions: sanitizedInput.observedConditions, instructionTemplate: sanitizedInput.instructionTemplate });
     const usage = buildUsageSummary(stageUsages);
 
     const artifacts = builderPackage.artifactDrafts.map((draft) => {
@@ -1458,8 +1477,29 @@ export async function generateCateoArtifacts(
         modelsUsed,
         evidenceFingerprint,
         profileId: requester?.profileId,
+        userId: requester?.userId,
+        conversationId: requester?.conversationId,
+        messageId: requester?.messageId,
+        templateId: template.templateId,
+        templateVersion: template.version,
+        promptFingerprint,
       });
       const summary = summarizeArtifactContent(draft.artifactType, draft.content);
+      const metadata: CateoArtifactEnterpriseMetadata = buildArtifactEnterpriseMetadata({
+        artifactType: draft.artifactType,
+        content: draft.content,
+        summary,
+        context,
+        reviewerDecision,
+        finalSynthesis,
+        template,
+        requester,
+        runId,
+        caseId: context.caseId,
+        evidenceFingerprint,
+        promptFingerprint,
+        requestId: options.requestId,
+      });
       const approvalState = reviewerDecision.approvedArtifactTypes.includes(draft.artifactType) ? reviewerDecision.approvalState : "draft";
       const lookupText = [
         sanitizedInput.symptomDescription,
@@ -1525,6 +1565,7 @@ export async function generateCateoArtifacts(
             note: `Matched existing artifact ${bestMatch.artifactId} at score ${bestMatch.score.toFixed(2)} via ${bestMatch.basis.join(", ")}${mergedErrors.length > 0 ? "; merged content failed schema validation so Cateo stored the validated replacement draft instead." : ""}`,
             signoffs: [],
             provenance,
+            metadata,
           });
 
           persistActions.push({
@@ -1569,6 +1610,7 @@ export async function generateCateoArtifacts(
         caseId: context.caseId,
         assetId: context.asset?.assetId,
         workOrderId: context.workOrder?.workOrderId,
+        linkedConversationIds: requester?.conversationId ? [requester.conversationId] : [],
         currentRevisionId: revisionId,
         createdAt,
         updatedAt: createdAt,
@@ -1582,6 +1624,7 @@ export async function generateCateoArtifacts(
           diffFromPrevious: [],
           signoffs: [],
           provenance,
+          metadata,
           content: draft.content,
         }],
       });
@@ -1679,6 +1722,8 @@ export async function generateCateoArtifacts(
       artifacts: artifactIds,
       interaction,
       requester,
+      conversationId: requester?.conversationId,
+      userId: requester?.userId,
       usage,
       trace,
     });
@@ -1702,6 +1747,8 @@ export async function generateCateoArtifacts(
         runId,
         profileId: requester?.profileId,
         requesterId: requester?.requesterId,
+        userId: requester?.userId,
+        conversationId: requester?.conversationId,
         organization: requester?.organization,
         emailHash: requester?.emailHash,
         taskClass: route.taskClass,
@@ -1745,6 +1792,7 @@ export async function generateCateoArtifacts(
   };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const promptFingerprint = fingerprintEvidence({ title: sanitizedInput.title, query: sanitizedInput.query, errorCode: sanitizedInput.errorCode, symptomDescription: sanitizedInput.symptomDescription, observedConditions: sanitizedInput.observedConditions, instructionTemplate: sanitizedInput.instructionTemplate });
     const usage = buildUsageSummary(stageUsages);
     const lastCheckpoint = checkpoints[checkpoints.length - 1];
     if (lastCheckpoint?.stage !== "failed") {
@@ -1836,5 +1884,15 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
+
+
+
+
+
+
+
+
+
 
 

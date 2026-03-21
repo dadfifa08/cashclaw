@@ -145,6 +145,8 @@ export interface CateoInteractionRecord {
   runId: string;
   profileId?: string;
   requesterId?: string;
+  userId?: string;
+  conversationId?: string;
   organization?: string;
   emailHash?: string;
   taskClass: string;
@@ -234,3 +236,6 @@ export function appendStudySession(record: StudySessionRecord): void {
 export function appendCateoInteraction(record: CateoInteractionRecord): void {
   appendJsonl("cateo_interactions.jsonl", sanitizeCateoInteraction(record));
 }
+
+
+
