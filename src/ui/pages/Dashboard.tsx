@@ -118,6 +118,7 @@ export function Dashboard() {
   const commandTrend = commandCenter?.trend ?? [];
   const topFailureModes = commandCenter?.topFailureModes ?? [];
   const topAssets = commandCenter?.topAssets ?? [];
+  const accountSignals = commandCenter?.accounts ?? null;
 
   const [agentCashBalance, setAgentCashBalance] = useState<AgentCashBalance | null>(null);
   const [ethPrice, setEthPrice] = useState<number>(0);

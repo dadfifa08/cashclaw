@@ -20,13 +20,36 @@ const PROFILE_HEADER = "x-cateo-profile-id";
 const REQUESTER_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const PROFILE_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const SSE_KEEPALIVE_MS = 15000;
+const SUBMISSION_WINDOW_MS = 10 * 60 * 1000;
+const SUBMISSION_LIMIT_PER_REQUESTER = 18;
+const SUBMISSION_LIMIT_PER_IP = 40;
+const submissionWindow = new Map<string, number[]>();
+
+interface PublicChatArtifactSummary {
+  artifactId: string;
+  artifactType: string;
+  title: string;
+  approvalState: string;
+}
 
 interface PublicChatResponse {
   message: string;
+  summary: string;
   highlights: string[];
   nextActions: string[];
   confidence: "low" | "medium" | "high";
   artifactCount: number;
+  interaction?: {
+    message: string;
+    highlights: string[];
+    nextActions: string[];
+    confidence: "low" | "medium" | "high";
+    artifactCount: number;
+    releaseStatus?: string;
+    requiresEngineerReview?: boolean;
+    clarifyingQuestion?: string;
+  };
+  artifacts: PublicChatArtifactSummary[];
 }
 
 interface PublicQueueJob {
@@ -109,6 +132,37 @@ function setHeaders(res: http.ServerResponse): void {
   res.setHeader("X-Frame-Options", "DENY");
 }
 
+function pruneSubmissionWindow(key: string, now = Date.now()): number[] {
+  const recent = (submissionWindow.get(key) ?? []).filter((stamp) => now - stamp <= SUBMISSION_WINDOW_MS);
+  submissionWindow.set(key, recent);
+  return recent;
+}
+
+function assertSubmissionAllowed(requesterId: string, remoteAddress: string | undefined): void {
+  const now = Date.now();
+  const requesterKey = `requester:${requesterId}`;
+  const requesterRecent = pruneSubmissionWindow(requesterKey, now);
+  if (requesterRecent.length >= SUBMISSION_LIMIT_PER_REQUESTER) {
+    throw new CateoPilotQuotaError("submission_rate_limited", "Too many queued requests for this account. Please wait before submitting another request.", 429);
+  }
+  if (remoteAddress) {
+    const ipKey = `ip:${remoteAddress}`;
+    const ipRecent = pruneSubmissionWindow(ipKey, now);
+    if (ipRecent.length >= SUBMISSION_LIMIT_PER_IP) {
+      throw new CateoPilotQuotaError("ip_rate_limited", "This network has reached the submission rate limit. Please try again later.", 429);
+    }
+  }
+}
+
+function noteSubmission(requesterId: string, remoteAddress: string | undefined): void {
+  const now = Date.now();
+  const requesterKey = `requester:${requesterId}`;
+  submissionWindow.set(requesterKey, [...pruneSubmissionWindow(requesterKey, now), now]);
+  if (remoteAddress) {
+    const ipKey = `ip:${remoteAddress}`;
+    submissionWindow.set(ipKey, [...pruneSubmissionWindow(ipKey, now), now]);
+  }
+}
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return readRequestBody(req, { maxBytes: 20_971_520 });
@@ -148,22 +202,34 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
     return undefined;
   }
 
-  if (result.interaction?.message) {
-    return {
+  const summary = result.summary?.trim() || result.interaction?.message || "Cateo prepared a controlled engineering response package.";
+  const interaction = result.interaction
+    ? {
       message: result.interaction.message,
       highlights: result.interaction.highlights ?? [],
       nextActions: result.interaction.nextActions ?? [],
       confidence: result.interaction.confidence ?? "medium",
       artifactCount: result.interaction.artifactCount ?? result.artifacts.length,
-    };
-  }
+      releaseStatus: result.interaction.releaseStatus,
+      requiresEngineerReview: result.interaction.requiresEngineerReview,
+      clarifyingQuestion: result.interaction.clarifyingQuestion,
+    }
+    : undefined;
 
   return {
-    message: result.summary?.trim() || "Cateo prepared a controlled engineering response package.",
-    highlights: [],
-    nextActions: [],
-    confidence: "medium",
-    artifactCount: result.artifacts.length,
+    message: interaction?.message ?? summary,
+    summary,
+    highlights: interaction?.highlights ?? [],
+    nextActions: interaction?.nextActions ?? [],
+    confidence: interaction?.confidence ?? "medium",
+    artifactCount: interaction?.artifactCount ?? result.artifacts.length,
+    interaction,
+    artifacts: result.artifacts.map((artifact) => ({
+      artifactId: artifact.artifactId,
+      artifactType: artifact.artifactType,
+      title: artifact.revisions.at(-1)?.summary || artifact.artifactType,
+      approvalState: artifact.revisions.at(-1)?.approvalState || "draft",
+    })),
   };
 }
 
@@ -298,14 +364,31 @@ function streamJobState(req: http.IncomingMessage, res: http.ServerResponse, job
       return;
     }
     writeSse(res, eventName, streamEnvelope(job, checkpoint), event?.eventId);
-    if (job.status === "completed" || job.status === "failed") {
+    if (eventName === "complete" || eventName === "failed") {
       closed = true;
       closeSse(res, keepAliveId, unsubscribe);
     }
   };
 
+  const replayCheckpoints = (job: AssistJobSnapshot) => {
+    for (const checkpoint of job.checkpoints) {
+      if (checkpoint.stage === "accepted" || checkpoint.stage === "completed" || checkpoint.stage === "failed") {
+        continue;
+      }
+      writeSse(res, "checkpoint", streamEnvelope(job, checkpoint));
+    }
+  };
+
   send("ready", null, current);
-  if (current.status === "completed" || current.status === "failed") {
+  replayCheckpoints(current);
+  if (current.status === "completed") {
+    writeSse(res, "complete", streamEnvelope(current));
+    closeSse(res, keepAliveId, unsubscribe);
+    return;
+  }
+  if (current.status === "failed") {
+    writeSse(res, "failed", streamEnvelope(current, current.checkpoints.at(-1)));
+    closeSse(res, keepAliveId, unsubscribe);
     return;
   }
 
@@ -327,7 +410,9 @@ function streamJobState(req: http.IncomingMessage, res: http.ServerResponse, job
 
   if (!unsubscribe) {
     closed = true;
-    json(res, { error: "Job not found" }, 404);
+    if (!res.writableEnded) {
+      closeSse(res, keepAliveId, unsubscribe);
+    }
     return;
   }
 
@@ -436,7 +521,7 @@ export async function startCateoSiteBridge(
 
           if (req.method === "GET") {
             const backlog = listAssistBacklog(requesterId);
-            json(res, { ok: true, message: summarizeBacklog(backlog), backlog, profile });
+            json(res, { ok: true, message: summarizeBacklog(backlog), backlog: toPublicBacklog(backlog), profile });
             return;
           }
 
@@ -470,13 +555,15 @@ export async function startCateoSiteBridge(
           }
 
           try {
+            assertSubmissionAllowed(requesterId, req.socket.remoteAddress ?? undefined);
             const reservation = reservePilotQuota(config, sessionProfile.profileId, requesterId, requestId);
             const job = submitAssistJob(body, requesterId, requestId, {
               profile: reservation.profile,
               quotaReservationId: reservation.reservationId,
             });
+            noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
             const backlog = listAssistBacklog(requesterId);
-            json(res, { ok: true, message: summarizeQueueJob(job), job, backlog, profile: reservation.profile }, 202);
+            json(res, { ok: true, message: summarizeQueueJob(job), job: toPublicJob(job), backlog: toPublicBacklog(backlog), profile: reservation.profile }, 202);
             return;
           } catch (error) {
             if (error instanceof CateoPilotQuotaError) {
@@ -519,7 +606,7 @@ export async function startCateoSiteBridge(
 
           const backlog = listAssistBacklog(requesterId);
           const profile = currentProfileSnapshot(job.profileId, requesterId);
-          json(res, { ok: true, message: summarizeQueueJob(job), job, backlog, profile });
+          json(res, { ok: true, message: summarizeQueueJob(job), job: toPublicJob(job), backlog: toPublicBacklog(backlog), profile });
           return;
         }
 
@@ -571,4 +658,10 @@ export async function startCateoSiteBridge(
 
   return server;
 }
+
+
+
+
+
+
 

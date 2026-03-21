@@ -8,6 +8,7 @@ interface RegisterStepProps {
 
 type TokenChoice = "launch" | "existing" | "none";
 
+const DEFAULT_REGISTER_SKILLS = "engineering diagnostics, root cause analysis, inspection workflows, preventive maintenance, SOP generation";
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -20,7 +21,7 @@ function fileToDataUrl(file: File): Promise<string> {
 export function RegisterStep({ onNext }: RegisterStepProps) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [skills, setSkills] = useState("");
+  const [skills, setSkills] = useState(DEFAULT_REGISTER_SKILLS);
   const [price, setPrice] = useState("10");
   const [tokenChoice, setTokenChoice] = useState<TokenChoice>("none");
   const [symbol, setSymbol] = useState("");
@@ -149,7 +150,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
   const TOKEN_OPTIONS: { value: TokenChoice; label: string; desc: string; detail: string }[] = [
     { value: "none", label: "NO TOKEN", desc: "Direct ETH payments", detail: "Clients pay you in ETH. Simple, no token needed." },
     { value: "launch", label: "LAUNCH TOKEN", desc: "New Flaunch token", detail: "Launch a tradeable token. You earn 10% of all trading fees forever. Requires an image." },
-    { value: "existing", label: "USE EXISTING", desc: "Existing ERC-20", detail: "Link an existing token on Base. Cosmetic only — displayed on your profile." },
+    { value: "existing", label: "USE EXISTING", desc: "Existing ERC-20", detail: "Link an existing token on Base. Cosmetic only ï¿½ displayed on your profile." },
   ];
 
   const needsImage = tokenChoice === "launch";
@@ -183,14 +184,15 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
 
         <div>
           <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">SKILLS</label>
-          <input type="text" value={skills} onChange={(e) => setSkills(e.target.value)} placeholder="typescript, react, solidity" className={inputCls} />
+          <input type="text" value={skills} onChange={(e) => setSkills(e.target.value)} placeholder="engineering diagnostics, root cause analysis" className={inputCls} />
+          <p className="text-[9px] text-zinc-800 mt-0.5 font-mono">Recommended Cateo marketplace skills are prefilled. If you clear this field, the backend still applies safe defaults.</p>
         </div>
 
         <div>
           <label className="block text-[8px] text-zinc-700 font-mono font-bold tracking-[0.2em] mb-1">BASE PRICE (USD)</label>
           <input type="text" value={price} onChange={(e) => setPrice(e.target.value)} placeholder="10" className={inputCls} />
           {ethPrice > 0 && (
-            <p className="text-[9px] text-zinc-800 mt-0.5 font-mono">˜ {usdToEth(parseFloat(price) || 0, ethPrice)} ETH</p>
+            <p className="text-[9px] text-zinc-800 mt-0.5 font-mono">ï¿½ {usdToEth(parseFloat(price) || 0, ethPrice)} ETH</p>
           )}
         </div>
 
@@ -244,7 +246,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
                   onClick={() => fileRef.current?.click()}
                   className="w-full py-3 border border-dashed border-zinc-800 rounded-sm text-[10px] text-zinc-600 font-mono hover:border-zinc-700 hover:text-zinc-500 transition-colors"
                 >
-                  Click to upload — PNG, JPG, GIF, WebP, SVG (max 5MB)
+                  Click to upload ï¿½ PNG, JPG, GIF, WebP, SVG (max 5MB)
                 </button>
               )}
               {missingImage && (
@@ -294,7 +296,7 @@ export function RegisterStep({ onNext }: RegisterStepProps) {
 
       {registering && (
         <p className="text-[9px] text-zinc-700 text-center font-mono tracking-wider">
-          TX PENDING — MAY TAKE 30+ SECONDS
+          TX PENDING ï¿½ MAY TAKE 30+ SECONDS
         </p>
       )}
     </div>

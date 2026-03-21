@@ -144,6 +144,28 @@ export interface CateoPartCatalogEntry {
   storageLocation?: string;
 }
 
+export interface CateoVerifiedSource {
+  title: string;
+  url: string;
+  domain?: string;
+  reason?: string;
+}
+
+export interface CateoPartResolution {
+  partNumber?: string;
+  partDescription?: string;
+  manufacturer?: string;
+  confidencePct: number;
+  needsClarification: boolean;
+  clarifyingQuestion?: string;
+  evidence: string[];
+  aliases: string[];
+  searchQueries: string[];
+  failureModes: string[];
+  preventiveMaintenanceHints: string[];
+  verifiedSources: CateoVerifiedSource[];
+}
+
 export interface CateoDimensionObservation {
   name: string;
   expected: number;
@@ -257,6 +279,7 @@ export interface CateoContextBundle {
   machine: CateoMachineMetadata | null;
   workOrder: CateoWorkOrderLink | null;
   failureCode: CateoMatchedFailureCode | null;
+  partResolution: CateoPartResolution | null;
   observedConditions: string[];
   serviceHistory: CateoServiceHistoryEntry[];
   suggestedParts: CateoPartCatalogEntry[];
@@ -374,6 +397,47 @@ export interface CateoArtifactSchemaRef {
   version: string;
 }
 
+export type CateoArtifactDuplicateState = "canonical" | "duplicate" | "merged-source";
+export type CateoArtifactRelationTarget = "artifact" | "asset" | "work-order" | "part" | "component" | "failure-mode" | "document" | "conversation" | "case";
+export type CateoArtifactRelationStrength = "exact" | "high" | "medium" | "low";
+export type CateoArtifactRelationSource = "ingested" | "inferred" | "merged" | "operator";
+
+export interface CateoPartReferenceLine {
+  partNumber: string;
+  description: string;
+  quantity?: number;
+  unitOfMeasure?: string;
+  manufacturer?: string;
+  partFamily?: string;
+  bomNodeId?: string;
+  interchangeablePartNumbers?: string[];
+}
+
+export interface CateoArtifactRelation {
+  relationId: string;
+  kind: "references" | "duplicate-of" | "derived-from" | "installed-on" | "linked-to-work-order" | "requires-part" | "documents" | "tracks-failure-mode" | "belongs-to-component" | "linked-to-conversation" | "linked-to-case";
+  targetType: CateoArtifactRelationTarget;
+  targetId: string;
+  label?: string;
+  strength: CateoArtifactRelationStrength;
+  source: CateoArtifactRelationSource;
+  tags?: string[];
+}
+
+export interface CateoDocumentControlMetadata {
+  recordClass: string;
+  retentionClass: string;
+  confidentiality: "internal" | "restricted" | "regulated";
+  reviewCadenceDays?: number;
+  ownerTeam?: string;
+  approvalBoard?: string;
+  electronicSignoffRequired: boolean;
+  changeReason?: string;
+  supersededByArtifactId?: string;
+  relatedArtifactIds: string[];
+  regulatoryContexts: string[];
+}
+
 export interface CateoArtifactEnterpriseMetadata {
   artifactTitle: string;
   artifactSummary: string;
@@ -388,6 +452,17 @@ export interface CateoArtifactEnterpriseMetadata {
   partDescription?: string;
   sourceTemplateId?: string;
   sourceTemplateVersion?: string;
+  taxonomy: {
+    domain: "inspection" | "maintenance" | "reliability" | "troubleshooting" | "documentation" | "mixed";
+    subsystem?: string;
+    componentPath: string[];
+    locationPath: string[];
+    discipline?: string;
+    failureMechanism?: string;
+    failureEffect?: string;
+    operatingState?: string;
+    environment?: string;
+  };
   classification: {
     failureCode?: string;
     failureLabel?: string;
@@ -410,6 +485,14 @@ export interface CateoArtifactEnterpriseMetadata {
     title?: string;
     priority?: "low" | "medium" | "high" | "critical";
     status?: string;
+  };
+  parts: {
+    primaryPartNumber?: string;
+    primaryPartDescription?: string;
+    candidateSkus: string[];
+    requiredPartLines: CateoPartReferenceLine[];
+    billOfMaterialsRefs: string[];
+    interchangeablePartNumbers: string[];
   };
   evidence: {
     attachmentIds: string[];
@@ -441,6 +524,7 @@ export interface CateoArtifactEnterpriseMetadata {
     requiredTools: string[];
     followUpActions: string[];
   };
+  relations: CateoArtifactRelation[];
   traceability: {
     caseId: string;
     runId: string;
@@ -469,6 +553,7 @@ export interface CateoArtifactEnterpriseMetadata {
     activeSkillIds: string[];
     activeAdapterIds: string[];
   };
+  documentControl: CateoDocumentControlMetadata;
   marketplace?: {
     source: "cashclaw" | "cateo-public";
     taskId?: string;
@@ -535,6 +620,12 @@ export interface CateoArtifactRecord {
   assetId?: string;
   workOrderId?: string;
   linkedConversationIds?: string[];
+  canonicalArtifactId?: string;
+  duplicateGroupId?: string;
+  duplicateState?: CateoArtifactDuplicateState;
+  supersededByArtifactId?: string;
+  relatedArtifactIds?: string[];
+  mergedSourceArtifactIds?: string[];
   currentRevisionId: string;
   createdAt: string;
   updatedAt: string;
@@ -661,6 +752,8 @@ export interface CateoInteractionCheckpoint {
   artifactCount?: number;
 }
 
+export type CateoServiceTier = "free" | "reviewed" | "enterprise";
+
 export interface CateoRequesterInfo {
   requesterId: string;
   profileId?: string;
@@ -670,6 +763,8 @@ export interface CateoRequesterInfo {
   displayName?: string;
   organization?: string;
   emailHash?: string;
+  serviceTier?: CateoServiceTier;
+  requiresEngineerReview?: boolean;
 }
 
 export interface CateoStageUsage {
@@ -736,6 +831,8 @@ export interface CateoArtifactPersistAction {
   matchedArtifactId?: string;
   matchScore?: number;
 }
+export type CateoInteractionReleaseStatus = "available" | "clarification-required" | "pending-engineer-review";
+
 export interface CateoInteractionProjection {
   message: string;
   highlights: string[];
@@ -744,6 +841,9 @@ export interface CateoInteractionProjection {
   artifactCount: number;
   artifactLabels: string[];
   conversationTitle?: string;
+  clarifyingQuestion?: string;
+  releaseStatus: CateoInteractionReleaseStatus;
+  requiresEngineerReview?: boolean;
   renderedAt: string;
   rendererVersion: string;
 }
@@ -751,6 +851,7 @@ export interface CateoInteractionProjection {
 export interface CateoReasoningTrace {
   route: CateoRoutingDecision;
   template: CateoInstructionTemplate;
+  partResolution?: CateoPartResolution;
   activeSkills?: CateoSkillActivation[];
   adapters?: CateoAdapterCapability[];
   validationAttempts: CateoValidationAttempt[];
@@ -805,6 +906,7 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
 
 
 

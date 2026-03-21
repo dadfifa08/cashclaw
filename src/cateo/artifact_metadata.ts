@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { getSchemaRef } from "./schemas.js";
 import type {
   CateoAdapterCapability,
@@ -5,12 +6,15 @@ import type {
   CateoArtifactContent,
   CateoArtifactEnterpriseMetadata,
   CateoArtifactRecord,
+  CateoArtifactRelation,
   CateoArtifactType,
   CateoConfidence,
   CateoContextBundle,
   CateoDiagnosticReasoningLog,
   CateoFinalSynthesis,
   CateoInstructionTemplate,
+  CateoInspectionChecklist,
+  CateoPartReferenceLine,
   CateoPartsToolsList,
   CateoRequesterInfo,
   CateoReviewerDecision,
@@ -18,12 +22,18 @@ import type {
   CateoServiceReport,
   CateoSkillActivation,
   CateoTroubleshootingProcedure,
-  CateoInspectionChecklist,
 } from "./types.js";
 
 const unique = (values: Array<string | undefined | null>) => [
   ...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))),
 ];
+
+function makeRelation(params: Omit<CateoArtifactRelation, "relationId">): CateoArtifactRelation {
+  return {
+    relationId: crypto.randomUUID(),
+    ...params,
+  };
+}
 
 function inferRiskLevel(args: {
   confidence: CateoConfidence;
@@ -94,6 +104,82 @@ function collectSymptoms(artifactType: CateoArtifactType, content: CateoArtifact
   return [];
 }
 
+function parsePartLine(line: string): CateoPartReferenceLine {
+  const [partNumberRaw, ...rest] = line.split(":");
+  const partNumber = partNumberRaw?.trim() || line.trim();
+  const description = rest.join(":").trim() || partNumber;
+  return {
+    partNumber,
+    description,
+    quantity: 1,
+    unitOfMeasure: "ea",
+  };
+}
+
+function buildPartLines(args: { context: CateoContextBundle; requiredParts: string[]; artifactType: CateoArtifactType; content: CateoArtifactContent }): CateoPartReferenceLine[] {
+  const explicit = args.requiredParts.map(parsePartLine);
+  const suggested = (args.context.suggestedParts ?? []).map((part) => ({
+    partNumber: part.sku,
+    description: part.description,
+    quantity: part.quantitySuggested,
+    unitOfMeasure: "ea",
+  } satisfies CateoPartReferenceLine));
+  const fromCatalog = args.artifactType === "parts-tools-list"
+    ? (args.content as CateoPartsToolsList).parts.map((part) => ({
+      partNumber: part.sku,
+      description: part.description,
+      quantity: part.quantity,
+      unitOfMeasure: "ea",
+    } satisfies CateoPartReferenceLine))
+    : [];
+  const fromResolution = args.context.partResolution?.partNumber ? [{
+    partNumber: args.context.partResolution.partNumber,
+    description: args.context.partResolution.partDescription || args.context.partResolution.partNumber,
+    quantity: 1,
+    unitOfMeasure: "ea",
+    manufacturer: args.context.partResolution.manufacturer,
+    interchangeablePartNumbers: args.context.partResolution.aliases,
+  } satisfies CateoPartReferenceLine] : [];
+  const deduped = new Map<string, CateoPartReferenceLine>();
+  for (const line of [...explicit, ...fromCatalog, ...suggested, ...fromResolution]) {
+    const key = `${line.partNumber}::${line.description}`.toLowerCase();
+    if (!deduped.has(key)) {
+      deduped.set(key, line);
+    }
+  }
+  return [...deduped.values()];
+}
+
+function buildRelations(args: {
+  context: CateoContextBundle;
+  requester?: CateoRequesterInfo;
+  requiredPartLines: CateoPartReferenceLine[];
+  documentRefs: string[];
+  failureMode?: string;
+}): CateoArtifactRelation[] {
+  const relations: CateoArtifactRelation[] = [];
+  if (args.context.asset?.assetId) {
+    relations.push(makeRelation({ kind: "installed-on", targetType: "asset", targetId: args.context.asset.assetId, label: args.context.asset.assetType || args.context.asset.assetId, strength: "exact", source: "ingested", tags: args.context.asset.locationHierarchy }));
+  }
+  if (args.context.workOrder?.workOrderId) {
+    relations.push(makeRelation({ kind: "linked-to-work-order", targetType: "work-order", targetId: args.context.workOrder.workOrderId, label: args.context.workOrder.title || args.context.workOrder.workOrderId, strength: "exact", source: "ingested", tags: [args.context.workOrder.priority, args.context.workOrder.status].filter(Boolean) as string[] }));
+  }
+  if (args.failureMode) {
+    relations.push(makeRelation({ kind: "tracks-failure-mode", targetType: "failure-mode", targetId: args.context.failureCode?.code || args.failureMode, label: args.context.failureCode?.label || args.failureMode, strength: args.context.failureCode?.code ? "exact" : "high", source: args.context.failureCode?.code ? "ingested" : "inferred" }));
+  }
+  for (const part of args.requiredPartLines) {
+    relations.push(makeRelation({ kind: "requires-part", targetType: "part", targetId: part.partNumber, label: part.description, strength: "high", source: "inferred", tags: [part.partFamily, part.manufacturer].filter(Boolean) as string[] }));
+  }
+  for (const documentRef of args.documentRefs) {
+    relations.push(makeRelation({ kind: "documents", targetType: "document", targetId: documentRef, label: documentRef, strength: "medium", source: "ingested" }));
+  }
+  if (args.requester?.conversationId) {
+    relations.push(makeRelation({ kind: "linked-to-conversation", targetType: "conversation", targetId: args.requester.conversationId, label: args.requester.displayName || args.requester.conversationId, strength: "exact", source: "ingested" }));
+  }
+  relations.push(makeRelation({ kind: "linked-to-case", targetType: "case", targetId: args.context.caseId, label: args.context.title, strength: "exact", source: "ingested" }));
+  return relations;
+}
+
 export function buildArtifactEnterpriseMetadata(args: {
   artifactType: CateoArtifactType;
   content: CateoArtifactContent;
@@ -127,6 +213,28 @@ export function buildArtifactEnterpriseMetadata(args: {
     ...args.context.observedConditions.filter((entry) => /(visible|marking|signal|measurement|dimension|material)/i.test(entry)),
   ]);
   const recurringPartSkus = unique(args.context.serviceHistory.flatMap((entry) => entry.partSkus ?? []));
+  const requiredPartLines = buildPartLines({
+    context: args.context,
+    requiredParts,
+    artifactType: args.artifactType,
+    content: args.content,
+  });
+  const primaryPart = requiredPartLines[0];
+  const failureMode = args.context.failureCode?.label || args.finalSynthesis.rootCauseStatement;
+  const webSourceRefs = (args.context.partResolution?.verifiedSources ?? []).map((source) => `${source.title} <${source.url}>`);
+  const documentRefs = unique([
+    ...args.context.attachments.filter((attachment) => attachment.kind === "document").map((attachment) => attachment.name),
+    ...webSourceRefs,
+  ]);
+  const relations = buildRelations({
+    context: args.context,
+    requester: args.requester,
+    requiredPartLines,
+    documentRefs,
+    failureMode,
+  });
+  const resolvedPartNumber = args.context.partResolution?.partNumber || primaryPart?.partNumber;
+  const resolvedPartDescription = args.context.partResolution?.partDescription || primaryPart?.description;
 
   return {
     artifactTitle: args.summary,
@@ -141,6 +249,8 @@ export function buildArtifactEnterpriseMetadata(args: {
     }),
     lifecycleState: "active",
     taxonomyTags: unique([
+      resolvedPartNumber,
+      args.context.partResolution?.manufacturer,
       args.context.failureCode?.code,
       args.context.failureCode?.label,
       args.context.asset?.assetType,
@@ -148,16 +258,28 @@ export function buildArtifactEnterpriseMetadata(args: {
       args.context.machine?.model,
       args.context.workOrder?.priority,
       ...(args.activeSkills ?? []).map((skill) => skill.id),
+      ...requiredPartLines.map((line) => line.partNumber),
     ]),
-    componentTitle: args.context.asset?.assetId || args.context.machine?.model || undefined,
-    partNumber: requiredParts[0]?.split(":")[0],
-    partDescription: requiredParts[0],
+    componentTitle: resolvedPartNumber || args.context.asset?.assetId || args.context.machine?.model || undefined,
+    partNumber: resolvedPartNumber,
+    partDescription: resolvedPartDescription ? `${resolvedPartNumber ?? resolvedPartDescription}: ${resolvedPartDescription}` : undefined,
     sourceTemplateId: args.template.templateId,
     sourceTemplateVersion: args.template.version,
+    taxonomy: {
+      domain: args.context.taskClass === "preventive-maintenance" ? "maintenance" : args.context.taskClass === "root-cause-analysis" ? "reliability" : args.context.taskClass,
+      subsystem: args.context.asset?.assetType || args.context.machine?.model || args.context.partResolution?.manufacturer,
+      componentPath: unique([args.context.machine?.manufacturer, args.context.machine?.model, args.context.asset?.assetId, args.context.partResolution?.partNumber]),
+      locationPath: args.context.asset?.locationHierarchy ?? args.context.machine?.locationHierarchy ?? [],
+      discipline: requiredTools.some((tool) => /meter|indicator|electrical/i.test(tool)) ? "electro-mechanical" : "mechanical",
+      failureMechanism: args.context.failureCode?.label || args.finalSynthesis.rootCauseStatement,
+      failureEffect: args.reviewerDecision.summary,
+      operatingState: args.context.observedConditions.find((entry) => /(running|stopped|intermittent|isolated)/i.test(entry)),
+      environment: args.context.machine?.environment,
+    },
     classification: {
       failureCode: args.context.failureCode?.code,
       failureLabel: args.context.failureCode?.label,
-      failureMode: args.context.failureCode?.label || args.finalSynthesis.rootCauseStatement,
+      failureMode,
       symptomSummary,
       rootCause: args.artifactType === "diagnostic-reasoning-log"
         ? (args.content as CateoDiagnosticReasoningLog).rootCauseStatement
@@ -167,7 +289,7 @@ export function buildArtifactEnterpriseMetadata(args: {
     asset: {
       assetId: args.context.asset?.assetId,
       assetType: args.context.asset?.assetType,
-      manufacturer: args.context.machine?.manufacturer,
+      manufacturer: args.context.machine?.manufacturer || args.context.partResolution?.manufacturer,
       model: args.context.machine?.model,
       serialNumber: args.context.machine?.serialNumber,
       locationHierarchy: args.context.asset?.locationHierarchy ?? args.context.machine?.locationHierarchy ?? [],
@@ -179,12 +301,20 @@ export function buildArtifactEnterpriseMetadata(args: {
       priority: args.context.workOrder?.priority,
       status: args.context.workOrder?.status,
     },
+    parts: {
+      primaryPartNumber: resolvedPartNumber,
+      primaryPartDescription: resolvedPartDescription,
+      candidateSkus: unique([resolvedPartNumber, ...requiredPartLines.map((line) => line.partNumber), ...recurringPartSkus, ...(args.context.partResolution?.aliases ?? [])]),
+      requiredPartLines,
+      billOfMaterialsRefs: unique(requiredPartLines.map((line) => line.bomNodeId)),
+      interchangeablePartNumbers: unique([...(args.context.partResolution?.aliases ?? []), ...requiredPartLines.flatMap((line) => line.interchangeablePartNumbers ?? [])]),
+    },
     evidence: {
       attachmentIds: args.context.attachments.map((attachment) => attachment.attachmentId),
       attachmentNames: args.context.attachments.map((attachment) => attachment.name),
-      evidenceSummary: unique([...args.context.contextSummary, ...symptomSummary]),
+      evidenceSummary: unique([...args.context.contextSummary, ...symptomSummary, ...(args.context.partResolution?.evidence ?? [])]),
       serviceHistoryCount: args.context.serviceHistory.length,
-      documentRefs: args.context.attachments.filter((attachment) => attachment.kind === "document").map((attachment) => attachment.name),
+      documentRefs,
       digitalTwinStatus: args.context.digitalTwin?.status,
       measuredCriteria: validationSteps,
     },
@@ -203,12 +333,13 @@ export function buildArtifactEnterpriseMetadata(args: {
       analysisSignals: mediaSignals,
     },
     actions: {
-      recommendedActions: unique([...args.finalSynthesis.nextActions, ...args.reviewerDecision.requiredFollowUp]),
+      recommendedActions: unique([...args.finalSynthesis.nextActions, ...args.reviewerDecision.requiredFollowUp, ...(args.context.partResolution?.preventiveMaintenanceHints ?? [])]),
       validationSteps,
       requiredParts,
       requiredTools,
       followUpActions: unique([...args.finalSynthesis.operatorNotes, ...args.reviewerDecision.findings]),
     },
+    relations,
     traceability: {
       caseId: args.caseId,
       runId: args.runId,
@@ -227,11 +358,12 @@ export function buildArtifactEnterpriseMetadata(args: {
         args.context.machine?.model,
         args.context.failureCode?.code,
         args.context.failureCode?.label,
-        ...requiredParts,
+        args.context.partResolution?.partNumber,
+        ...requiredPartLines.map((line) => line.partNumber),
         ...requiredTools,
         ...(args.activeSkills ?? []).map((skill) => skill.id),
       ]),
-      recurringSignals: unique([...args.context.serviceHistory.map((entry) => entry.failureCode), ...args.context.observedConditions]),
+      recurringSignals: unique([...args.context.serviceHistory.map((entry) => entry.failureCode), ...args.context.observedConditions, ...(args.context.partResolution?.failureModes ?? [])]),
       estimatedRevisionCount: 1,
     },
     governance: {
@@ -245,6 +377,18 @@ export function buildArtifactEnterpriseMetadata(args: {
       activeSkillIds: (args.activeSkills ?? []).map((skill) => skill.id),
       activeAdapterIds: (args.adapters ?? []).map((adapter) => adapter.id),
     },
+    documentControl: {
+      recordClass: `${args.context.taskClass}.${args.artifactType}`,
+      retentionClass: "long-term-engineering-record",
+      confidentiality: args.context.attachments.some((attachment) => attachment.kind === "document") ? "regulated" : "internal",
+      reviewCadenceDays: args.context.taskClass === "preventive-maintenance" ? 90 : 30,
+      ownerTeam: "Cateo engineering operations",
+      approvalBoard: args.requester?.requiresEngineerReview ? "customer engineering review board" : args.context.workOrder?.workOrderId ? "work-order review board" : "technical reviewer",
+      electronicSignoffRequired: true,
+      changeReason: args.reviewerDecision.summary,
+      relatedArtifactIds: [],
+      regulatoryContexts: unique(["ISO-ready", args.context.workOrder?.workOrderId ? "work-order-controlled" : undefined, args.marketplace?.source === "cashclaw" ? "marketplace-traceable" : "public-assist"]),
+    },
     marketplace: args.marketplace,
   };
 }
@@ -252,7 +396,7 @@ export function buildArtifactEnterpriseMetadata(args: {
 export function deriveConversationTitleFromArtifacts(artifacts: CateoArtifactRecord[]): string {
   for (const artifact of artifacts) {
     const revision = artifact.revisions.at(-1);
-    const title = revision?.metadata?.partDescription || revision?.metadata?.partNumber;
+    const title = revision?.metadata?.parts?.primaryPartDescription || revision?.metadata?.parts?.primaryPartNumber || revision?.metadata?.partDescription || revision?.metadata?.partNumber;
     if (title) {
       return title;
     }
@@ -268,4 +412,3 @@ export function deriveConversationTitleFromArtifacts(artifacts: CateoArtifactRec
 
   return "Cateo conversation";
 }
-

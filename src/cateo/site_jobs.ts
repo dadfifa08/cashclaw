@@ -37,6 +37,8 @@ interface AssistJobRecord {
   profileDisplayName?: string;
   profileOrganization?: string;
   profileEmailHash?: string;
+  profileServiceTier?: CateoProfileSnapshot["serviceTier"];
+  requiresEngineerReview?: boolean;
 }
 
 export interface AssistJobSnapshot {
@@ -102,6 +104,7 @@ const queue: string[] = [];
 const completedDurationsMs: number[] = [];
 const listeners = new Map<string, Set<AssistJobListener>>();
 let draining = false;
+let drainTimer: NodeJS.Timeout | null = null;
 let nextAcceptedSequence = 1;
 let nextEventId = 1;
 
@@ -389,6 +392,8 @@ async function runNextJob(): Promise<void> {
         displayName: record.profileDisplayName,
         organization: record.profileOrganization,
         emailHash: record.profileEmailHash,
+        serviceTier: record.profileServiceTier,
+        requiresEngineerReview: record.requiresEngineerReview,
       } : undefined,
       onCheckpoint: (checkpoint) => {
         recordCheckpoint(record, checkpoint, "checkpoint");
@@ -448,6 +453,16 @@ async function runNextJob(): Promise<void> {
   }
 }
 
+function scheduleDrain(): void {
+  if (drainTimer) {
+    return;
+  }
+  drainTimer = setTimeout(() => {
+    drainTimer = null;
+    void drainQueue();
+  }, 500);
+}
+
 async function drainQueue(): Promise<void> {
   if (draining) {
     return;
@@ -495,6 +510,8 @@ export function submitAssistJob(
     checkpoints: [acceptedCheckpoint],
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
+    profileServiceTier: options?.profile?.serviceTier,
+    requiresEngineerReview: options?.profile?.reviewedOutputs ?? false,
   };
 
   jobs.set(jobId, record);
@@ -570,3 +587,7 @@ export function subscribeAssistJob(jobId: string, requesterId: string, listener:
     }
   };
 }
+
+
+
+

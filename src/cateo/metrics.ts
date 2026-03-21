@@ -2,6 +2,7 @@ import { loadConfig } from "../config.js";
 import { getApprovals } from "../security/approvals.js";
 import { loadRecentAuditEvents } from "../security/audit.js";
 import { listPilotProfiles } from "./profiles.js";
+import { listPublicUsers } from "./accounts.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows } from "./store.js";
 import { listVectorIndexEntries } from "./vector_index.js";
 
@@ -31,6 +32,16 @@ export interface CommandCenterFeedItem {
   title: string;
   detail: string;
   severity: "info" | "warn" | "error";
+}
+
+export interface CommandCenterAccountRow {
+  userId: string;
+  displayName: string;
+  organization?: string;
+  roles: string[];
+  serviceTier?: string;
+  twoFactorEnabled?: boolean;
+  lastLoginAt?: string;
 }
 
 export interface CommandCenterSnapshot {
@@ -72,6 +83,17 @@ export interface CommandCenterSnapshot {
     documentCoveragePct: number;
     queueDepth: number;
     auditErrors: number;
+  };
+  accounts: {
+    totalUsers: number;
+    adminUsers: number;
+    reviewedProfiles: number;
+    enterpriseProfiles: number;
+    twoFactorEnabled: number;
+    suspendedProfiles: number;
+    serviceTiers: CommandCenterValuePoint[];
+    topOrganizations: CommandCenterValuePoint[];
+    recentUsers: CommandCenterAccountRow[];
   };
   alerts: CommandCenterAlert[];
   recentActivity: CommandCenterFeedItem[];
@@ -155,6 +177,26 @@ function buildSeededSnapshot(): CommandCenterSnapshot {
       queueDepth: 0,
       auditErrors: 0,
     },
+    accounts: {
+      totalUsers: 5,
+      adminUsers: 1,
+      reviewedProfiles: 1,
+      enterpriseProfiles: 0,
+      twoFactorEnabled: 1,
+      suspendedProfiles: 0,
+      serviceTiers: [
+        { label: "free", value: 4 },
+        { label: "reviewed", value: 1 },
+      ],
+      topOrganizations: [
+        { label: "Acme Plant", value: 2 },
+        { label: "Field Ops", value: 1 },
+      ],
+      recentUsers: [
+        { userId: "seed-user-1", displayName: "Demo Admin", organization: "Cateo", roles: ["admin"], serviceTier: "enterprise", twoFactorEnabled: true },
+        { userId: "seed-user-2", displayName: "Demo User", organization: "Acme Plant", roles: ["user"], serviceTier: "reviewed", twoFactorEnabled: false },
+      ],
+    },
     alerts: [
       { level: "warn", title: "Low-confidence outputs present", detail: "Two recent cases remain below the confidence threshold and should be reviewed." },
       { level: "info", title: "Demo mode active", detail: "Live artifact analytics will replace these seeded values as soon as real Cateo cases accumulate." },
@@ -178,6 +220,7 @@ export function buildCommandCenterSnapshot(): CommandCenterSnapshot {
   const audit = loadRecentAuditEvents(500);
   const vectorEntries = listVectorIndexEntries();
   const profiles = config ? listPilotProfiles(config) : [];
+  const publicUsers = config ? listPublicUsers(config) : [];
   const caseRecords = caseRows.slice(0, 120).map((row) => loadCaseRecord(row.caseId)).filter(Boolean);
   const artifactRecords = artifactRows.slice(0, 200).map((row) => loadArtifactRecord(row.artifactId)).filter(Boolean);
 
@@ -185,6 +228,8 @@ export function buildCommandCenterSnapshot(): CommandCenterSnapshot {
   const assets = new Map();
   const trendMap = new Map();
   const approvalStates = new Map();
+  const serviceTiers = new Map();
+  const organizations = new Map();
   const alerts: CommandCenterAlert[] = [];
   let revisions = 0;
   let highRiskCases = 0;
@@ -221,6 +266,15 @@ export function buildCommandCenterSnapshot(): CommandCenterSnapshot {
       current.interactions += 1;
       trendMap.set(day, current);
     }
+  }
+
+  for (const profile of profiles) {
+    pushCount(serviceTiers, profile.serviceTier);
+    pushCount(organizations, profile.organization);
+  }
+
+  for (const user of publicUsers) {
+    pushCount(organizations, user.organization);
   }
 
   for (const record of artifactRecords) {
@@ -292,6 +346,25 @@ export function buildCommandCenterSnapshot(): CommandCenterSnapshot {
       documentCoveragePct: Math.min(100, Math.round((vectorEntries.length / Math.max(1, artifactRows.length + caseRows.length)) * 100)),
       queueDepth: approvals.filter((entry) => entry.status === "pending").length,
       auditErrors,
+    },
+    accounts: {
+      totalUsers: publicUsers.length,
+      adminUsers: publicUsers.filter((user) => user.roles.includes("admin")).length,
+      reviewedProfiles: profiles.filter((profile) => profile.reviewedOutputs).length,
+      enterpriseProfiles: profiles.filter((profile) => profile.serviceTier === "enterprise").length,
+      twoFactorEnabled: publicUsers.filter((user) => user.security?.twoFactorEnabled).length,
+      suspendedProfiles: profiles.filter((profile) => profile.status === "suspended").length,
+      serviceTiers: toTopPoints(serviceTiers, 6),
+      topOrganizations: toTopPoints(organizations, 6),
+      recentUsers: publicUsers.slice(0, 8).map((user) => ({
+        userId: user.userId,
+        displayName: user.displayName,
+        organization: user.organization,
+        roles: user.roles,
+        serviceTier: user.profile?.serviceTier,
+        twoFactorEnabled: user.security?.twoFactorEnabled,
+        lastLoginAt: user.lastLoginAt,
+      })),
     },
     alerts,
     recentActivity: audit.slice(0, 10).map((entry) => ({

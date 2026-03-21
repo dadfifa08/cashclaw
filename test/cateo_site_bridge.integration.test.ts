@@ -306,7 +306,7 @@ describe("Cateo site bridge", () => {
     ({ server, baseUrl } = await bootBridge());
     const submitBody = JSON.stringify({
       title: "Inspection request",
-      symptomDescription: "Customer needs a controlled inspection artifact.",
+      symptomDescription: "Customer needs a controlled inspection artifact for manufacturing part MXR-2045-A1.",
       asset: { assetId: "A-100", model: "Rig-X" },
       workOrder: { workOrderId: "WO-100" },
     });
@@ -360,7 +360,7 @@ describe("Cateo site bridge", () => {
 
     const streamingBody = JSON.stringify({
       title: "Streaming inspection request",
-      symptomDescription: "Stream the live checkpoint path for this controlled request.",
+      symptomDescription: "Stream the live checkpoint path for manufacturing part MXR-2045-A1.",
     });
     const submit = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
       method: "POST",
@@ -414,9 +414,9 @@ describe("Cateo site bridge", () => {
       };
     }
 
-    const first = await submitFor("client-a", "First inspection request");
-    const second = await submitFor("client-a", "Second inspection request");
-    const third = await submitFor("client-b", "Separate requester job");
+    const first = await submitFor("client-a", "First inspection request for manufacturing part MXR-2045-A1");
+    const second = await submitFor("client-a", "Second inspection request for manufacturing part MXR-2045-A2");
+    const third = await submitFor("client-b", "Separate requester job for manufacturing part MXR-2045-A3");
 
     expect(first.job.acceptedSequence).toBeLessThan(second.job.acceptedSequence);
     expect(first.job.backlogPosition).toBe(1);
@@ -456,4 +456,5 @@ describe("Cateo site bridge", () => {
     expect(foreignLookup.status).toBe(404);
   });
 });
+
 

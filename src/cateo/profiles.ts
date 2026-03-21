@@ -4,9 +4,11 @@ import type { CashClawConfig } from "../config.js";
 import { getConfigDir, getPilotConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import type { CateoServiceTier } from "./types.js";
 
-const PROFILE_DB_VERSION = "cateo-profile-db-v1";
+const PROFILE_DB_VERSION = "cateo-profile-db-v2";
 const MAX_REQUESTER_IDS = 20;
+const MAX_HISTORY_DAYS = 60;
 
 interface CateoQuotaReservation {
   reservationId: string;
@@ -41,7 +43,11 @@ interface CateoProfileRecord {
   organization?: string;
   roles: string[];
   requesterIds: string[];
+  serviceTier: CateoServiceTier;
+  reviewedOutputs: boolean;
+  artifactDownloadAccess: boolean;
   usage: CateoQuotaUsageDay;
+  usageHistory?: CateoQuotaUsageDay[];
 }
 
 interface CateoProfileStore {
@@ -72,6 +78,16 @@ export interface CateoQuotaSnapshot {
   reservationTokensPerJob: number;
 }
 
+export interface CateoQuotaHistoryPoint {
+  day: string;
+  acceptedRequests: number;
+  completedRequests: number;
+  failedRequests: number;
+  usedInputTokens: number;
+  usedOutputTokens: number;
+  usedTotalTokens: number;
+}
+
 export interface CateoProfileSnapshot {
   profileId: string;
   createdAt: string;
@@ -81,7 +97,11 @@ export interface CateoProfileSnapshot {
   displayName?: string;
   email?: string;
   organization?: string;
+  serviceTier: CateoServiceTier;
+  reviewedOutputs: boolean;
+  artifactDownloadAccess: boolean;
   quota: CateoQuotaSnapshot;
+  history: CateoQuotaHistoryPoint[];
 }
 
 export interface CateoQuotaReservationReceipt {
@@ -155,10 +175,50 @@ function emptyUsageDay(day = todayUtc()): CateoQuotaUsageDay {
   };
 }
 
+function toHistoryPoint(usage: CateoQuotaUsageDay): CateoQuotaHistoryPoint {
+  return {
+    day: usage.day,
+    acceptedRequests: usage.acceptedRequests,
+    completedRequests: usage.completedRequests,
+    failedRequests: usage.failedRequests,
+    usedInputTokens: usage.usedInputTokens,
+    usedOutputTokens: usage.usedOutputTokens,
+    usedTotalTokens: usage.usedTotalTokens,
+  };
+}
+
+function archiveUsageDay(record: CateoProfileRecord, usage: CateoQuotaUsageDay): void {
+  if (!usage.day) {
+    return;
+  }
+  const nextHistory = [toHistoryPoint(usage), ...(record.usageHistory ?? []).map((entry) => toHistoryPoint(entry as CateoQuotaUsageDay))]
+    .reduce<CateoQuotaHistoryPoint[]>((carry, current) => {
+      if (carry.some((entry) => entry.day === current.day)) {
+        return carry;
+      }
+      carry.push(current);
+      return carry;
+    }, [])
+    .slice(0, MAX_HISTORY_DAYS);
+  record.usageHistory = nextHistory.map((entry) => ({
+    ...emptyUsageDay(entry.day),
+    acceptedRequests: entry.acceptedRequests,
+    completedRequests: entry.completedRequests,
+    failedRequests: entry.failedRequests,
+    usedInputTokens: entry.usedInputTokens,
+    usedOutputTokens: entry.usedOutputTokens,
+    usedTotalTokens: entry.usedTotalTokens,
+  }));
+}
+
 function normalizeUsageDay(record: CateoProfileRecord): CateoQuotaUsageDay {
   const day = todayUtc();
   if (record.usage?.day === day) {
     return record.usage;
+  }
+
+  if (record.usage?.day) {
+    archiveUsageDay(record, record.usage);
   }
 
   const carriedReservations = record.usage?.reservations ?? [];
@@ -181,6 +241,16 @@ function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): 
   const pilot = getPilotConfig(config);
   const usage = normalizeUsageDay(record);
   const quota = pilot.quota;
+  const history = [usage, ...(record.usageHistory ?? [])]
+    .map((entry) => toHistoryPoint(entry))
+    .reduce<CateoQuotaHistoryPoint[]>((carry, current) => {
+      if (carry.some((entry) => entry.day === current.day)) {
+        return carry;
+      }
+      carry.push(current);
+      return carry;
+    }, [])
+    .slice(0, 14);
 
   return {
     profileId: record.profileId,
@@ -191,6 +261,9 @@ function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): 
     displayName: record.displayName,
     email: record.email,
     organization: record.organization,
+    serviceTier: record.serviceTier,
+    reviewedOutputs: record.reviewedOutputs,
+    artifactDownloadAccess: record.artifactDownloadAccess,
     quota: {
       day: usage.day,
       dailyRequestLimit: quota.dailyRequestLimit,
@@ -212,6 +285,7 @@ function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): 
       pendingJobs: usage.pendingJobs,
       reservationTokensPerJob: quota.reservationTokensPerJob,
     },
+    history,
   };
 }
 
@@ -271,7 +345,11 @@ export function upsertPilotProfile(
     organization: undefined,
     roles: ["pilot_user"],
     requesterIds: [],
+    serviceTier: "free",
+    reviewedOutputs: false,
+    artifactDownloadAccess: true,
     usage: emptyUsageDay(),
+    usageHistory: [],
   };
 
   const displayName = normalizeText(input.displayName, 120);
@@ -469,6 +547,61 @@ export function settlePilotQuota(
     },
   });
 
+  return snapshot;
+}
+
+
+export function updatePilotProfileAdmin(
+  config: CashClawConfig,
+  profileId: string,
+  input: {
+    status?: "active" | "suspended";
+    serviceTier?: CateoServiceTier;
+    reviewedOutputs?: boolean;
+    artifactDownloadAccess?: boolean;
+    displayName?: string;
+    organization?: string;
+  },
+  requestId?: string,
+): CateoProfileSnapshot {
+  const store = loadProfileStore();
+  const record = findProfile(store, profileId);
+  if (!record) {
+    throw new CateoPilotQuotaError("profile_not_found", "Pilot profile not found.", 404);
+  }
+
+  record.status = input.status ?? record.status;
+  record.serviceTier = input.serviceTier ?? record.serviceTier;
+  record.reviewedOutputs = input.reviewedOutputs ?? record.reviewedOutputs;
+  record.artifactDownloadAccess = input.artifactDownloadAccess ?? record.artifactDownloadAccess;
+  const displayName = normalizeText(input.displayName, 120);
+  const organization = normalizeText(input.organization, 160);
+  if (displayName !== undefined) {
+    record.displayName = displayName;
+  }
+  if (organization !== undefined) {
+    record.organization = organization;
+  }
+  record.updatedAt = new Date().toISOString();
+  record.lastSeenAt = record.updatedAt;
+  record.usage = normalizeUsageDay(record);
+
+  const snapshot = saveProfileRecord(config, store, record);
+  appendAuditEvent({
+    actor: "server",
+    category: "pilot_profile",
+    action: "admin_update",
+    outcome: "success",
+    message: `Admin updated pilot profile ${profileId}`,
+    requestId,
+    metadata: {
+      profileId,
+      status: snapshot.status,
+      serviceTier: snapshot.serviceTier,
+      reviewedOutputs: snapshot.reviewedOutputs,
+      artifactDownloadAccess: snapshot.artifactDownloadAccess,
+    },
+  });
   return snapshot;
 }
 export function listPilotProfiles(config: CashClawConfig): CateoProfileSnapshot[] {

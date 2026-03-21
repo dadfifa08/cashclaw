@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import { syncCateoOntology } from "./ontology.js";
 import { searchVectorIndex, upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
 import type {
   CateoArtifactContent,
@@ -26,6 +27,15 @@ export interface ArtifactCatalogRow {
   revisionNumber: number;
   summary: string;
   updatedAt: string;
+  partNumber?: string;
+  componentTitle?: string;
+  failureCode?: string;
+  lifecycleState?: string;
+  duplicateState?: string;
+  canonicalArtifactId?: string;
+  duplicateGroupId?: string;
+  relationCount?: number;
+  taxonomyTags: string[];
 }
 
 interface ArtifactCatalogFile {
@@ -92,6 +102,20 @@ function caseCatalogPath(): string {
   return path.join(getDatabaseDir(), "cases.json");
 }
 
+function unique(values: Array<string | undefined | null>): string[] {
+  return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
+}
+
+function normalizeArtifactRecord(record: CateoArtifactRecord): CateoArtifactRecord {
+  return {
+    ...record,
+    canonicalArtifactId: record.canonicalArtifactId || record.artifactId,
+    duplicateState: record.duplicateState || "canonical",
+    relatedArtifactIds: unique(record.relatedArtifactIds ?? []),
+    mergedSourceArtifactIds: unique(record.mergedSourceArtifactIds ?? []),
+  };
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
@@ -152,6 +176,7 @@ function saveArtifactCatalog(file: ArtifactCatalogFile): void {
 
 function upsertArtifactCatalog(record: CateoArtifactRecord): void {
   const current = record.revisions[record.revisions.length - 1];
+  const metadata = current?.metadata;
   const next: ArtifactCatalogRow = {
     artifactId: record.artifactId,
     caseId: record.caseId,
@@ -164,6 +189,15 @@ function upsertArtifactCatalog(record: CateoArtifactRecord): void {
     revisionNumber: current.revisionNumber,
     summary: current.summary,
     updatedAt: record.updatedAt,
+    partNumber: metadata?.parts?.primaryPartNumber ?? metadata?.partNumber,
+    componentTitle: metadata?.componentTitle,
+    failureCode: metadata?.classification?.failureCode,
+    lifecycleState: metadata?.lifecycleState,
+    duplicateState: record.duplicateState,
+    canonicalArtifactId: record.canonicalArtifactId,
+    duplicateGroupId: record.duplicateGroupId,
+    relationCount: metadata?.relations?.length ?? 0,
+    taxonomyTags: metadata?.taxonomyTags ?? [],
   };
 
   const file = loadArtifactCatalog();
@@ -205,6 +239,19 @@ function upsertCaseCatalog(record: CateoCaseRecord): void {
   saveCaseCatalog({ version: DATABASE_VERSION, updatedAt: new Date().toISOString(), rows });
 }
 
+function rebuildMaterializedIndexes(): void {
+  const artifactCatalog = loadArtifactCatalog();
+  const caseCatalog = loadCaseCatalog();
+  const artifactRecords = artifactCatalog.rows
+    .map((row) => readProtectedJson<CateoArtifactRecord | null>(artifactPath(row.artifactId), null))
+    .filter((record): record is CateoArtifactRecord => Boolean(record))
+    .map((record) => normalizeArtifactRecord(record));
+  const caseRecords = caseCatalog.rows
+    .map((row) => readProtectedJson<CateoCaseRecord | null>(casePath(row.caseId), null))
+    .filter((record): record is CateoCaseRecord => Boolean(record));
+  syncCateoOntology({ artifactRecords, caseRecords });
+}
+
 export function buildJsonDiff(before: unknown, after: unknown): CateoJsonDiffEntry[] {
   const diff: CateoJsonDiffEntry[] = [];
   diffRecursive(before, after, "", diff);
@@ -236,21 +283,24 @@ export function fingerprintEvidence(value: unknown): string {
 }
 
 export function saveArtifactRecord(record: CateoArtifactRecord): CateoArtifactRecord {
-  writeProtectedJson(artifactPath(record.artifactId), record);
-  upsertArtifactCatalog(record);
-  upsertArtifactVectorEntry(record);
-  return record;
+  const normalized = normalizeArtifactRecord(record);
+  writeProtectedJson(artifactPath(normalized.artifactId), normalized);
+  upsertArtifactCatalog(normalized);
+  upsertArtifactVectorEntry(normalized);
+  rebuildMaterializedIndexes();
+  return normalized;
 }
 
 export function loadArtifactRecord(artifactId: string): CateoArtifactRecord | null {
   const record = readProtectedJson<CateoArtifactRecord | null>(artifactPath(artifactId), null);
-  return record;
+  return record ? normalizeArtifactRecord(record) : null;
 }
 
 export function saveCaseRecord(record: CateoCaseRecord): CateoCaseRecord {
   writeProtectedJson(casePath(record.caseId), record);
   upsertCaseCatalog(record);
   upsertCaseVectorEntry(record);
+  rebuildMaterializedIndexes();
   return record;
 }
 
@@ -269,11 +319,12 @@ export function createRevision(params: {
   note?: string;
   signoffs?: CateoArtifactRevision["signoffs"];
 }): CateoArtifactRecord {
-  const current = params.record.revisions[params.record.revisions.length - 1];
+  const record = normalizeArtifactRecord(params.record);
+  const current = record.revisions[record.revisions.length - 1];
   const createdAt = params.provenance.createdAt;
   const revision: CateoArtifactRevision = {
     revisionId: crypto.randomUUID(),
-    revisionNumber: params.record.revisions.length + 1,
+    revisionNumber: record.revisions.length + 1,
     approvalState: params.approvalState,
     createdAt,
     createdBy: params.createdBy,
@@ -287,10 +338,10 @@ export function createRevision(params: {
   };
 
   const updated: CateoArtifactRecord = {
-    ...params.record,
+    ...record,
     currentRevisionId: revision.revisionId,
     updatedAt: createdAt,
-    revisions: [...params.record.revisions, revision],
+    revisions: [...record.revisions, revision],
   };
 
   return saveArtifactRecord(updated);
@@ -310,6 +361,7 @@ export interface SimilarArtifactMatch {
   caseId: string;
   assetId?: string;
   workOrderId?: string;
+  partNumber?: string;
   score: number;
   basis: string[];
   revisionNumber: number;
@@ -322,10 +374,11 @@ export function findSimilarArtifacts(params: {
   artifactType: string;
   assetId?: string;
   workOrderId?: string;
+  partNumber?: string;
   limit?: number;
   minScore?: number;
 }): SimilarArtifactMatch[] {
-  const rows = listArtifactCatalogRows().filter((row) => row.artifactType === params.artifactType);
+  const rows = listArtifactCatalogRows().filter((row) => row.artifactType === params.artifactType && row.lifecycleState !== "retired");
   const vectorMatches = searchVectorIndex({
     text: [params.artifactType, params.text, params.assetId, params.workOrderId].filter(Boolean).join("\n"),
     kind: "artifact",
@@ -336,7 +389,7 @@ export function findSimilarArtifacts(params: {
     limit: Math.max(5, params.limit ?? 5),
   });
 
-  const byArtifactId = new Map();
+  const byArtifactId = new Map<string, SimilarArtifactMatch>();
   for (const row of rows) {
     byArtifactId.set(row.artifactId, {
       artifactId: row.artifactId,
@@ -344,8 +397,9 @@ export function findSimilarArtifacts(params: {
       caseId: row.caseId,
       assetId: row.assetId,
       workOrderId: row.workOrderId,
-      score: 0,
-      basis: [],
+      partNumber: row.partNumber,
+      score: row.duplicateState === "duplicate" ? -0.25 : 0,
+      basis: row.duplicateState === "duplicate" ? ["duplicate_penalty"] : [],
       revisionNumber: row.revisionNumber,
       approvalState: row.approvalState,
       updatedAt: row.updatedAt,
@@ -353,6 +407,7 @@ export function findSimilarArtifacts(params: {
   }
 
   for (const match of vectorMatches) {
+    if (!match.artifactId) continue;
     const current = byArtifactId.get(match.artifactId);
     if (!current) continue;
     current.score = Math.max(current.score, match.score);
@@ -368,6 +423,10 @@ export function findSimilarArtifacts(params: {
       current.score += 0.2;
       current.basis.push("work_order_exact");
     }
+    if (params.partNumber && current.partNumber && current.partNumber.toLowerCase() === params.partNumber.toLowerCase()) {
+      current.score += 0.45;
+      current.basis.push("part_exact");
+    }
   }
 
   return [...byArtifactId.values()]
@@ -375,5 +434,3 @@ export function findSimilarArtifacts(params: {
     .sort((left, right) => right.score - left.score || right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, params.limit ?? 5);
 }
-
-

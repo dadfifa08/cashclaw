@@ -366,6 +366,16 @@ export interface CommandCenterFeedItem {
   severity: "info" | "warn" | "error";
 }
 
+export interface CommandCenterAccountRow {
+  userId: string;
+  displayName: string;
+  organization?: string;
+  roles: string[];
+  serviceTier?: string;
+  twoFactorEnabled?: boolean;
+  lastLoginAt?: string;
+}
+
 export interface CommandCenterData {
   generatedAt: number;
   seeded: boolean;
@@ -405,6 +415,17 @@ export interface CommandCenterData {
     documentCoveragePct: number;
     queueDepth: number;
     auditErrors: number;
+  };
+  accounts: {
+    totalUsers: number;
+    adminUsers: number;
+    reviewedProfiles: number;
+    enterpriseProfiles: number;
+    twoFactorEnabled: number;
+    suspendedProfiles: number;
+    serviceTiers: CommandCenterValuePoint[];
+    topOrganizations: CommandCenterValuePoint[];
+    recentUsers: CommandCenterAccountRow[];
   };
   alerts: CommandCenterAlert[];
   recentActivity: CommandCenterFeedItem[];

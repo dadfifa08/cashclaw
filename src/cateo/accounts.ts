@@ -6,8 +6,9 @@ import { appendAuditEvent } from "../security/audit.js";
 import { authenticateOperator } from "../security/operators.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
 import { getPilotProfile, type CateoProfileSnapshot, upsertPilotProfile } from "./profiles.js";
+import { buildTotpProvisioningUri, describeTotpSecret, generateRecoveryCodes, generateTotpSecret, hashRecoveryCode, verifyRecoveryCode, verifyTotpCode } from "./totp.js";
 
-const USER_DB = "cateo-public-users-v1";
+const USER_DB = "cateo-public-users-v2";
 const SESSION_DB = "cateo-public-sessions-v1";
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
 const USERNAME = /^[a-z0-9._-]{3,64}$/i;
@@ -17,6 +18,24 @@ const LIMIT = 6;
 const throttle = new Map<string, { failures: number[]; lockedUntil?: number }>();
 
 export type CateoPublicUserRole = "user" | "admin";
+
+interface UserSecurityRec {
+  passwordChangedAt?: string;
+  twoFactor: {
+    enabled: boolean;
+    secret?: string;
+    pendingSecret?: string;
+    recoveryCodeHashes: string[];
+    enabledAt?: string;
+    lastVerifiedAt?: string;
+  };
+}
+
+interface UserPreferencesRec {
+  timezone?: string;
+  responseDetail?: "balanced" | "concise" | "detailed";
+  emailUpdates?: boolean;
+}
 
 interface UserRec {
   userId: string;
@@ -35,6 +54,8 @@ interface UserRec {
   profileId?: string;
   passwordSalt?: string;
   passwordHash?: string;
+  security: UserSecurityRec;
+  preferences?: UserPreferencesRec;
 }
 interface UserFile { version: string; updatedAt: string; users: UserRec[]; }
 interface SessionRec { sessionId: string; userId: string; requesterId?: string; createdAt: string; updatedAt: string; expiresAt: string; }
@@ -53,8 +74,15 @@ export interface CateoPublicUserSnapshot {
   roles: CateoPublicUserRole[];
   profileId?: string;
   profile?: CateoProfileSnapshot | null;
+  security: {
+    twoFactorEnabled: boolean;
+    passwordChangedAt?: string;
+  };
+  preferences?: UserPreferencesRec;
 }
 export interface CateoPublicSessionSnapshot { sessionId: string; expiresAt: string; user: CateoPublicUserSnapshot; }
+export interface CateoTwoFactorSetupSnapshot { manualEntryKey: string; otpauthUrl: string; issuer: string; accountName: string; }
+export interface CateoTwoFactorConfirmSnapshot { user: CateoPublicUserSnapshot; recoveryCodes: string[]; }
 export class CateoPublicAuthError extends Error { constructor(public code: string, message: string, public status = 400) { super(message); this.name = "CateoPublicAuthError"; } }
 
 const userPath = () => path.join(getConfigDir(), "cateo", "security", "public_users.json");
@@ -72,19 +100,123 @@ function normalizeEmail(value?: string) { const email = trim(value)?.toLowerCase
 function normalizeUsername(value?: string) { const username = trim(value); if (!username) return undefined; if (!USERNAME.test(username)) throw new CateoPublicAuthError("USERNAME_INVALID", "Usernames must be 3-64 characters and use letters, numbers, dots, underscores, or hyphens."); return username; }
 function touchRequester(record: UserRec, requesterId?: string) { const id = trim(requesterId); if (!id) return; record.requesterIds = [id, ...record.requesterIds.filter((entry) => entry !== id)].slice(0, 20); }
 function profileIdFor(config: CashClawConfig, record: UserRec, requesterId?: string, requestId?: string) { return upsertPilotProfile(config, { profileId: record.profileId, requesterId, displayName: record.displayName, email: record.email, organization: record.organization }, requestId).profileId; }
-function userSnapshot(config: CashClawConfig, record: UserRec): CateoPublicUserSnapshot { return { userId: record.userId, createdAt: record.createdAt, updatedAt: record.updatedAt, lastLoginAt: record.lastLoginAt, status: record.status, email: record.email, username: record.username, displayName: record.displayName, organization: record.organization, roles: [...record.roles], profileId: record.profileId, profile: record.profileId ? getPilotProfile(config, record.profileId, record.requesterIds[0]) ?? null : null }; }
+function userSnapshot(config: CashClawConfig, record: UserRec): CateoPublicUserSnapshot { return { userId: record.userId, createdAt: record.createdAt, updatedAt: record.updatedAt, lastLoginAt: record.lastLoginAt, status: record.status, email: record.email, username: record.username, displayName: record.displayName, organization: record.organization, roles: [...record.roles], profileId: record.profileId, profile: record.profileId ? getPilotProfile(config, record.profileId, record.requesterIds[0]) ?? null : null, security: { twoFactorEnabled: record.security.twoFactor.enabled, passwordChangedAt: record.security.passwordChangedAt }, preferences: record.preferences }; }
 function saveUser(config: CashClawConfig, store: UserFile, record: UserRec) { const users = store.users.filter((entry) => entry.userId !== record.userId); users.push(record); saveUsers({ version: USER_DB, updatedAt: nowIso(), users }); return userSnapshot(config, record); }
 function guardLogin(identifier: string, requesterId?: string) { const key = `${identifier.toLowerCase()}::${requesterId ?? "anon"}`; const state = throttle.get(key); const now = Date.now(); if (!state) return; state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS); if (state.lockedUntil && state.lockedUntil > now) throw new CateoPublicAuthError("LOGIN_THROTTLED", "Too many login attempts. Try again later.", 429); if (state.lockedUntil && state.lockedUntil <= now) throttle.delete(key); }
 function failedLogin(identifier: string, requesterId?: string) { const key = `${identifier.toLowerCase()}::${requesterId ?? "anon"}`; const state = throttle.get(key) ?? { failures: [] as number[] }; const now = Date.now(); state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS); state.failures.push(now); if (state.failures.length >= LIMIT) state.lockedUntil = now + LOCK_MS; throttle.set(key, state); }
 const clearLogin = (identifier: string, requesterId?: string) => throttle.delete(`${identifier.toLowerCase()}::${requesterId ?? "anon"}`);
 function findUser(store: UserFile, identifier: string) { const id = identifier.trim().toLowerCase(); return store.users.find((entry) => entry.email?.toLowerCase() === id || entry.username?.toLowerCase() === id) ?? null; }
+function requireUser(store: UserFile, userId: string): UserRec { const user = store.users.find((entry) => entry.userId === userId && entry.status === "active"); if (!user) throw new CateoPublicAuthError("USER_NOT_FOUND", "User not found.", 404); return user; }
+function defaultSecurity(): UserSecurityRec { return { twoFactor: { enabled: false, recoveryCodeHashes: [] } }; }
+function defaultPreferences(record?: Partial<UserRec>): UserPreferencesRec { return { timezone: undefined, responseDetail: "balanced", emailUpdates: Boolean(record?.email) }; }
 function createSession(config: CashClawConfig, record: UserRec, requesterId?: string, requestId?: string): CateoPublicSessionSnapshot { const store = loadSessions(); const expiresAt = new Date(Date.now() + Math.max(1, getPilotConfig(config).sessionTtlDays) * 24 * 60 * 60 * 1000).toISOString(); const sessionId = crypto.randomBytes(36).toString("base64url"); const session: SessionRec = { sessionId, userId: record.userId, requesterId, createdAt: nowIso(), updatedAt: nowIso(), expiresAt }; const sessions = store.sessions.filter((entry) => entry.expiresAt > nowIso() && entry.userId !== record.userId).slice(-40); sessions.push(session); saveSessions({ version: SESSION_DB, updatedAt: nowIso(), sessions }); appendAuditEvent({ actor: "server", category: "public_auth", action: "session_create", outcome: "success", message: `Created public session for ${record.userId}`, requestId, metadata: { userId: record.userId, requesterId } }); return { sessionId, expiresAt, user: userSnapshot(config, record) }; }
+function passwordStrengthErrors(password: string, tokens: string[]): string[] { const errors: string[] = []; const normalized = password.trim(); if (normalized.length < 14) errors.push("Use at least 14 characters."); if (!/[a-z]/.test(normalized)) errors.push("Add a lowercase letter."); if (!/[A-Z]/.test(normalized)) errors.push("Add an uppercase letter."); if (!/\d/.test(normalized)) errors.push("Add a number."); if (!/[^A-Za-z0-9]/.test(normalized)) errors.push("Add a symbol."); if (/\s/.test(normalized)) errors.push("Avoid spaces."); if (/(.)\1\1/.test(normalized)) errors.push("Avoid repeated character runs."); for (const token of tokens.map((entry) => entry.toLowerCase()).filter((entry) => entry.length >= 4)) { if (normalized.toLowerCase().includes(token)) { errors.push("Do not include your email, username, or display name in the password."); break; } } return errors; }
+function ensureStrongPassword(password: string, context: { email?: string; username?: string; displayName?: string }): void { const errors = passwordStrengthErrors(password, [context.email ?? "", context.username ?? "", ...(context.displayName?.split(/\s+/) ?? [])]); if (errors.length > 0) throw new CateoPublicAuthError("PASSWORD_WEAK", errors.join(" ")); }
+function issuerName(): string { return "Cateo"; }
+function verifySecondFactor(record: UserRec, otpCode: string | undefined): { ok: boolean; remainingRecoveryHashes?: string[] } { if (!record.security.twoFactor.enabled || !record.security.twoFactor.secret) return { ok: true }; const raw = trim(otpCode); if (!raw) return { ok: false }; if (verifyTotpCode(record.security.twoFactor.secret, raw)) { return { ok: true }; } const recovery = verifyRecoveryCode(raw, record.security.twoFactor.recoveryCodeHashes); if (recovery.valid) { return { ok: true, remainingRecoveryHashes: recovery.remainingHashes }; } return { ok: false }; }
 
-export function registerPublicUser(config: CashClawConfig, input: { email: string; password: string; displayName?: string; organization?: string; username?: string; requesterId?: string }, requestId?: string): CateoPublicSessionSnapshot { const email = normalizeEmail(input.email); const username = normalizeUsername(input.username); const password = trim(input.password); if (!email) throw new CateoPublicAuthError("EMAIL_REQUIRED", "Email is required."); if (!password || password.length < 10) throw new CateoPublicAuthError("PASSWORD_WEAK", "Passwords must be at least 10 characters."); const store = loadUsers(); if (store.users.some((entry) => entry.email?.toLowerCase() === email)) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "An account already exists for that email.", 409); if (username && store.users.some((entry) => entry.username?.toLowerCase() === username.toLowerCase())) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "That username is already taken.", 409); const salt = crypto.randomBytes(18).toString("base64url"); const record: UserRec = { userId: crypto.randomUUID(), createdAt: nowIso(), updatedAt: nowIso(), lastLoginAt: nowIso(), status: "active", authSource: "local", email, emailHash: hashEmail(email), username, displayName: trim(input.displayName) || username || email.split("@")[0] || "Cateo user", organization: trim(input.organization), roles: ["user"], requesterIds: [], passwordSalt: salt, passwordHash: hashPassword(password, salt) }; touchRequester(record, input.requesterId); record.profileId = profileIdFor(config, record, input.requesterId, requestId); saveUser(config, store, record); appendAuditEvent({ actor: "server", category: "public_auth", action: "register", outcome: "success", message: `Registered public user ${record.userId}`, requestId, metadata: { userId: record.userId, requesterId: input.requesterId } }); return createSession(config, record, input.requesterId, requestId); }
+export function registerPublicUser(config: CashClawConfig, input: { email: string; password: string; displayName?: string; organization?: string; username?: string; requesterId?: string }, requestId?: string): CateoPublicSessionSnapshot { const email = normalizeEmail(input.email); const username = normalizeUsername(input.username); const password = trim(input.password); if (!email) throw new CateoPublicAuthError("EMAIL_REQUIRED", "Email is required."); if (!password) throw new CateoPublicAuthError("PASSWORD_REQUIRED", "Password is required."); ensureStrongPassword(password, { email, username, displayName: input.displayName }); const store = loadUsers(); if (store.users.some((entry) => entry.email?.toLowerCase() === email)) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "An account already exists for that email.", 409); if (username && store.users.some((entry) => entry.username?.toLowerCase() === username.toLowerCase())) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "That username is already taken.", 409); const salt = crypto.randomBytes(18).toString("base64url"); const record: UserRec = { userId: crypto.randomUUID(), createdAt: nowIso(), updatedAt: nowIso(), lastLoginAt: nowIso(), status: "active", authSource: "local", email, emailHash: hashEmail(email), username, displayName: trim(input.displayName) || username || email.split("@")[0] || "Cateo user", organization: trim(input.organization), roles: ["user"], requesterIds: [], passwordSalt: salt, passwordHash: hashPassword(password, salt), security: { ...defaultSecurity(), passwordChangedAt: nowIso() }, preferences: defaultPreferences({ email }) }; touchRequester(record, input.requesterId); record.profileId = profileIdFor(config, record, input.requesterId, requestId); saveUser(config, store, record); appendAuditEvent({ actor: "server", category: "public_auth", action: "register", outcome: "success", message: `Registered public user ${record.userId}`, requestId, metadata: { userId: record.userId, requesterId: input.requesterId } }); return createSession(config, record, input.requesterId, requestId); }
 
-export function loginPublicUser(config: CashClawConfig, input: { identifier: string; password: string; requesterId?: string }, requestId?: string): CateoPublicSessionSnapshot { const identifier = trim(input.identifier); const password = trim(input.password); if (!identifier || !password) throw new CateoPublicAuthError("LOGIN_REQUIRED", "Enter your email or username and password.", 400); guardLogin(identifier, input.requesterId); const store = loadUsers(); const local = findUser(store, identifier); if (local?.authSource === "local" && local.passwordSalt && local.passwordHash && verifyPassword(password, local.passwordSalt, local.passwordHash)) { local.updatedAt = nowIso(); local.lastLoginAt = nowIso(); touchRequester(local, input.requesterId); local.profileId = profileIdFor(config, local, input.requesterId, requestId); saveUser(config, store, local); clearLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login", outcome: "success", message: `Public user ${local.userId} logged in`, requestId, metadata: { userId: local.userId, requesterId: input.requesterId } }); return createSession(config, local, input.requesterId, requestId); } const operator = authenticateOperator(identifier, password); if (operator && operator.role === "admin") { const admin = local ?? { userId: crypto.randomUUID(), createdAt: nowIso(), updatedAt: nowIso(), lastLoginAt: nowIso(), status: "active", authSource: "operator", username: normalizeUsername(identifier) || identifier, displayName: identifier, roles: ["user", "admin"], requesterIds: [] } as UserRec; admin.updatedAt = nowIso(); admin.lastLoginAt = nowIso(); admin.roles = ["user", "admin"]; touchRequester(admin, input.requesterId); admin.profileId = profileIdFor(config, admin, input.requesterId, requestId); saveUser(config, store, admin); clearLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login_admin", outcome: "success", message: `Operator-backed admin ${admin.userId} logged in via public site`, requestId, metadata: { userId: admin.userId, requesterId: input.requesterId } }); return createSession(config, admin, input.requesterId, requestId); } failedLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login", outcome: "failed", severity: "warn", message: "Public login failed", requestId, metadata: { identifier, requesterId: input.requesterId } }); throw new CateoPublicAuthError("LOGIN_INVALID", "That login was not accepted.", 401); }
+export function loginPublicUser(config: CashClawConfig, input: { identifier: string; password: string; otpCode?: string; requesterId?: string }, requestId?: string): CateoPublicSessionSnapshot { const identifier = trim(input.identifier); const password = trim(input.password); if (!identifier || !password) throw new CateoPublicAuthError("LOGIN_REQUIRED", "Enter your email or username and password.", 400); guardLogin(identifier, input.requesterId); const store = loadUsers(); const local = findUser(store, identifier); const completeLogin = (record: UserRec): CateoPublicSessionSnapshot => { const secondFactor = verifySecondFactor(record, input.otpCode); if (!secondFactor.ok) { throw new CateoPublicAuthError("OTP_REQUIRED", "Enter your verification code or a recovery code to finish logging in.", 401); } if (secondFactor.remainingRecoveryHashes) { record.security.twoFactor.recoveryCodeHashes = secondFactor.remainingRecoveryHashes; } record.updatedAt = nowIso(); record.lastLoginAt = nowIso(); record.security.twoFactor.lastVerifiedAt = nowIso(); touchRequester(record, input.requesterId); record.profileId = profileIdFor(config, record, input.requesterId, requestId); saveUser(config, store, record); clearLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login", outcome: "success", message: `Public user ${record.userId} logged in`, requestId, metadata: { userId: record.userId, requesterId: input.requesterId, twoFactor: record.security.twoFactor.enabled } }); return createSession(config, record, input.requesterId, requestId); };
+  if (local?.authSource === "local" && local.passwordSalt && local.passwordHash && verifyPassword(password, local.passwordSalt, local.passwordHash)) {
+    return completeLogin(local);
+  }
+  const operator = authenticateOperator(identifier, password);
+  if (operator && operator.role === "admin") { const admin = local ?? { userId: crypto.randomUUID(), createdAt: nowIso(), updatedAt: nowIso(), lastLoginAt: nowIso(), status: "active", authSource: "operator", username: normalizeUsername(identifier) || identifier, displayName: identifier, roles: ["user", "admin"], requesterIds: [], security: defaultSecurity(), preferences: defaultPreferences() } as UserRec; admin.updatedAt = nowIso(); admin.lastLoginAt = nowIso(); admin.roles = ["user", "admin"]; admin.security = admin.security ?? defaultSecurity(); admin.preferences = admin.preferences ?? defaultPreferences(); touchRequester(admin, input.requesterId); admin.profileId = profileIdFor(config, admin, input.requesterId, requestId); return completeLogin(admin); }
+  failedLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login", outcome: "failed", severity: "warn", message: "Public login failed", requestId, metadata: { identifier, requesterId: input.requesterId } }); throw new CateoPublicAuthError("LOGIN_INVALID", "That login was not accepted.", 401); }
 
 export function getPublicSession(config: CashClawConfig, sessionId?: string, requesterId?: string, requestId?: string): CateoPublicSessionSnapshot | null { const id = trim(sessionId); if (!id) return null; const sessions = loadSessions(); const active = sessions.sessions.find((entry) => entry.sessionId === id); if (!active || active.expiresAt <= nowIso()) return null; if (requesterId && active.requesterId && active.requesterId !== requesterId) { appendAuditEvent({ actor: "server", category: "public_auth", action: "session_mismatch", outcome: "denied", severity: "warn", message: "Rejected public session because the requester identity changed", requestId, metadata: { requesterId, storedRequesterId: active.requesterId } }); return null; } const store = loadUsers(); const user = store.users.find((entry) => entry.userId === active.userId && entry.status === "active"); if (!user) return null; touchRequester(user, requesterId); user.profileId = profileIdFor(config, user, requesterId, requestId); saveUser(config, store, user); active.updatedAt = nowIso(); if (requesterId) active.requesterId = requesterId; saveSessions({ version: SESSION_DB, updatedAt: nowIso(), sessions: [...sessions.sessions.filter((entry) => entry.sessionId !== id && entry.expiresAt > nowIso()), active] }); return { sessionId: active.sessionId, expiresAt: active.expiresAt, user: userSnapshot(config, user) }; }
 export function logoutPublicSession(sessionId?: string, requestId?: string) { const id = trim(sessionId); if (!id) return; const store = loadSessions(); const sessions = store.sessions.filter((entry) => entry.sessionId !== id); if (sessions.length !== store.sessions.length) { saveSessions({ version: SESSION_DB, updatedAt: nowIso(), sessions }); appendAuditEvent({ actor: "server", category: "public_auth", action: "logout", outcome: "success", message: "Public session ended", requestId, metadata: { sessionId: id } }); } }
 export function listPublicUsers(config: CashClawConfig) { return loadUsers().users.filter((entry) => entry.status === "active").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map((entry) => userSnapshot(config, entry)); }
+export function getPublicUserById(config: CashClawConfig, userId: string): CateoPublicUserSnapshot | null { const store = loadUsers(); const user = store.users.find((entry) => entry.userId === userId && entry.status === "active"); return user ? userSnapshot(config, user) : null; }
 
+export function updatePublicUserProfile(config: CashClawConfig, userId: string, input: { displayName?: string; organization?: string; username?: string; email?: string; timezone?: string; responseDetail?: "balanced" | "concise" | "detailed"; emailUpdates?: boolean }, requestId?: string): CateoPublicUserSnapshot {
+  const store = loadUsers();
+  const user = requireUser(store, userId);
+  const email = input.email !== undefined ? normalizeEmail(input.email) : user.email;
+  const username = input.username !== undefined ? normalizeUsername(input.username) : user.username;
+  if (email && store.users.some((entry) => entry.userId !== userId && entry.email?.toLowerCase() === email.toLowerCase())) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "Another account already uses that email.", 409);
+  if (username && store.users.some((entry) => entry.userId !== userId && entry.username?.toLowerCase() === username.toLowerCase())) throw new CateoPublicAuthError("ACCOUNT_EXISTS", "That username is already taken.", 409);
+  user.email = email;
+  user.emailHash = hashEmail(email);
+  user.username = username;
+  user.displayName = trim(input.displayName) || user.displayName;
+  user.organization = trim(input.organization) || undefined;
+  user.updatedAt = nowIso();
+  user.profileId = profileIdFor(config, user, user.requesterIds[0], requestId);
+  user.preferences = {
+    ...(user.preferences ?? defaultPreferences(user)),
+    timezone: trim(input.timezone),
+    responseDetail: input.responseDetail ?? user.preferences?.responseDetail ?? "balanced",
+    emailUpdates: input.emailUpdates ?? user.preferences?.emailUpdates ?? Boolean(user.email),
+  };
+  const snapshot = saveUser(config, store, user);
+  appendAuditEvent({ actor: "server", category: "public_profile", action: "update_profile", outcome: "success", message: `Updated public profile ${userId}`, requestId, metadata: { userId, username, hasEmail: Boolean(email) } });
+  return snapshot;
+}
+
+export function changePublicUserPassword(config: CashClawConfig, userId: string, input: { currentPassword: string; newPassword: string }, requestId?: string): CateoPublicUserSnapshot {
+  const store = loadUsers();
+  const user = requireUser(store, userId);
+  if (user.authSource !== "local" || !user.passwordSalt || !user.passwordHash) throw new CateoPublicAuthError("PASSWORD_UNAVAILABLE", "This account does not manage a local password.", 400);
+  if (!verifyPassword(input.currentPassword, user.passwordSalt, user.passwordHash)) throw new CateoPublicAuthError("PASSWORD_INVALID", "Current password is not correct.", 401);
+  ensureStrongPassword(input.newPassword, { email: user.email, username: user.username, displayName: user.displayName });
+  const salt = crypto.randomBytes(18).toString("base64url");
+  user.passwordSalt = salt;
+  user.passwordHash = hashPassword(input.newPassword, salt);
+  user.security.passwordChangedAt = nowIso();
+  user.updatedAt = nowIso();
+  const snapshot = saveUser(config, store, user);
+  appendAuditEvent({ actor: "server", category: "public_profile", action: "change_password", outcome: "success", message: `Changed password for public user ${userId}`, requestId, metadata: { userId } });
+  return snapshot;
+}
+
+export function beginPublicUserTwoFactorSetup(_config: CashClawConfig, userId: string, requestId?: string): CateoTwoFactorSetupSnapshot {
+  const store = loadUsers();
+  const user = requireUser(store, userId);
+  const secret = generateTotpSecret();
+  user.security.twoFactor.pendingSecret = secret;
+  user.updatedAt = nowIso();
+  saveUsers({ version: USER_DB, updatedAt: nowIso(), users: [...store.users.filter((entry) => entry.userId !== user.userId), user] });
+  const described = describeTotpSecret(secret);
+  const accountName = user.email || user.username || user.displayName;
+  appendAuditEvent({ actor: "server", category: "public_profile", action: "begin_2fa", outcome: "success", message: `Started two-factor setup for ${userId}`, requestId, metadata: { userId } });
+  return {
+    manualEntryKey: described.manualEntryKey,
+    otpauthUrl: buildTotpProvisioningUri({ secret: described.secret, accountName, issuer: issuerName() }),
+    issuer: issuerName(),
+    accountName,
+  };
+}
+
+export function confirmPublicUserTwoFactor(config: CashClawConfig, userId: string, code: string, requestId?: string): CateoTwoFactorConfirmSnapshot {
+  const store = loadUsers();
+  const user = requireUser(store, userId);
+  const secret = user.security.twoFactor.pendingSecret;
+  if (!secret) throw new CateoPublicAuthError("OTP_SETUP_REQUIRED", "Start two-factor setup before confirming it.", 400);
+  if (!verifyTotpCode(secret, code)) throw new CateoPublicAuthError("OTP_INVALID", "The verification code was not accepted.", 401);
+  const recoveryCodes = generateRecoveryCodes();
+  user.security.twoFactor = {
+    enabled: true,
+    secret,
+    recoveryCodeHashes: recoveryCodes.map((entry) => hashRecoveryCode(entry)),
+    enabledAt: nowIso(),
+    lastVerifiedAt: nowIso(),
+  };
+  user.updatedAt = nowIso();
+  const snapshot = saveUser(config, store, user);
+  appendAuditEvent({ actor: "server", category: "public_profile", action: "confirm_2fa", outcome: "success", message: `Enabled two-factor authentication for ${userId}`, requestId, metadata: { userId } });
+  return { user: snapshot, recoveryCodes };
+}
+
+export function disablePublicUserTwoFactor(config: CashClawConfig, userId: string, code: string, requestId?: string): CateoPublicUserSnapshot {
+  const store = loadUsers();
+  const user = requireUser(store, userId);
+  const verification = verifySecondFactor(user, code);
+  if (!verification.ok) throw new CateoPublicAuthError("OTP_INVALID", "The verification code or recovery code was not accepted.", 401);
+  user.security.twoFactor = { enabled: false, recoveryCodeHashes: [] };
+  user.updatedAt = nowIso();
+  const snapshot = saveUser(config, store, user);
+  appendAuditEvent({ actor: "server", category: "public_profile", action: "disable_2fa", outcome: "success", message: `Disabled two-factor authentication for ${userId}`, requestId, metadata: { userId } });
+  return snapshot;
+}

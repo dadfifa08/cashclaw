@@ -9,6 +9,7 @@ import type {
   CateoFailureCodeEntry,
   CateoMatchedFailureCode,
   CateoPartCatalogEntry,
+  CateoPartResolution,
   CateoTaskClass,
 } from "./types.js";
 
@@ -20,13 +21,19 @@ function tokenize(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3);
 }
 
-function scorePart(part: CateoPartCatalogEntry, tokens: Set<string>, model: string | undefined): number {
+function scorePart(part: CateoPartCatalogEntry, tokens: Set<string>, model: string | undefined, partResolution: CateoPartResolution | undefined): number {
   let score = 0;
   for (const token of tokens) {
     if (part.description.toLowerCase().includes(token)) score += 2;
-    if (part.sku.toLowerCase().includes(token)) score += 1;
+    if (part.sku.toLowerCase().includes(token)) score += 2;
   }
   if (model && part.compatibleModels?.some((entry) => entry.toLowerCase() === model.toLowerCase())) {
+    score += 3;
+  }
+  if (partResolution?.partNumber && part.sku.toLowerCase() === partResolution.partNumber.toLowerCase()) {
+    score += 8;
+  }
+  if (partResolution?.aliases.some((alias) => alias.toLowerCase() === part.sku.toLowerCase())) {
     score += 3;
   }
   return score;
@@ -51,6 +58,17 @@ function mergeDigitalTwinInputs(primary: CateoDigitalTwinInput | undefined, deri
     dimensions: [...(primary?.dimensions ?? []), ...(derived?.dimensions ?? [])],
     points: [...(primary?.points ?? []), ...(derived?.points ?? [])],
   };
+}
+
+function partCatalogFromResolution(partResolution: CateoPartResolution | undefined): CateoPartCatalogEntry[] {
+  if (!partResolution?.partNumber) {
+    return [];
+  }
+  return [{
+    sku: partResolution.partNumber,
+    description: partResolution.partDescription || partResolution.partNumber,
+    compatibleModels: [],
+  }];
 }
 
 export function inferCateoTaskClass(input: CateoAssistInput): CateoTaskClass {
@@ -85,7 +103,7 @@ export function inferRequestedArtifacts(input: CateoAssistInput, taskClass = inf
   }
 }
 
-export function buildCateoContext(caseId: string, input: CateoAssistInput, attachmentEvidence: CateoAttachmentEvidence[] = []): CateoContextBundle {
+export function buildCateoContext(caseId: string, input: CateoAssistInput, attachmentEvidence: CateoAttachmentEvidence[] = [], partResolution?: CateoPartResolution | null): CateoContextBundle {
   const taskClass = inferCateoTaskClass(input);
   const matchedFailureCode = matchFailureCode(input.errorCode, input.taxonomy?.failureCodes);
   const machineModel = input.machine?.model ?? input.asset?.model;
@@ -95,11 +113,15 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     matchedFailureCode?.description,
     input.symptomDescription,
     ...(input.observedConditions ?? []),
+    partResolution?.partNumber,
+    partResolution?.partDescription,
+    partResolution?.manufacturer,
+    ...(partResolution?.aliases ?? []),
     ...attachmentEvidence.map((entry) => `${entry.name} ${entry.mimeType ?? ""}`),
   ].filter(Boolean).join(" ")));
 
-  const suggestedParts = [...(input.partsCatalog ?? [])]
-    .map((part) => ({ part, score: scorePart(part, searchTokens, machineModel) }))
+  const suggestedParts = [...(input.partsCatalog ?? []), ...partCatalogFromResolution(partResolution ?? undefined)]
+    .map((part) => ({ part, score: scorePart(part, searchTokens, machineModel, partResolution ?? undefined) }))
     .filter((entry) => entry.score > 0)
     .sort((left, right) => right.score - left.score)
     .slice(0, 6)
@@ -109,6 +131,10 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
   const serviceHistory = [...(input.serviceHistory ?? [])].sort((left, right) => right.occurredAt.localeCompare(left.occurredAt)).slice(0, 12);
 
   const contextSummary = uniqueStrings([
+    partResolution?.partNumber ? `Resolved manufacturing part number: ${partResolution.partNumber} (${partResolution.confidencePct}% confidence).` : undefined,
+    partResolution?.partDescription ? `Resolved part description: ${partResolution.partDescription}.` : undefined,
+    partResolution?.manufacturer ? `Resolved manufacturer: ${partResolution.manufacturer}.` : undefined,
+    partResolution?.verifiedSources.length ? `Verified web sources collected: ${partResolution.verifiedSources.length}.` : undefined,
     input.asset?.assetId ? `Asset reference: ${input.asset.assetId}.` : undefined,
     input.workOrder?.workOrderId ? `Work order reference: ${input.workOrder.workOrderId}.` : undefined,
     machineModel ? `Machine model: ${machineModel}.` : undefined,
@@ -121,16 +147,22 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     ...attachmentEvidence.slice(0, 3).map((entry) => `${entry.kind} evidence ${entry.name}${entry.width && entry.height ? ` at ${entry.width}x${entry.height}` : ""}.`),
     digitalTwin?.status === "fail" ? `Digital twin deviations detected: ${digitalTwin.flaggedFeatures.join("; ")}.` : undefined,
     digitalTwin?.status === "pass" ? "Digital twin geometry checks passed within tolerance." : undefined,
+    ...((partResolution?.evidence ?? []).slice(0, 4)),
   ]);
+
+  const resolvedTitle = partResolution?.partNumber
+    ? `${taskClass.replace(/-/g, " ")} case for ${partResolution.partNumber}`
+    : input.title?.trim() || `${taskClass.replace(/-/g, " ")} case for ${input.asset?.assetId ?? input.machine?.model ?? "unidentified asset"}`;
 
   return {
     caseId,
-    title: input.title?.trim() || `${taskClass.replace(/-/g, " ")} case for ${input.asset?.assetId ?? input.machine?.model ?? "unidentified asset"}`,
+    title: resolvedTitle,
     taskClass,
     asset: input.asset ?? null,
     machine: input.machine ?? null,
     workOrder: input.workOrder ?? null,
     failureCode: matchedFailureCode,
+    partResolution: partResolution ?? null,
     observedConditions: uniqueStrings(input.observedConditions ?? []),
     serviceHistory,
     suggestedParts,

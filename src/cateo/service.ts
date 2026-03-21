@@ -12,6 +12,7 @@ import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifact
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
+import { resolveCateoPart } from "./part_resolution.js";
 import { listCateoAdapters } from "./adapter_registry.js";
 import { enrichAssistInputWithOpenAIMedia } from "./openai_media.js";
 import { resolveCateoSkillsForAssistInput, summarizeSkillReasons } from "./skill_registry.js";
@@ -251,6 +252,7 @@ function buildPromptPayload(input: CateoAssistInput, context: CateoContextBundle
       suggestedParts: context.suggestedParts.slice(0, 5),
       attachments: context.attachments,
       digitalTwin: context.digitalTwin,
+      partResolution: context.partResolution,
       summary: context.contextSummary,
     },
     route,
@@ -983,7 +985,8 @@ export async function generateCateoArtifacts(
   const enrichedInput = mediaEnhanced.input;
   const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(enrichedInput));
   const attachmentEvidence = ingestMediaAttachments(caseId, enrichedInput.attachments, options.requestId);
-  const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence);
+  const partResolution = await resolveCateoPart(config, sanitizedInput, options.requestId);
+  const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence, partResolution);
   let route = buildRoute(sanitizedInput, context);
   const requestedTemplate = sanitizedInput.instructionTemplate;
   const template = getInstructionTemplate(requestedTemplate?.taskClass ?? route.taskClass, route.requestedArtifacts);
@@ -1101,6 +1104,149 @@ export async function generateCateoArtifacts(
       taskClass: route.taskClass,
       artifactTypes: route.requestedArtifacts,
     }));
+
+    if (partResolution.needsClarification) {
+      const clarificationConfidence: CateoConfidence = partResolution.confidencePct >= 80
+        ? "high"
+        : partResolution.confidencePct >= 50
+          ? "medium"
+          : "low";
+      const leadPlan = fallbackLeadPlan(route, context, sanitizedInput);
+      const critique = fallbackCritique(context);
+      const finalSynthesis = fallbackFinal(route, context, leadPlan, critique);
+      const runId = crypto.randomUUID();
+      const usage = buildUsageSummary(stageUsages);
+      const interaction = {
+        message: partResolution.clarifyingQuestion || "I need the exact manufacturer part number before I can generate the engineering package.",
+        highlights: uniqueStrings([
+          partResolution.partNumber ? `Candidate part number: ${partResolution.partNumber}` : undefined,
+          ...partResolution.evidence.slice(0, 3),
+        ]),
+        nextActions: uniqueStrings([
+          "Reply with the exact manufacturer part number or a clear nameplate photo.",
+          "Include any visible model, revision, or serial markings on the component.",
+        ]),
+        confidence: clarificationConfidence,
+        artifactCount: 0,
+        artifactLabels: [],
+        conversationTitle: partResolution.partNumber || context.asset?.assetId || context.machine?.model || "Cateo conversation",
+        clarifyingQuestion: partResolution.clarifyingQuestion,
+        releaseStatus: "clarification-required" as const,
+        renderedAt: new Date().toISOString(),
+        rendererVersion: "cateo-renderer-v2",
+      };
+      const trace = {
+        route,
+        template,
+        partResolution,
+        activeSkills,
+        adapters: activeAdapters,
+        validationAttempts,
+        ruleResults: [],
+        lookupCandidates,
+        persistActions,
+        prompts: {
+          planner: plannerPrompt,
+          builder: "",
+          reviewer: "",
+        },
+        leadPlan,
+        challengerCritique: critique,
+        finalSynthesis,
+        rawFinalSynthesis: JSON.stringify(finalSynthesis, null, 2),
+      };
+
+      publishCheckpoint(buildCheckpoint({
+        stage: "planning",
+        status: "completed",
+        summary: "Cateo could not verify the manufacturing part number with enough confidence and is requesting clarification.",
+        taskClass: route.taskClass,
+        confidence: clarificationConfidence,
+        artifactTypes: route.requestedArtifacts,
+      }));
+
+      saveCaseRecord({
+        caseId: context.caseId,
+        runId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        input: sanitizedInput,
+        context,
+        artifacts: [],
+        interaction,
+        requester,
+        conversationId: requester?.conversationId,
+        userId: requester?.userId,
+        usage,
+        trace,
+      });
+
+      publishCheckpoint(buildCheckpoint({
+        stage: "completed",
+        status: "completed",
+        summary: "Cateo is waiting for a clarifying part-number response before generating controlled artifacts.",
+        taskClass: route.taskClass,
+        confidence: clarificationConfidence,
+        artifactTypes: route.requestedArtifacts,
+        artifactCount: 0,
+      }));
+
+      if (config.security.persistence.persistDatasets) {
+        appendCateoInteraction({
+          schemaVersion: "1.0",
+          kind: "cateo_interaction",
+          timestamp: Date.now(),
+          caseId: context.caseId,
+          runId,
+          profileId: requester?.profileId,
+          requesterId: requester?.requesterId,
+          userId: requester?.userId,
+          conversationId: requester?.conversationId,
+          organization: requester?.organization,
+          emailHash: requester?.emailHash,
+          taskClass: route.taskClass,
+          assetId: context.asset?.assetId,
+          workOrderId: context.workOrder?.workOrderId,
+          prompt: sanitizedInput.symptomDescription,
+          errorCode: sanitizedInput.errorCode,
+          observedConditions: context.observedConditions,
+          attachmentCount: context.attachments.length,
+          requestedArtifacts: route.requestedArtifacts,
+          activeSkillIds: activeSkills.map((skill) => skill.id),
+          activeAdapterIds: activeAdapters.map((adapter) => adapter.id),
+          capabilityTags: route.capabilityTags,
+          artifactTypes: [],
+          interactionMessage: interaction.message,
+          highlights: interaction.highlights,
+          nextActions: interaction.nextActions,
+          confidence: interaction.confidence,
+          contextSummary: context.contextSummary,
+          checkpoints: checkpoints.map((checkpoint) => ({
+            stage: checkpoint.stage,
+            status: checkpoint.status,
+            summary: checkpoint.summary,
+          })),
+          modelsUsed: [],
+          usage,
+          executiveSummary: finalSynthesis.executiveSummary,
+          rootCauseStatement: finalSynthesis.rootCauseStatement,
+          reviewerSummary: "Clarification required before artifact generation.",
+        });
+      }
+
+      return {
+        caseId: context.caseId,
+        runId,
+        summary: interaction.message,
+        interaction,
+        checkpoints,
+        context,
+        requester,
+        usage,
+        trace,
+        artifacts: [],
+      };
+    }
 
     const leadStage = await callJsonStage({
       stage: "planner",
@@ -1374,6 +1520,7 @@ export async function generateCateoArtifacts(
     const ruleSummary = summarizeRuleOutcomes(ruleResults);
     const ruleMessages = ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => `${entry.ruleId}: ${entry.message}`);
     const escalatedByRules = ruleResults.some((entry) => entry.outcome === "escalate");
+    const requiresEngineerReview = Boolean(requester?.requiresEngineerReview);
 
     validationAttempts.push({
       stage: "reviewer",
@@ -1407,19 +1554,23 @@ export async function generateCateoArtifacts(
     const reviewerDecision: CateoReviewerDecision = {
       ...reviewerDecisionBase,
       overallStatus: escalatedByRules ? "needs-revision" : reviewerDecisionBase.overallStatus,
-      approvalState: escalatedByRules ? "draft" : reviewerDecisionBase.approvalState,
-      approvedArtifactTypes: escalatedByRules ? [] : reviewerDecisionBase.approvedArtifactTypes,
+      approvalState: escalatedByRules || requiresEngineerReview ? "draft" : reviewerDecisionBase.approvalState,
+      approvedArtifactTypes: escalatedByRules || requiresEngineerReview ? [] : reviewerDecisionBase.approvedArtifactTypes,
       findings: uniqueStrings([
         ...reviewerDecisionBase.findings,
         ...ruleMessages,
+        requiresEngineerReview ? "Customer tier requires manual engineer validation before artifact release." : undefined,
       ]),
       requiredFollowUp: uniqueStrings([
         ...reviewerDecisionBase.requiredFollowUp,
         ...ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => entry.message),
+        requiresEngineerReview ? "Engineer sign-off is required before releasing this artifact package to the customer profile." : undefined,
       ]),
       summary: escalatedByRules
         ? "Reviewer and rules engine held the package in draft pending additional engineering follow-up."
-        : reviewerDecisionBase.summary,
+        : requiresEngineerReview
+          ? "Cateo prepared the package and queued it for manual engineer validation before release."
+          : reviewerDecisionBase.summary,
     };
 
     const finalSynthesis: CateoFinalSynthesis = {
@@ -1539,6 +1690,7 @@ export async function generateCateoArtifacts(
         artifactType: draft.artifactType,
         assetId: context.asset?.assetId,
         workOrderId: context.workOrder?.workOrderId,
+        partNumber: context.partResolution?.partNumber,
         limit: 3,
       }).map((match) => ({
         artifactId: match.artifactId,
@@ -1698,9 +1850,19 @@ export async function generateCateoArtifacts(
   }));
 
     const interaction = renderCateoInteraction(artifacts);
+    if (requiresEngineerReview) {
+      interaction.releaseStatus = "pending-engineer-review";
+      interaction.requiresEngineerReview = true;
+      interaction.message = `${interaction.message}\n\nThis customer tier includes manual engineer validation. Cateo created the artifact package and queued it for sign-off before release to the profile and download catalog.`;
+      interaction.nextActions = uniqueStrings([
+        ...interaction.nextActions,
+        "Wait for manual engineer validation before downloading the final artifact package.",
+      ]);
+    }
     const trace = {
       route,
       template,
+      partResolution,
       activeSkills,
       adapters: activeAdapters,
       validationAttempts,
@@ -1756,7 +1918,7 @@ export async function generateCateoArtifacts(
     publishCheckpoint(buildCheckpoint({
       stage: "completed",
       status: "completed",
-      summary: "Cateo response is ready.",
+      summary: requiresEngineerReview ? "Cateo generated a provisional response and queued engineer review." : "Cateo response is ready.",
       taskClass: route.taskClass,
       confidence: interaction.confidence,
       artifactTypes: artifacts.map((artifact) => artifact.artifactType),
