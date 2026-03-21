@@ -13,13 +13,14 @@ export interface KnowledgeEntry {
 }
 
 const MAX_ENTRIES = 200;
+const MAX_KNOWLEDGE_AGE_MS = 365 * 24 * 60 * 60 * 1000;
 
 function getKnowledgePath(): string {
   return path.join(getConfigDir(), "knowledge.json");
 }
 
 function shouldPersist(): boolean {
-  return loadConfig()?.security.persistence.persistKnowledge ?? true;
+  return loadConfig()?.security.persistence.persistKnowledge ?? false;
 }
 
 let cache: KnowledgeEntry[] | null = null;
@@ -37,9 +38,17 @@ function isKnowledgeEntry(entry: unknown): entry is KnowledgeEntry {
   );
 }
 
+function pruneEntries(entries: KnowledgeEntry[], now = Date.now()): KnowledgeEntry[] {
+  const cutoff = now - MAX_KNOWLEDGE_AGE_MS;
+  return entries
+    .filter((entry) => entry.timestamp >= cutoff)
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-MAX_ENTRIES);
+}
+
 function readFromDisk(): KnowledgeEntry[] {
   const parsed = readProtectedJson<KnowledgeEntry[]>(getKnowledgePath(), []);
-  return Array.isArray(parsed) ? parsed.filter(isKnowledgeEntry) : [];
+  return Array.isArray(parsed) ? pruneEntries(parsed.filter(isKnowledgeEntry)) : [];
 }
 
 export function loadKnowledge(): KnowledgeEntry[] {
@@ -80,10 +89,7 @@ export function storeKnowledge(entry: KnowledgeEntry): void {
     entries.push(normalized);
   }
 
-  const trimmed = entries
-    .sort((left, right) => left.timestamp - right.timestamp)
-    .slice(-MAX_ENTRIES);
-
+  const trimmed = pruneEntries(entries);
   cache = trimmed;
   if (shouldPersist()) {
     writeProtectedJson(getKnowledgePath(), trimmed);

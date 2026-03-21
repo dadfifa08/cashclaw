@@ -217,6 +217,51 @@ vi.mock("../src/security/secure_store.js", async () => {
 function randomPort(): number { return 44000 + Math.floor(Math.random() * 4000); }
 async function closeServer(server: http.Server | null): Promise<void> { if (!server) return; await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); }
 
+async function internalHeaders(
+  method: string,
+  path: string,
+  options?: { body?: string; clientId?: string; profileId?: string; contentType?: string; accept?: string },
+): Promise<Record<string, string>> {
+  const { signInternalRequest } = await import("../src/system/service_auth.js");
+  const headers: Record<string, string> = {
+    ...signInternalRequest(process.env.CATEO_INTERNAL_TOKEN ?? "", {
+      method,
+      path,
+      body: options?.body ?? "",
+      clientId: options?.clientId,
+      profileId: options?.profileId,
+      contentType: options?.contentType,
+      accept: options?.accept,
+    }),
+  };
+  if (options?.clientId) {
+    headers["X-Cateo-Client-Id"] = options.clientId;
+  }
+  if (options?.profileId) {
+    headers["X-Cateo-Profile-Id"] = options.profileId;
+  }
+  if (options?.contentType) {
+    headers["Content-Type"] = options.contentType;
+  }
+  if (options?.accept) {
+    headers.Accept = options.accept;
+  }
+  return headers;
+}
+
+async function internalFetch(
+  baseUrl: string,
+  path: string,
+  options?: { method?: string; body?: string; clientId?: string; profileId?: string; contentType?: string; accept?: string },
+): Promise<Response> {
+  const method = options?.method ?? "GET";
+  return fetch(`${baseUrl}${path}`, {
+    method,
+    headers: await internalHeaders(method, path, options),
+    body: options?.body,
+  });
+}
+
 async function bootRuntime(): Promise<{ server: http.Server; baseUrl: string }> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cateo-internal-"));
   const port = randomPort();
@@ -272,30 +317,31 @@ describe("Cateo internal API", () => {
     vi.resetModules();
   });
 
-  it("requires a bearer token for the local-only Cateo API", async () => {
+  it("requires signed auth for the local-only Cateo API", async () => {
     ({ server, baseUrl } = await bootRuntime());
     const denied = await fetch(`${baseUrl}/internal/cateo/health`);
     expect(denied.status).toBe(403);
-    const allowed = await fetch(`${baseUrl}/internal/cateo/health`, { headers: { Authorization: "Bearer cateo-test-token" } });
+    const allowed = await internalFetch(baseUrl, "/internal/cateo/health");
     expect(allowed.status).toBe(200);
   });
 
   it("generates, revises, signs off, and indexes artifact-first responses", async () => {
     ({ server, baseUrl } = await bootRuntime());
-    const assist = await fetch(`${baseUrl}/internal/cateo/assist`, {
+    const assistBody = JSON.stringify({
+      title: "Pump overtemperature",
+      errorCode: "E-441",
+      symptomDescription: "Pump temperature alarm is triggering during normal load.",
+      asset: { assetId: "P-100", model: "Pump-X" },
+      workOrder: { workOrderId: "WO-88", priority: "high" },
+      observedConditions: ["Housing is warm", "Alarm clears after cooldown"],
+      serviceHistory: [{ occurredAt: "2026-03-01T08:00:00.000Z", summary: "Replaced seal set", failureCode: "E-441" }],
+      partsCatalog: [{ sku: "BRG-100", description: "Bearing kit", compatibleModels: ["Pump-X"], quantitySuggested: 1 }],
+      attachments: [{ kind: "image", name: "pump-evidence.png", mimeType: "image/png", contentBase64: ONE_BY_ONE_PNG_BASE64, annotations: { calibration: { referenceName: "scale", pixels: 1, actualLength: 1, unit: "mm" }, dimensions: [{ name: "bearing-seat", expected: 1, unit: "mm", observedPixels: 1, toleranceAbs: 0.1 }] } }],
+    });
+    const assist = await internalFetch(baseUrl, "/internal/cateo/assist", {
       method: "POST",
-      headers: { Authorization: "Bearer cateo-test-token", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: "Pump overtemperature",
-        errorCode: "E-441",
-        symptomDescription: "Pump temperature alarm is triggering during normal load.",
-        asset: { assetId: "P-100", model: "Pump-X" },
-        workOrder: { workOrderId: "WO-88", priority: "high" },
-        observedConditions: ["Housing is warm", "Alarm clears after cooldown"],
-        serviceHistory: [{ occurredAt: "2026-03-01T08:00:00.000Z", summary: "Replaced seal set", failureCode: "E-441" }],
-        partsCatalog: [{ sku: "BRG-100", description: "Bearing kit", compatibleModels: ["Pump-X"], quantitySuggested: 1 }],
-        attachments: [{ kind: "image", name: "pump-evidence.png", mimeType: "image/png", contentBase64: ONE_BY_ONE_PNG_BASE64, annotations: { calibration: { referenceName: "scale", pixels: 1, actualLength: 1, unit: "mm" }, dimensions: [{ name: "bearing-seat", expected: 1, unit: "mm", observedPixels: 1, toleranceAbs: 0.1 }] } }],
-      }),
+      contentType: "application/json",
+      body: assistBody,
     });
     expect(assist.status).toBe(200);
     const assistPayload = await assist.json() as {
@@ -314,19 +360,21 @@ describe("Cateo internal API", () => {
     expect(assistPayload.context.digitalTwin?.status).toBe("pass");
 
     const artifactId = assistPayload.artifacts[0]?.artifactId;
-    const revise = await fetch(`${baseUrl}/internal/cateo/artifacts/revise`, {
+    const reviseBody = JSON.stringify({ artifactId, editor: "qa-reviewer", note: "Added clarification", contentPatch: { followUpActions: ["Route to QA", "Confirm lubrication state"] } });
+    const revise = await internalFetch(baseUrl, "/internal/cateo/artifacts/revise", {
       method: "POST",
-      headers: { Authorization: "Bearer cateo-test-token", "Content-Type": "application/json" },
-      body: JSON.stringify({ artifactId, editor: "qa-reviewer", note: "Added clarification", contentPatch: { followUpActions: ["Route to QA", "Confirm lubrication state"] } }),
+      contentType: "application/json",
+      body: reviseBody,
     });
     expect(revise.status).toBe(200);
     const revisePayload = await revise.json() as { artifact: { revisions: Array<unknown> } };
     expect(revisePayload.artifact.revisions.length).toBe(2);
 
-    const signoff = await fetch(`${baseUrl}/internal/cateo/artifacts/signoff`, {
+    const signoffBody = JSON.stringify({ artifactId, actor: "quality.lead", role: "Quality Lead", meaning: "Reviewed for controlled release", state: "reviewed" });
+    const signoff = await internalFetch(baseUrl, "/internal/cateo/artifacts/signoff", {
       method: "POST",
-      headers: { Authorization: "Bearer cateo-test-token", "Content-Type": "application/json" },
-      body: JSON.stringify({ artifactId, actor: "quality.lead", role: "Quality Lead", meaning: "Reviewed for controlled release", state: "reviewed" }),
+      contentType: "application/json",
+      body: signoffBody,
     });
     expect(signoff.status).toBe(200);
     const signoffPayload = await signoff.json() as { artifact: { revisions: Array<{ approvalState: string }> } };

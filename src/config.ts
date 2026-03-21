@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { deleteProtectedSecret, readProtectedSecret, writeProtectedSecret } from "./security/secure_store.js";
 import { getConfigPath } from "./system/runtime_paths.js";
+import { loadRuntimeEnv } from "./system/env.js";
 
 export type LLMProviderName = "anthropic" | "openai" | "openrouter" | "ollama";
 export type AgentCashAccessClass = "research" | "social" | "media" | "outbound";
@@ -81,6 +82,33 @@ export interface OrchestrationConfig {
   structure: LocalSupportModelConfig;
 }
 
+export interface PilotHostedRoleModelsConfig {
+  lead?: string;
+  challenger?: string;
+  structure?: string;
+  study?: string;
+}
+
+export interface PilotQuotaConfig {
+  enabled: boolean;
+  dailyRequestLimit: number;
+  dailyInputTokenLimit: number;
+  dailyOutputTokenLimit: number;
+  dailyTotalTokenLimit: number;
+  reservationTokensPerJob: number;
+  maxPendingJobsPerProfile: number;
+  maxPromptChars: number;
+}
+
+export interface PilotConfig {
+  enabled: boolean;
+  allowAnonymousProfiles: boolean;
+  requireVerifiedEmail: boolean;
+  sessionTtlDays: number;
+  hostedRoleModels: PilotHostedRoleModelsConfig;
+  quota: PilotQuotaConfig;
+}
+
 export interface CashClawConfig {
   agentId: string;
   llm: LLMConfig;
@@ -98,7 +126,10 @@ export interface CashClawConfig {
   agentCashEnabled: boolean;
   security: SecurityConfig;
   orchestration: OrchestrationConfig;
+  pilot?: PilotConfig;
 }
+
+loadRuntimeEnv();
 
 const LLM_SECRET_NAME = "llm-api-key";
 const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1";
@@ -132,17 +163,35 @@ const DEFAULT_SECURITY_CONFIG: SecurityConfig = {
     agentCash: true,
   },
   persistence: {
-    persistOperatorChat: true,
+    persistOperatorChat: false,
     persistKnowledge: true,
     persistFeedback: true,
-    persistDatasets: true,
+    persistDatasets: false,
     persistActivityLog: true,
-    auditRetentionDays: 180,
+    auditRetentionDays: 90,
   },
   agentCashPolicy: {
     maxUsdPerCall: 0.05,
     maxUsdPerTask: 0.25,
     allowedClasses: ["research", "social"],
+  },
+};
+
+const DEFAULT_PILOT_CONFIG: PilotConfig = {
+  enabled: true,
+  allowAnonymousProfiles: true,
+  requireVerifiedEmail: false,
+  sessionTtlDays: 365,
+  hostedRoleModels: {},
+  quota: {
+    enabled: true,
+    dailyRequestLimit: 25,
+    dailyInputTokenLimit: 200_000,
+    dailyOutputTokenLimit: 200_000,
+    dailyTotalTokenLimit: 350_000,
+    reservationTokensPerJob: 16_000,
+    maxPendingJobsPerProfile: 4,
+    maxPromptChars: 12_000,
   },
 };
 
@@ -159,6 +208,7 @@ const DEFAULT_CONFIG: Omit<CashClawConfig, "agentId" | "llm"> = {
   agentCashEnabled: false,
   security: DEFAULT_SECURITY_CONFIG,
   orchestration: DEFAULT_ORCHESTRATION_CONFIG,
+  pilot: DEFAULT_PILOT_CONFIG,
 };
 
 function getDefaultConfigPath(): string {
@@ -180,6 +230,14 @@ function normalizeMode(value: unknown, fallback: OrchestrationMode): Orchestrati
     : fallback;
 }
 
+function normalizePositiveInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
 function mergeSecurityConfig(partial?: Partial<SecurityConfig>): SecurityConfig {
   return {
     approvalPolicy: {
@@ -194,6 +252,31 @@ function mergeSecurityConfig(partial?: Partial<SecurityConfig>): SecurityConfig 
       ...DEFAULT_SECURITY_CONFIG.agentCashPolicy,
       ...partial?.agentCashPolicy,
       allowedClasses: partial?.agentCashPolicy?.allowedClasses ?? DEFAULT_SECURITY_CONFIG.agentCashPolicy.allowedClasses,
+    },
+  };
+}
+
+function mergePilotConfig(partial?: Partial<PilotConfig>): PilotConfig {
+  return {
+    enabled: partial?.enabled ?? DEFAULT_PILOT_CONFIG.enabled,
+    allowAnonymousProfiles: partial?.allowAnonymousProfiles ?? DEFAULT_PILOT_CONFIG.allowAnonymousProfiles,
+    requireVerifiedEmail: partial?.requireVerifiedEmail ?? DEFAULT_PILOT_CONFIG.requireVerifiedEmail,
+    sessionTtlDays: normalizePositiveInteger(partial?.sessionTtlDays, DEFAULT_PILOT_CONFIG.sessionTtlDays, 1, 3650),
+    hostedRoleModels: {
+      lead: partial?.hostedRoleModels?.lead?.trim() || DEFAULT_PILOT_CONFIG.hostedRoleModels.lead,
+      challenger: partial?.hostedRoleModels?.challenger?.trim() || DEFAULT_PILOT_CONFIG.hostedRoleModels.challenger,
+      structure: partial?.hostedRoleModels?.structure?.trim() || DEFAULT_PILOT_CONFIG.hostedRoleModels.structure,
+      study: partial?.hostedRoleModels?.study?.trim() || DEFAULT_PILOT_CONFIG.hostedRoleModels.study,
+    },
+    quota: {
+      enabled: partial?.quota?.enabled ?? DEFAULT_PILOT_CONFIG.quota.enabled,
+      dailyRequestLimit: normalizePositiveInteger(partial?.quota?.dailyRequestLimit, DEFAULT_PILOT_CONFIG.quota.dailyRequestLimit, 1, 10_000),
+      dailyInputTokenLimit: normalizePositiveInteger(partial?.quota?.dailyInputTokenLimit, DEFAULT_PILOT_CONFIG.quota.dailyInputTokenLimit, 1_000, 50_000_000),
+      dailyOutputTokenLimit: normalizePositiveInteger(partial?.quota?.dailyOutputTokenLimit, DEFAULT_PILOT_CONFIG.quota.dailyOutputTokenLimit, 1_000, 50_000_000),
+      dailyTotalTokenLimit: normalizePositiveInteger(partial?.quota?.dailyTotalTokenLimit, DEFAULT_PILOT_CONFIG.quota.dailyTotalTokenLimit, 1_000, 50_000_000),
+      reservationTokensPerJob: normalizePositiveInteger(partial?.quota?.reservationTokensPerJob, DEFAULT_PILOT_CONFIG.quota.reservationTokensPerJob, 256, 10_000_000),
+      maxPendingJobsPerProfile: normalizePositiveInteger(partial?.quota?.maxPendingJobsPerProfile, DEFAULT_PILOT_CONFIG.quota.maxPendingJobsPerProfile, 1, 100),
+      maxPromptChars: normalizePositiveInteger(partial?.quota?.maxPromptChars, DEFAULT_PILOT_CONFIG.quota.maxPromptChars, 200, 500_000),
     },
   };
 }
@@ -227,12 +310,19 @@ function normalizeConfig(parsed: Partial<CashClawConfig>): CashClawConfig {
   }
 
   const llmFromSecret = readProtectedSecret(LLM_SECRET_NAME);
-  const llmProvider = parsed.llm?.provider ?? "anthropic";
+  const llmProvider = parsed.llm?.provider ?? "openai";
+  const llmFromEnv = llmProvider === "openai"
+    ? process.env.OPENAI_API_KEY?.trim()
+    : llmProvider === "anthropic"
+      ? process.env.ANTHROPIC_API_KEY?.trim()
+      : llmProvider === "openrouter"
+        ? process.env.OPENROUTER_API_KEY?.trim()
+        : undefined;
   const llm: LLMConfig = {
     provider: llmProvider,
     model: parsed.llm?.model ?? "",
     apiKey: requiresApiKey(llmProvider)
-      ? (plainApiKey ?? llmFromSecret ?? "")
+      ? (plainApiKey ?? llmFromSecret ?? llmFromEnv ?? "")
       : undefined,
     baseUrl: parsed.llm?.baseUrl,
   };
@@ -244,6 +334,7 @@ function normalizeConfig(parsed: Partial<CashClawConfig>): CashClawConfig {
     llm,
     security: mergeSecurityConfig(parsed.security),
     orchestration: mergeOrchestrationConfig(parsed.orchestration),
+    pilot: mergePilotConfig(parsed.pilot),
   };
 }
 
@@ -309,6 +400,10 @@ export function getOrchestrationConfig(config?: CashClawConfig | null): Orchestr
   return mergeOrchestrationConfig(config?.orchestration);
 }
 
+export function getPilotConfig(config?: CashClawConfig | null): PilotConfig {
+  return mergePilotConfig(config?.pilot);
+}
+
 export function isConfigured(): boolean {
   const config = loadConfig();
   if (!config) return false;
@@ -328,7 +423,7 @@ export function savePartialConfig(partial: Partial<CashClawConfig>): CashClawCon
     ...DEFAULT_CONFIG,
     agentId: "",
     llm: {
-      provider: "anthropic",
+      provider: "openai",
       model: "",
       apiKey: "",
     },
@@ -336,6 +431,7 @@ export function savePartialConfig(partial: Partial<CashClawConfig>): CashClawCon
     ...partial,
     security: mergeSecurityConfig(partial.security ?? existing?.security),
     orchestration: mergeOrchestrationConfig(partial.orchestration ?? existing?.orchestration),
+    pilot: mergePilotConfig(partial.pilot ?? existing?.pilot),
   });
 
   saveConfig(config);
@@ -352,7 +448,7 @@ export function initConfig(opts: {
 }): CashClawConfig {
   const modelDefaults: Record<LLMProviderName, string> = {
     anthropic: "claude-sonnet-4-20250514",
-    openai: "gpt-4o",
+    openai: "gpt-4.1-mini",
     openrouter: "anthropic/claude-sonnet-4-20250514",
     ollama: "qwen3-coder-next",
   };
@@ -381,6 +477,7 @@ export function initConfig(opts: {
     specialties: opts.specialties ?? [],
     security: mergeSecurityConfig(),
     orchestration: mergeOrchestrationConfig(),
+    pilot: mergePilotConfig(),
   };
 
   saveConfig(config);

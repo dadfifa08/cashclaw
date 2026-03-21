@@ -1,11 +1,13 @@
 import http from "node:http";
 import crypto from "node:crypto";
-import { loadConfig } from "../config.js";
+import { getPilotConfig, loadConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./http_api.js";
-import { getInternalServiceToken } from "../system/service_auth.js";
+import { createInternalRequestVerifier, getInternalServiceToken } from "../system/service_auth.js";
+import { readRequestBody } from "../system/request_body.js";
 import { getAssistJob, listAssistBacklog, submitAssistJob, subscribeAssistJob } from "./site_jobs.js";
 import type { AssistBacklogSnapshot, AssistJobEvent, AssistJobSnapshot } from "./site_jobs.js";
+import { CateoPilotQuotaError, getPilotProfile, reservePilotQuota, upsertPilotProfile, type CateoProfileSnapshot } from "./profiles.js";
 import type { CateoAssistInput, CateoInteractionCheckpoint } from "./types.js";
 
 const DEFAULT_SITE_BRIDGE_HOST = "127.0.0.1";
@@ -13,7 +15,9 @@ const DEFAULT_SITE_BRIDGE_PORT = 3788;
 const JOBS_PREFIX = `${INTERNAL_CATEO_PREFIX}/jobs/assist`;
 const JOB_STREAM_SUFFIX = "/stream";
 const REQUESTER_HEADER = "x-cateo-client-id";
+const PROFILE_HEADER = "x-cateo-profile-id";
 const REQUESTER_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
+const PROFILE_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const SSE_KEEPALIVE_MS = 15000;
 
 interface PublicChatResponse {
@@ -62,6 +66,7 @@ interface PublicStreamEnvelope {
   job: PublicQueueJob;
   backlog: PublicBacklogSnapshot;
   checkpoint?: CateoInteractionCheckpoint;
+  profile?: CateoProfileSnapshot;
 }
 
 export interface CateoSiteBridgeSettings {
@@ -103,25 +108,9 @@ function setHeaders(res: http.ServerResponse): void {
   res.setHeader("X-Frame-Options", "DENY");
 }
 
-function hasValidInternalToken(req: http.IncomingMessage, expectedToken: string): boolean {
-  const header = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) return false;
-  const presented = header.slice("Bearer ".length).trim();
-  const expectedBuffer = Buffer.from(expectedToken);
-  const presentedBuffer = Buffer.from(presented);
-  if (expectedBuffer.length !== presentedBuffer.length) return false;
-  return crypto.timingSafeEqual(expectedBuffer, presentedBuffer);
-}
 
 function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString();
-    });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
+  return readRequestBody(req, { maxBytes: 20_971_520 });
 }
 
 function parseJsonBody<T>(raw: string): T {
@@ -140,6 +129,16 @@ function getRequesterId(req: http.IncomingMessage): string | null {
     return null;
   }
   return REQUESTER_ID_PATTERN.test(requesterId) ? requesterId : null;
+}
+
+function getProfileId(req: http.IncomingMessage): string | null {
+  const header = req.headers[PROFILE_HEADER];
+  const raw = Array.isArray(header) ? header[0] : header;
+  const profileId = raw?.trim();
+  if (!profileId) {
+    return null;
+  }
+  return PROFILE_ID_PATTERN.test(profileId) ? profileId : null;
 }
 
 function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | undefined {
@@ -231,6 +230,14 @@ function summarizeBacklog(backlog: AssistBacklogSnapshot): string {
   return `Tracking ${backlog.pendingCount} pending output(s): ${backlog.runningCount} in progress, ${backlog.queuedCount} queued.`;
 }
 
+function currentProfileSnapshot(profileId: string | undefined, requesterId: string): CateoProfileSnapshot | undefined {
+  const config = loadConfig();
+  if (!config || !profileId) {
+    return undefined;
+  }
+  return getPilotProfile(config, profileId, requesterId) ?? undefined;
+}
+
 function streamEnvelope(job: AssistJobSnapshot, checkpoint?: CateoInteractionCheckpoint): PublicStreamEnvelope {
   const backlog = listAssistBacklog(job.requesterId);
   return {
@@ -239,6 +246,7 @@ function streamEnvelope(job: AssistJobSnapshot, checkpoint?: CateoInteractionChe
     job: toPublicJob(job),
     backlog: toPublicBacklog(backlog),
     checkpoint,
+    profile: currentProfileSnapshot(job.profileId, job.requesterId),
   };
 }
 
@@ -336,10 +344,32 @@ function streamJobState(req: http.IncomingMessage, res: http.ServerResponse, job
   });
 }
 
+function measureAssistPromptChars(input: CateoAssistInput): number {
+  const textParts = [
+    input.title,
+    input.query,
+    input.errorCode,
+    input.symptomDescription,
+    ...(input.observedConditions ?? []),
+    input.asset?.assetId,
+    input.asset?.assetType,
+    input.asset?.model,
+    input.machine?.manufacturer,
+    input.machine?.model,
+    input.machine?.serialNumber,
+    input.machine?.environment,
+    input.workOrder?.workOrderId,
+    input.workOrder?.title,
+    ...(input.attachments ?? []).flatMap((attachment) => [attachment.name, attachment.note]),
+  ].filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+  return textParts.join("\n").length;
+}
+
 export async function startCateoSiteBridge(
   settings: CateoSiteBridgeSettings = resolveCateoSiteBridgeSettings(),
 ): Promise<http.Server> {
   const internalServiceToken = getInternalServiceToken();
+  const internalRequestVerifier = createInternalRequestVerifier(internalServiceToken);
 
   const server = http.createServer((req, res) => {
     setHeaders(res);
@@ -363,12 +393,14 @@ export async function startCateoSiteBridge(
     void (async () => {
       try {
         if (url.pathname === "/healthz") {
+          const config = loadConfig();
           json(res, {
             ok: true,
-            configured: !!loadConfig(),
+            configured: !!config,
             internalApiPrefix: INTERNAL_CATEO_PREFIX,
             jobsPrefix: JOBS_PREFIX,
             localOnlyListener: settings.baseUrl,
+            pilotEnabled: config ? getPilotConfig(config).enabled : false,
           });
           return;
         }
@@ -378,7 +410,8 @@ export async function startCateoSiteBridge(
           return;
         }
 
-        if (!hasValidInternalToken(req, internalServiceToken)) {
+        const internalVerification = await internalRequestVerifier.verify(req, url.pathname, () => readBody(req));
+        if (!internalVerification.ok) {
           json(res, { error: "Unauthorized" }, 403);
           return;
         }
@@ -390,14 +423,25 @@ export async function startCateoSiteBridge(
             return;
           }
 
+          const config = loadConfig();
+          const requestedProfileId = getProfileId(req) ?? undefined;
+          const profile = config && requestedProfileId
+            ? getPilotProfile(config, requestedProfileId, requesterId, requestId) ?? undefined
+            : undefined;
+
           if (req.method === "GET") {
             const backlog = listAssistBacklog(requesterId);
-            json(res, { ok: true, message: summarizeBacklog(backlog), backlog });
+            json(res, { ok: true, message: summarizeBacklog(backlog), backlog, profile });
             return;
           }
 
           if (req.method !== "POST") {
             json(res, { error: "GET or POST only" }, 405);
+            return;
+          }
+
+          if (!config) {
+            json(res, { error: "Cateo runtime is not configured" }, 503);
             return;
           }
 
@@ -409,10 +453,33 @@ export async function startCateoSiteBridge(
             return;
           }
 
-          const job = submitAssistJob(body, requesterId, requestId);
-          const backlog = listAssistBacklog(requesterId);
-          json(res, { ok: true, message: summarizeQueueJob(job), job, backlog }, 202);
-          return;
+          const promptChars = measureAssistPromptChars(body);
+          const pilotConfig = getPilotConfig(config);
+          const sessionProfile = profile ?? upsertPilotProfile(config, { profileId: requestedProfileId, requesterId }, requestId);
+          if (promptChars > pilotConfig.quota.maxPromptChars) {
+            json(res, {
+              error: `Prompt exceeds the pilot limit of ${pilotConfig.quota.maxPromptChars} characters.`,
+              profile: sessionProfile,
+            }, 413);
+            return;
+          }
+
+          try {
+            const reservation = reservePilotQuota(config, sessionProfile.profileId, requesterId, requestId);
+            const job = submitAssistJob(body, requesterId, requestId, {
+              profile: reservation.profile,
+              quotaReservationId: reservation.reservationId,
+            });
+            const backlog = listAssistBacklog(requesterId);
+            json(res, { ok: true, message: summarizeQueueJob(job), job, backlog, profile: reservation.profile }, 202);
+            return;
+          } catch (error) {
+            if (error instanceof CateoPilotQuotaError) {
+              json(res, { error: error.message, code: error.code, profile: error.profile ?? sessionProfile }, error.status);
+              return;
+            }
+            throw error;
+          }
         }
 
         if (url.pathname.startsWith(`${JOBS_PREFIX}/`)) {
@@ -446,7 +513,8 @@ export async function startCateoSiteBridge(
           }
 
           const backlog = listAssistBacklog(requesterId);
-          json(res, { ok: true, message: summarizeQueueJob(job), job, backlog });
+          const profile = currentProfileSnapshot(job.profileId, requesterId);
+          json(res, { ok: true, message: summarizeQueueJob(job), job, backlog, profile });
           return;
         }
 

@@ -198,6 +198,7 @@ function browserHeaders(baseUrl: string): HeadersInit {
   return {
     Origin: baseUrl,
     "Sec-Fetch-Site": "same-origin",
+    "User-Agent": "Cateo-ControlPlane-Test/1.0",
   };
 }
 
@@ -223,6 +224,20 @@ function getCookieValue(response: Response, name: string): string | undefined {
     .find(([key]) => key === name)?.[1];
 }
 
+async function loginOperator(baseUrl: string) {
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: {
+      ...browserHeaders(baseUrl),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username: "admin", password: "test-password-123" }),
+  });
+  const cookie = getCookieHeader(login);
+  const csrf = getCookieValue(login, "cateo_csrf");
+  return { login, cookie, csrf };
+}
+
 async function closeServer(server: http.Server | null): Promise<void> {
   if (!server) return;
   await new Promise<void>((resolve, reject) => {
@@ -241,6 +256,7 @@ async function bootConfiguredRuntime(): Promise<TestRuntime> {
   const port = randomPort();
   process.env.CATEO_HOME = home;
   process.env.CATEO_PORT = String(port);
+  process.env.CATEO_OPERATOR_USERS = "admin:admin:test-password-123";
 
   vi.resetModules();
 
@@ -327,28 +343,45 @@ describe("control plane integration", () => {
     }
     delete process.env.CATEO_HOME;
     delete process.env.CATEO_PORT;
+    delete process.env.CATEO_OPERATOR_USERS;
     vi.resetModules();
   });
 
-  it("requires bootstrap session and csrf for privileged HTTP control", async () => {
+  it("requires operator login, csrf, and logout for privileged HTTP control", async () => {
     runtime = await bootConfiguredRuntime();
 
-    const unauthorized = await fetch(`${runtime.baseUrl}/api/status`, {
+    const sessionProbe = await fetch(`${runtime.baseUrl}/api/auth/session`, {
       headers: browserHeaders(runtime.baseUrl),
     });
-    expect(unauthorized.status).toBe(403);
+    expect(sessionProbe.status).toBe(200);
+    await expect(sessionProbe.json()).resolves.toMatchObject({ enabled: true, authenticated: false });
+
+    const unauthorized = await fetch(`${runtime.baseUrl}/api/bootstrap`, {
+      headers: browserHeaders(runtime.baseUrl),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const { login, cookie, csrf } = await loginOperator(runtime.baseUrl);
+    expect(login.status).toBe(200);
+    expect(cookie).toContain("cateo_sid=");
+    expect(csrf).toBeTruthy();
+
+    const session = await fetch(`${runtime.baseUrl}/api/auth/session`, {
+      headers: { ...browserHeaders(runtime.baseUrl), Cookie: cookie },
+    });
+    expect(session.status).toBe(200);
+    await expect(session.json()).resolves.toMatchObject({
+      enabled: true,
+      authenticated: true,
+      operator: { username: "admin", role: "admin" },
+    });
 
     const bootstrap = await fetch(`${runtime.baseUrl}/api/bootstrap`, {
-      headers: browserHeaders(runtime.baseUrl),
+      headers: { ...browserHeaders(runtime.baseUrl), Cookie: cookie },
     });
     expect(bootstrap.status).toBe(200);
     const snapshot = await bootstrap.json() as { snapshot: { status: { running: boolean } } };
     expect(snapshot.snapshot.status.running).toBe(true);
-
-    const cookie = getCookieHeader(bootstrap);
-    const csrf = getCookieValue(bootstrap, "cateo_csrf");
-    expect(cookie).toContain("cateo_sid=");
-    expect(csrf).toBeTruthy();
 
     const status = await fetch(`${runtime.baseUrl}/api/status`, {
       headers: { ...browserHeaders(runtime.baseUrl), Cookie: cookie },
@@ -376,16 +409,33 @@ describe("control plane integration", () => {
     });
     expect(stopWithCsrf.status).toBe(200);
     expect(mocks.heartbeatInstances[0]?.stop).toHaveBeenCalled();
-  });
 
-  it("delivers live snapshots over websocket after authenticated bootstrap", async () => {
+    const logout = await fetch(`${runtime.baseUrl}/api/auth/logout`, {
+      method: "POST",
+      headers: {
+        ...browserHeaders(runtime.baseUrl),
+        Cookie: cookie,
+        "Content-Type": "application/json",
+        "X-Cateo-CSRF": csrf ?? "",
+      },
+    });
+    expect(logout.status).toBe(200);
+
+    const deniedAfterLogout = await fetch(`${runtime.baseUrl}/api/bootstrap`, {
+      headers: { ...browserHeaders(runtime.baseUrl), Cookie: cookie },
+    });
+    expect(deniedAfterLogout.status).toBe(401);
+  });
+  it("delivers live snapshots over websocket after authenticated login", async () => {
     runtime = await bootConfiguredRuntime();
 
+    const { login, cookie, csrf } = await loginOperator(runtime.baseUrl);
+    expect(login.status).toBe(200);
+
     const bootstrap = await fetch(`${runtime.baseUrl}/api/bootstrap`, {
-      headers: browserHeaders(runtime.baseUrl),
+      headers: { ...browserHeaders(runtime.baseUrl), Cookie: cookie },
     });
-    const cookie = getCookieHeader(bootstrap);
-    const csrf = getCookieValue(bootstrap, "cateo_csrf");
+    expect(bootstrap.status).toBe(200);
 
     const wsUrl = `${runtime.baseUrl.replace("http", "ws")}/api/live?csrf=${encodeURIComponent(csrf ?? "")}`;
     const message = await new Promise<string>((resolve, reject) => {
@@ -393,6 +443,7 @@ describe("control plane integration", () => {
         headers: {
           Origin: runtime.baseUrl,
           Cookie: cookie,
+          "User-Agent": "Cateo-ControlPlane-Test/1.0",
         },
       });
 
@@ -407,15 +458,11 @@ describe("control plane integration", () => {
     expect(payload.type).toBe("snapshot");
     expect(payload.snapshot.status.agentId).toBe("agent-1");
   });
-
   it("executes approved actions through the approval endpoint", async () => {
     runtime = await bootConfiguredRuntime();
 
-    const bootstrap = await fetch(`${runtime.baseUrl}/api/bootstrap`, {
-      headers: browserHeaders(runtime.baseUrl),
-    });
-    const cookie = getCookieHeader(bootstrap);
-    const csrf = getCookieValue(bootstrap, "cateo_csrf");
+    const { login, cookie, csrf } = await loginOperator(runtime.baseUrl);
+    expect(login.status).toBe(200);
 
     const { requestApproval } = await import("../src/security/approvals.js");
     const { approval } = requestApproval({
@@ -449,4 +496,3 @@ describe("control plane integration", () => {
     );
   });
 });
-

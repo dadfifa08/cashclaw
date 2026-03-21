@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import { loadConfig } from "../config.js";
 import { createModelRuntime } from "../llm/runtime.js";
 import { appendAuditEvent } from "../security/audit.js";
-import { generateCateoArtifacts } from "./service.js";
+import { getCateoUsageFromError, generateCateoArtifacts } from "./service.js";
+import { settlePilotQuota, type CateoProfileSnapshot } from "./profiles.js";
 import type { CateoAssistInput, CateoInteractionCheckpoint } from "./types.js";
 
 const MAX_JOBS = 200;
@@ -18,6 +19,8 @@ export type AssistJobEventType = "snapshot" | "checkpoint" | "completed" | "fail
 interface AssistJobRecord {
   jobId: string;
   requesterId: string;
+  profileId?: string;
+  quotaReservationId?: string;
   acceptedSequence: number;
   title: string;
   promptPreview: string;
@@ -31,11 +34,15 @@ interface AssistJobRecord {
   checkpoints: CateoInteractionCheckpoint[];
   result?: AssistJobResult;
   error?: string;
+  profileDisplayName?: string;
+  profileOrganization?: string;
+  profileEmailHash?: string;
 }
 
 export interface AssistJobSnapshot {
   jobId: string;
   requesterId: string;
+  profileId?: string;
   acceptedSequence: number;
   title: string;
   promptPreview: string;
@@ -294,6 +301,7 @@ function snapshot(record: AssistJobRecord, context = buildSnapshotContext()): As
   return {
     jobId: record.jobId,
     requesterId: record.requesterId,
+    profileId: record.profileId,
     acceptedSequence: record.acceptedSequence,
     title: record.title,
     promptPreview: record.promptPreview,
@@ -361,11 +369,12 @@ async function runNextJob(): Promise<void> {
     outcome: "running",
     message: `Cateo site job ${jobId} started`,
     requestId: record.requestId,
-    metadata: { jobId, requesterId: record.requesterId, acceptedSequence: record.acceptedSequence },
+    metadata: { jobId, requesterId: record.requesterId, profileId: record.profileId, acceptedSequence: record.acceptedSequence },
   });
 
+  let config = loadConfig();
+
   try {
-    const config = loadConfig();
     if (!config) {
       throw new Error("Cateo runtime is not configured");
     }
@@ -374,6 +383,13 @@ async function runNextJob(): Promise<void> {
     const result = await generateCateoArtifacts(config, runtime, record.input, {
       actor: "site",
       requestId: record.requestId,
+      requester: record.profileId ? {
+        profileId: record.profileId,
+        requesterId: record.requesterId,
+        displayName: record.profileDisplayName,
+        organization: record.profileOrganization,
+        emailHash: record.profileEmailHash,
+      } : undefined,
       onCheckpoint: (checkpoint) => {
         recordCheckpoint(record, checkpoint, "checkpoint");
       },
@@ -385,6 +401,9 @@ async function runNextJob(): Promise<void> {
     if (record.startedAt) {
       rememberDuration(record.finishedAt - record.startedAt);
     }
+    if (config && record.profileId) {
+      settlePilotQuota(config, record.profileId, record.quotaReservationId, result.usage, "completed", record.requestId);
+    }
     emitJobEvent(record, "completed");
     appendAuditEvent({
       actor: "server",
@@ -393,13 +412,22 @@ async function runNextJob(): Promise<void> {
       outcome: "success",
       message: `Cateo site job ${jobId} completed`,
       requestId: record.requestId,
-      metadata: { jobId, requesterId: record.requesterId, artifactCount: record.result.artifacts.length },
+      metadata: {
+        jobId,
+        requesterId: record.requesterId,
+        profileId: record.profileId,
+        artifactCount: record.result.artifacts.length,
+        totalTokens: record.result.usage?.totalTokens,
+      },
     });
   } catch (error) {
     record.status = "failed";
     record.error = error instanceof Error ? error.message : String(error);
     record.finishedAt = Date.now();
     record.updatedAt = record.finishedAt;
+    if (config && record.profileId) {
+      settlePilotQuota(config, record.profileId, record.quotaReservationId, getCateoUsageFromError(error), "failed", record.requestId);
+    }
     recordCheckpoint(record, createCheckpoint({
       stage: "failed",
       status: "failed",
@@ -413,7 +441,7 @@ async function runNextJob(): Promise<void> {
       severity: "error",
       message: `Cateo site job ${jobId} failed`,
       requestId: record.requestId,
-      metadata: { jobId, requesterId: record.requesterId, error: record.error },
+      metadata: { jobId, requesterId: record.requesterId, profileId: record.profileId, error: record.error },
     });
   } finally {
     record.input = undefined;
@@ -435,7 +463,12 @@ async function drainQueue(): Promise<void> {
   }
 }
 
-export function submitAssistJob(input: CateoAssistInput, requesterId: string, requestId?: string): AssistJobSnapshot {
+export function submitAssistJob(
+  input: CateoAssistInput,
+  requesterId: string,
+  requestId?: string,
+  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string },
+): AssistJobSnapshot {
   compactJobs();
   const now = Date.now();
   const jobId = crypto.randomUUID();
@@ -449,6 +482,8 @@ export function submitAssistJob(input: CateoAssistInput, requesterId: string, re
   const record: AssistJobRecord = {
     jobId,
     requesterId,
+    profileId: options?.profile?.profileId,
+    quotaReservationId: options?.quotaReservationId,
     acceptedSequence,
     title: deriveTitle(input),
     promptPreview: derivePromptPreview(input),
@@ -458,6 +493,8 @@ export function submitAssistJob(input: CateoAssistInput, requesterId: string, re
     requestId,
     input,
     checkpoints: [acceptedCheckpoint],
+    profileDisplayName: options?.profile?.displayName,
+    profileOrganization: options?.profile?.organization,
   };
 
   jobs.set(jobId, record);
@@ -469,7 +506,7 @@ export function submitAssistJob(input: CateoAssistInput, requesterId: string, re
     outcome: "queued",
     message: `Cateo site job ${jobId} queued`,
     requestId,
-    metadata: { jobId, requesterId, acceptedSequence: record.acceptedSequence, queueDepth: queue.length },
+    metadata: { jobId, requesterId, profileId: record.profileId, acceptedSequence: record.acceptedSequence, queueDepth: queue.length },
   });
   const submittedSnapshot = snapshot(record);
   void drainQueue();

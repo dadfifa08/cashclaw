@@ -167,6 +167,51 @@ vi.mock("../src/security/secure_store.js", async () => {
 function randomPort(): number { return 48000 + Math.floor(Math.random() * 1000); }
 async function closeServer(server: http.Server | null): Promise<void> { if (!server) return; await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); }
 
+async function bridgeHeaders(
+  method: string,
+  path: string,
+  options?: { body?: string; clientId?: string; profileId?: string; contentType?: string; accept?: string },
+): Promise<Record<string, string>> {
+  const { signInternalRequest } = await import("../src/system/service_auth.js");
+  const headers: Record<string, string> = {
+    ...signInternalRequest(process.env.CATEO_INTERNAL_TOKEN ?? "", {
+      method,
+      path,
+      body: options?.body ?? "",
+      clientId: options?.clientId,
+      profileId: options?.profileId,
+      contentType: options?.contentType,
+      accept: options?.accept,
+    }),
+  };
+  if (options?.clientId) {
+    headers["X-Cateo-Client-Id"] = options.clientId;
+  }
+  if (options?.profileId) {
+    headers["X-Cateo-Profile-Id"] = options.profileId;
+  }
+  if (options?.contentType) {
+    headers["Content-Type"] = options.contentType;
+  }
+  if (options?.accept) {
+    headers.Accept = options.accept;
+  }
+  return headers;
+}
+
+async function bridgeFetch(
+  baseUrl: string,
+  path: string,
+  options?: { method?: string; body?: string; clientId?: string; profileId?: string; contentType?: string; accept?: string },
+): Promise<Response> {
+  const method = options?.method ?? "GET";
+  return fetch(`${baseUrl}${path}`, {
+    method,
+    headers: await bridgeHeaders(method, path, options),
+    body: options?.body,
+  });
+}
+
 function parseSseEvents(raw: string): Array<{ event: string; data: any }> {
   return raw
     .split(/\r?\n\r?\n/)
@@ -253,25 +298,23 @@ describe("Cateo site bridge", () => {
     const hidden = await fetch(`${baseUrl}/api/bootstrap`);
     expect(hidden.status).toBe(404);
 
-    const allowed = await fetch(`${baseUrl}/internal/cateo/health`, { headers: { Authorization: "Bearer cateo-site-bridge-token" } });
+    const allowed = await bridgeFetch(baseUrl, "/internal/cateo/health");
     expect(allowed.status).toBe(200);
   });
 
   it("queues and completes async assist jobs through the authenticated bridge", async () => {
     ({ server, baseUrl } = await bootBridge());
-    const submit = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
+    const submitBody = JSON.stringify({
+      title: "Inspection request",
+      symptomDescription: "Customer needs a controlled inspection artifact.",
+      asset: { assetId: "A-100", model: "Rig-X" },
+      workOrder: { workOrderId: "WO-100" },
+    });
+    const submit = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
       method: "POST",
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "Content-Type": "application/json",
-        "X-Cateo-Client-Id": "client-a",
-      },
-      body: JSON.stringify({
-        title: "Inspection request",
-        symptomDescription: "Customer needs a controlled inspection artifact.",
-        asset: { assetId: "A-100", model: "Rig-X" },
-        workOrder: { workOrderId: "WO-100" },
-      }),
+      contentType: "application/json",
+      clientId: "client-a",
+      body: submitBody,
     });
 
     expect(submit.status).toBe(202);
@@ -290,11 +333,8 @@ describe("Cateo site bridge", () => {
       backlog?: { pendingCount: number };
     } | null = null;
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const poll = await fetch(`${baseUrl}/internal/cateo/jobs/assist/${jobEnvelope.job.jobId}`, {
-        headers: {
-          Authorization: "Bearer cateo-site-bridge-token",
-          "X-Cateo-Client-Id": "client-a",
-        },
+      const poll = await bridgeFetch(baseUrl, `/internal/cateo/jobs/assist/${jobEnvelope.job.jobId}`, {
+        clientId: "client-a",
       });
       expect(poll.status).toBe(200);
       result = await poll.json() as {
@@ -318,26 +358,21 @@ describe("Cateo site bridge", () => {
     ({ server, baseUrl } = await bootBridge());
     mocks.runtimeDelayMs.value = 10;
 
-    const submit = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
+    const streamingBody = JSON.stringify({
+      title: "Streaming inspection request",
+      symptomDescription: "Stream the live checkpoint path for this controlled request.",
+    });
+    const submit = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
       method: "POST",
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "Content-Type": "application/json",
-        "X-Cateo-Client-Id": "client-stream",
-      },
-      body: JSON.stringify({
-        title: "Streaming inspection request",
-        symptomDescription: "Stream the live checkpoint path for this controlled request.",
-      }),
+      contentType: "application/json",
+      clientId: "client-stream",
+      body: streamingBody,
     });
     expect(submit.status).toBe(202);
     const submitPayload = await submit.json() as { job: { jobId: string } };
 
-    const stream = await fetch(`${baseUrl}/internal/cateo/jobs/assist/${submitPayload.job.jobId}/stream`, {
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "X-Cateo-Client-Id": "client-stream",
-      },
+    const stream = await bridgeFetch(baseUrl, `/internal/cateo/jobs/assist/${submitPayload.job.jobId}/stream`, {
+      clientId: "client-stream",
     });
 
     expect(stream.status).toBe(200);
@@ -366,13 +401,10 @@ describe("Cateo site bridge", () => {
     mocks.runtimeDelayMs.value = 40;
 
     async function submitFor(clientId: string, symptomDescription: string) {
-      const response = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
+      const response = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
         method: "POST",
-        headers: {
-          Authorization: "Bearer cateo-site-bridge-token",
-          "Content-Type": "application/json",
-          "X-Cateo-Client-Id": clientId,
-        },
+        contentType: "application/json",
+        clientId,
         body: JSON.stringify({ symptomDescription }),
       });
       expect(response.status).toBe(202);
@@ -391,11 +423,8 @@ describe("Cateo site bridge", () => {
     expect(second.job.backlogPosition).toBeGreaterThanOrEqual(2);
     expect(third.job.backlogPosition).toBeGreaterThanOrEqual(2);
 
-    const backlogResponse = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "X-Cateo-Client-Id": "client-a",
-      },
+    const backlogResponse = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
+      clientId: "client-a",
     });
     expect(backlogResponse.status).toBe(200);
     const backlogPayload = await backlogResponse.json() as {
@@ -411,11 +440,8 @@ describe("Cateo site bridge", () => {
     expect(backlogPayload.backlog.items[0]?.backlogPosition).toBe(1);
     expect(backlogPayload.backlog.items[1]?.backlogPosition).toBe(2);
 
-    const otherBacklogResponse = await fetch(`${baseUrl}/internal/cateo/jobs/assist`, {
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "X-Cateo-Client-Id": "client-b",
-      },
+    const otherBacklogResponse = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
+      clientId: "client-b",
     });
     expect(otherBacklogResponse.status).toBe(200);
     const otherBacklogPayload = await otherBacklogResponse.json() as {
@@ -424,11 +450,8 @@ describe("Cateo site bridge", () => {
     expect(otherBacklogPayload.backlog.pendingCount).toBe(1);
     expect(otherBacklogPayload.backlog.items[0]?.jobId).toBe(third.job.jobId);
 
-    const foreignLookup = await fetch(`${baseUrl}/internal/cateo/jobs/assist/${encodeURIComponent(first.job.jobId)}`, {
-      headers: {
-        Authorization: "Bearer cateo-site-bridge-token",
-        "X-Cateo-Client-Id": "client-b",
-      },
+    const foreignLookup = await bridgeFetch(baseUrl, `/internal/cateo/jobs/assist/${encodeURIComponent(first.job.jobId)}`, {
+      clientId: "client-b",
     });
     expect(foreignLookup.status).toBe(404);
   });

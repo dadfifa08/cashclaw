@@ -1,5 +1,5 @@
 import type { CashClawConfig, LLMConfig } from "../config.js";
-import { getOrchestrationConfig } from "../config.js";
+import { getOrchestrationConfig, getPilotConfig } from "../config.js";
 import { createLLMProvider } from "./index.js";
 import type { LLMProvider } from "./types.js";
 
@@ -36,6 +36,36 @@ function toLocalRoleConfig(model: string, baseUrl: string): LLMConfig {
   };
 }
 
+function toSharedRoleConfig(config: CashClawConfig, role: Exclude<CateoRuntimeRole, "operator">): LLMConfig {
+  const pilot = getPilotConfig(config);
+  const modelOverride = role === "lead"
+    ? pilot.hostedRoleModels.lead
+    : role === "challenger"
+      ? pilot.hostedRoleModels.challenger
+      : role === "structure"
+        ? pilot.hostedRoleModels.structure
+        : pilot.hostedRoleModels.study;
+
+  return {
+    provider: config.llm.provider,
+    model: modelOverride?.trim() || config.llm.model,
+    apiKey: config.llm.apiKey,
+    baseUrl: config.llm.baseUrl,
+  };
+}
+
+function createRoleProvider(config: LLMConfig, role: CateoRuntimeRole): { provider: LLMProvider; meta: CateoRuntimeModelInfo } {
+  return {
+    provider: createLLMProvider(config),
+    meta: {
+      role,
+      provider: config.provider,
+      model: config.model,
+      baseUrl: config.baseUrl,
+    },
+  };
+}
+
 export function createModelRuntime(config: CashClawConfig): CateoModelRuntime {
   const orchestration = getOrchestrationConfig(config);
   const operator = createLLMProvider(config.llm);
@@ -60,52 +90,52 @@ export function createModelRuntime(config: CashClawConfig): CateoModelRuntime {
     };
   }
 
-  const leadConfig = toLocalRoleConfig(orchestration.lead.model, orchestration.lead.baseUrl);
-  const lead = createLLMProvider(leadConfig);
-  const leadMeta: CateoRuntimeModelInfo = {
-    role: "lead",
-    provider: leadConfig.provider,
-    model: leadConfig.model,
-    baseUrl: leadConfig.baseUrl,
-  };
+  const useLocalRoles = config.llm.provider === "ollama";
+  const leadRole = createRoleProvider(
+    useLocalRoles
+      ? toLocalRoleConfig(orchestration.lead.model, orchestration.lead.baseUrl)
+      : toSharedRoleConfig(config, "lead"),
+    "lead",
+  );
 
-  const challenger = orchestration.challenger.enabled
-    ? createLLMProvider(toLocalRoleConfig(orchestration.challenger.model, orchestration.challenger.baseUrl))
-    : undefined;
-  const challengerMeta = orchestration.challenger.enabled
-    ? {
-        role: "challenger" as const,
-        provider: "ollama" as const,
-        model: orchestration.challenger.model,
-        baseUrl: orchestration.challenger.baseUrl,
-      }
+  const challengerRole = orchestration.challenger.enabled
+    ? createRoleProvider(
+        useLocalRoles
+          ? toLocalRoleConfig(orchestration.challenger.model, orchestration.challenger.baseUrl)
+          : toSharedRoleConfig(config, "challenger"),
+        "challenger",
+      )
     : undefined;
 
-  const structure = orchestration.structure.enabled
-    ? createLLMProvider(toLocalRoleConfig(orchestration.structure.model, orchestration.structure.baseUrl))
+  const structureRole = orchestration.structure.enabled
+    ? createRoleProvider(
+        useLocalRoles
+          ? toLocalRoleConfig(orchestration.structure.model, orchestration.structure.baseUrl)
+          : toSharedRoleConfig(config, "structure"),
+        "structure",
+      )
     : undefined;
-  const structureMeta = orchestration.structure.enabled
-    ? {
-        role: "structure" as const,
-        provider: "ollama" as const,
-        model: orchestration.structure.model,
-        baseUrl: orchestration.structure.baseUrl,
-      }
-    : undefined;
+
+  const studyRole = createRoleProvider(
+    useLocalRoles
+      ? toLocalRoleConfig(orchestration.lead.model, orchestration.lead.baseUrl)
+      : toSharedRoleConfig(config, "study"),
+    "study",
+  );
 
   return {
     operator,
-    lead,
-    challenger,
-    structure,
-    study: lead,
+    lead: leadRole.provider,
+    challenger: challengerRole?.provider,
+    structure: structureRole?.provider,
+    study: studyRole.provider,
     meta: {
       orchestrationEnabled: true,
       operator: operatorMeta,
-      lead: leadMeta,
-      challenger: challengerMeta,
-      structure: structureMeta,
-      study: { ...leadMeta, role: "study" },
+      lead: leadRole.meta,
+      challenger: challengerRole?.meta,
+      structure: structureRole?.meta,
+      study: studyRole.meta,
     },
   };
 }

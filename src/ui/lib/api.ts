@@ -4,6 +4,40 @@ const CSRF_HEADER = "X-Cateo-CSRF";
 
 let bootstrapCache: BootstrapData | null = null;
 let bootstrapPromise: Promise<BootstrapData> | null = null;
+let authSessionCache: AuthSessionData | null = null;
+let authSessionPromise: Promise<AuthSessionData> | null = null;
+
+export interface OperatorIdentityData {
+  username: string;
+  role: "admin" | "reviewer" | "analyst" | "viewer";
+}
+
+export interface AuthSessionData {
+  enabled: boolean;
+  authenticated: boolean;
+  operator: OperatorIdentityData | null;
+  expiresAt: number | null;
+}
+
+interface ErrorPayload {
+  error?: string;
+  code?: string;
+  retryAfterSeconds?: number | null;
+}
+
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  retryAfterSeconds?: number | null;
+
+  constructor(message: string, status: number, code?: string, retryAfterSeconds?: number | null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds ?? null;
+  }
+}
 
 function readCookie(name: string): string | null {
   const parts = document.cookie.split(/;\s*/).filter(Boolean);
@@ -17,56 +51,91 @@ function readCookie(name: string): string | null {
   return null;
 }
 
-async function parseResponse<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: res.statusText })) as { error?: string };
-    throw new Error(body.error ?? `API ${res.status}`);
-  }
-  return res.json() as Promise<T>;
+export function clearClientSessionCaches(): void {
+  bootstrapCache = null;
+  bootstrapPromise = null;
+  authSessionCache = null;
+  authSessionPromise = null;
 }
 
-async function getWithSession<T>(path: string, forceRefresh = false): Promise<T> {
-  await getBootstrap(forceRefresh);
-  const res = await fetch(`${BASE}${path}`, { credentials: "same-origin" });
-  if (res.status === 403 && !forceRefresh) {
-    bootstrapCache = null;
-    await getBootstrap(true);
-    return getWithSession<T>(path, true);
+async function parseResponse<T>(res: Response): Promise<T> {
+  const raw = await res.text();
+  let parsed: unknown = null;
+  if (raw) {
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      if (!res.ok) {
+        throw new ApiError(raw || res.statusText || `API ${res.status}`, res.status);
+      }
+      return raw as T;
+    }
   }
+
+  if (!res.ok) {
+    const body = (parsed && typeof parsed === "object" ? parsed : {}) as ErrorPayload;
+    throw new ApiError(body.error ?? res.statusText ?? `API ${res.status}`, res.status, body.code, body.retryAfterSeconds ?? null);
+  }
+
+  return parsed as T;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { credentials: "same-origin" });
   return parseResponse<T>(res);
 }
 
-async function postWithSession<T>(path: string, body?: unknown, forceRefresh = false): Promise<T> {
-  await getBootstrap(forceRefresh);
-  const csrf = readCookie(CSRF_COOKIE);
-  if (!csrf) {
-    if (!forceRefresh) {
-      bootstrapCache = null;
-      await getBootstrap(true);
-      return postWithSession<T>(path, body, true);
-    }
-    throw new Error("Missing CSRF token");
+async function postJson<T>(path: string, body?: unknown, csrfToken?: string): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (csrfToken) {
+    headers[CSRF_HEADER] = csrfToken;
   }
-
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
     credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      [CSRF_HEADER]: csrf,
-    },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
-
-  if (res.status === 403 && !forceRefresh) {
-    bootstrapCache = null;
-    await getBootstrap(true);
-    return postWithSession<T>(path, body, true);
-  }
-
   return parseResponse<T>(res);
 }
 
+async function getWithSession<T>(path: string): Promise<T> {
+  return getJson<T>(path);
+}
+
+async function postWithSession<T>(path: string, body?: unknown): Promise<T> {
+  const csrf = readCookie(CSRF_COOKIE);
+  if (!csrf) {
+    throw new ApiError("Missing CSRF token", 403, "MISSING_CSRF");
+  }
+  return postJson<T>(path, body, csrf);
+}
+
+export async function getAuthSession(force = false): Promise<AuthSessionData> {
+  if (!force && authSessionCache) {
+    return authSessionCache;
+  }
+  if (!force && authSessionPromise) {
+    return authSessionPromise;
+  }
+
+  const pending = getJson<AuthSessionData>("/api/auth/session")
+    .then((data) => {
+      authSessionCache = data;
+      authSessionPromise = null;
+      return data;
+    })
+    .catch((err) => {
+      authSessionPromise = null;
+      if (force) {
+        authSessionCache = null;
+      }
+      throw err;
+    });
+
+  authSessionPromise = pending;
+  return pending;
+}
 export interface StatusData {
   running: boolean;
   activeTasks: number;
@@ -269,6 +338,77 @@ export interface AuditEntry {
   hash: string;
 }
 
+export interface CommandCenterValuePoint {
+  label: string;
+  value: number;
+}
+
+export interface CommandCenterTrendPoint {
+  label: string;
+  artifacts: number;
+  revisions: number;
+  interactions: number;
+  approvals: number;
+}
+
+export interface CommandCenterAlert {
+  level: "info" | "warn" | "critical";
+  title: string;
+  detail: string;
+}
+
+export interface CommandCenterFeedItem {
+  id: string;
+  timestamp: number;
+  type: string;
+  title: string;
+  detail: string;
+  severity: "info" | "warn" | "error";
+}
+
+export interface CommandCenterData {
+  generatedAt: number;
+  seeded: boolean;
+  totals: {
+    artifacts: number;
+    revisions: number;
+    approved: number;
+    reviewed: number;
+    draft: number;
+    cases: number;
+    highRiskCases: number;
+    lowConfidenceOutputs: number;
+    unresolvedItems: number;
+    validationFailures: number;
+    retries: number;
+    escalations: number;
+    profiles: number;
+    vectorEntries: number;
+  };
+  growth: {
+    artifacts: number;
+    revisions: number;
+    interactions: number;
+  };
+  trend: CommandCenterTrendPoint[];
+  topFailureModes: CommandCenterValuePoint[];
+  topAssets: CommandCenterValuePoint[];
+  approvalStates: CommandCenterValuePoint[];
+  modelValidation: {
+    successRate: number;
+    failureRate: number;
+    retryCount: number;
+    escalationCount: number;
+  };
+  health: {
+    ingestionStatus: string;
+    documentCoveragePct: number;
+    queueDepth: number;
+    auditErrors: number;
+  };
+  alerts: CommandCenterAlert[];
+  recentActivity: CommandCenterFeedItem[];
+}
 export interface LiveRuntimeSnapshot {
   status: StatusData | null;
   tasks: TaskData[];
@@ -281,6 +421,7 @@ export interface LiveRuntimeSnapshot {
   approvals: ApprovalData[];
   audit: AuditEntry[];
   config: ConfigData | null;
+  commandCenter: CommandCenterData;
 }
 
 export interface BootstrapData {
@@ -307,18 +448,15 @@ export async function getBootstrap(force = false): Promise<BootstrapData> {
     return bootstrapPromise;
   }
 
-  const pending = fetch(`${BASE}/api/bootstrap`, { credentials: "same-origin" })
-    .then((res) => parseResponse<BootstrapData>(res))
+  const pending = getJson<BootstrapData>("/api/bootstrap")
     .then((data) => {
       bootstrapCache = data;
       bootstrapPromise = null;
       return data;
     })
     .catch((err) => {
+      bootstrapCache = null;
       bootstrapPromise = null;
-      if (force) {
-        bootstrapCache = null;
-      }
       throw err;
     });
 
@@ -336,6 +474,19 @@ export function getLiveUrl(): string {
 }
 
 export const api = {
+  getAuthSession,
+  login: async (username: string, password: string) => {
+    const session = await postJson<AuthSessionData>("/api/auth/login", { username, password });
+    authSessionCache = session;
+    bootstrapCache = null;
+    bootstrapPromise = null;
+    return session;
+  },
+  logout: async () => {
+    const result = await postWithSession<{ ok: boolean }>("/api/auth/logout");
+    clearClientSessionCaches();
+    return result;
+  },
   getStatus: () => getWithSession<StatusData>("/api/status"),
   getTasks: () => getWithSession<{ tasks: TaskData[]; events: ActivityEvent[] }>("/api/tasks"),
   getLogs: () => getWithSession<{ log: string }>("/api/logs"),
@@ -390,4 +541,3 @@ export const api = {
   }) => postWithSession<{ ok: boolean }>("/api/setup/specialization", spec),
   completeSetup: () => postWithSession<{ ok: boolean; mode: string }>("/api/setup/complete"),
 };
-

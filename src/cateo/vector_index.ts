@@ -8,7 +8,7 @@ import type { CateoArtifactRecord, CateoCaseRecord } from "./types.js";
 const VECTOR_INDEX_VERSION = "cateo-vector-index-v1";
 const VECTOR_DIMENSIONS = 128;
 
-interface VectorIndexEntry {
+export interface VectorIndexEntry {
   id: string;
   kind: "artifact" | "case";
   caseId: string;
@@ -133,4 +133,44 @@ export function upsertCaseVectorEntry(record: CateoCaseRecord): void {
     preview,
     vector: buildVector(preview),
   });
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  let total = 0;
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    total += left[index] * right[index];
+  }
+  return Number(total.toFixed(6));
+}
+
+export interface VectorSearchMatch extends VectorIndexEntry {
+  score: number;
+}
+
+export function listVectorIndexEntries(): VectorIndexEntry[] {
+  return [...loadVectorIndex().entries].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function searchVectorIndex(params: {
+  text: string;
+  kind?: VectorIndexEntry["kind"];
+  artifactType?: string;
+  assetId?: string;
+  workOrderId?: string;
+  minScore?: number;
+  limit?: number;
+}): VectorSearchMatch[] {
+  const query = buildVector(params.text);
+  const minScore = params.minScore ?? 0.1;
+  const limit = params.limit ?? 5;
+  return listVectorIndexEntries()
+    .filter((entry) => !params.kind || entry.kind === params.kind)
+    .filter((entry) => !params.artifactType || entry.artifactType === params.artifactType)
+    .filter((entry) => !params.assetId || entry.assetId === params.assetId || !entry.assetId)
+    .filter((entry) => !params.workOrderId || entry.workOrderId === params.workOrderId || !entry.workOrderId)
+    .map((entry) => ({ ...entry, score: cosineSimilarity(entry.vector, query) }))
+    .filter((entry) => entry.score >= minScore)
+    .sort((left, right) => right.score - left.score || right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, limit);
 }

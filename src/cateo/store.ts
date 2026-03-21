@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
-import { upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
+import { searchVectorIndex, upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
 import type {
   CateoArtifactContent,
   CateoArtifactRecord,
@@ -14,7 +14,7 @@ import type {
 
 const DATABASE_VERSION = "cateo-document-db-v1";
 
-interface ArtifactCatalogRow {
+export interface ArtifactCatalogRow {
   artifactId: string;
   caseId: string;
   artifactType: string;
@@ -34,7 +34,7 @@ interface ArtifactCatalogFile {
   rows: ArtifactCatalogRow[];
 }
 
-interface CaseCatalogRow {
+export interface CaseCatalogRow {
   caseId: string;
   runId: string;
   title: string;
@@ -292,4 +292,84 @@ export function createRevision(params: {
   };
 
   return saveArtifactRecord(updated);
+}
+
+export function listArtifactCatalogRows(): ArtifactCatalogRow[] {
+  return [...loadArtifactCatalog().rows].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function listCaseCatalogRows(): CaseCatalogRow[] {
+  return [...loadCaseCatalog().rows].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export interface SimilarArtifactMatch {
+  artifactId: string;
+  artifactType: string;
+  caseId: string;
+  assetId?: string;
+  workOrderId?: string;
+  score: number;
+  basis: string[];
+  revisionNumber: number;
+  approvalState: string;
+  updatedAt: string;
+}
+
+export function findSimilarArtifacts(params: {
+  text: string;
+  artifactType: string;
+  assetId?: string;
+  workOrderId?: string;
+  limit?: number;
+  minScore?: number;
+}): SimilarArtifactMatch[] {
+  const rows = listArtifactCatalogRows().filter((row) => row.artifactType === params.artifactType);
+  const vectorMatches = searchVectorIndex({
+    text: [params.artifactType, params.text, params.assetId, params.workOrderId].filter(Boolean).join("\n"),
+    kind: "artifact",
+    artifactType: params.artifactType,
+    assetId: params.assetId,
+    workOrderId: params.workOrderId,
+    minScore: params.minScore ?? 0.12,
+    limit: Math.max(5, params.limit ?? 5),
+  });
+
+  const byArtifactId = new Map();
+  for (const row of rows) {
+    byArtifactId.set(row.artifactId, {
+      artifactId: row.artifactId,
+      artifactType: row.artifactType,
+      caseId: row.caseId,
+      assetId: row.assetId,
+      workOrderId: row.workOrderId,
+      score: 0,
+      basis: [],
+      revisionNumber: row.revisionNumber,
+      approvalState: row.approvalState,
+      updatedAt: row.updatedAt,
+    });
+  }
+
+  for (const match of vectorMatches) {
+    const current = byArtifactId.get(match.artifactId);
+    if (!current) continue;
+    current.score = Math.max(current.score, match.score);
+    current.basis.push("semantic_match");
+  }
+
+  for (const current of byArtifactId.values()) {
+    if (params.assetId && current.assetId === params.assetId) {
+      current.score += 0.35;
+      current.basis.push("asset_exact");
+    }
+    if (params.workOrderId && current.workOrderId === params.workOrderId) {
+      current.score += 0.2;
+      current.basis.push("work_order_exact");
+    }
+  }
+
+  return [...byArtifactId.values()]
+    .filter((entry) => entry.score >= (params.minScore ?? 0.12))
+    .sort((left, right) => right.score - left.score || right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, params.limit ?? 5);
 }

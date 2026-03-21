@@ -6,6 +6,7 @@ import { AuditLog } from "./pages/Audit.js";
 import { Chat } from "./pages/Chat.js";
 import { Settings } from "./pages/Settings.js";
 import { Setup } from "./pages/Setup.js";
+import { LoginScreen } from "./pages/Login.js";
 import { useLiveRuntime } from "./lib/live.js";
 
 type Page = "dashboard" | "tasks" | "approvals" | "audit" | "chat" | "settings";
@@ -33,7 +34,22 @@ function CateoLogo() {
 
 export function App() {
   const [page, setPage] = useState<Page>("dashboard");
-  const { bootstrap, snapshot, connectionState, error, refresh } = useLiveRuntime();
+  const { auth, bootstrap, snapshot, connectionState, error, refresh, login, logout } = useLiveRuntime();
+
+  if (!auth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div>
+          <div className="w-5 h-5 border-2 border-zinc-700 border-t-zinc-400 rounded-full animate-spin mx-auto mb-3" />
+          {error && <p className="text-xs text-zinc-600 font-mono">{error}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  if (!auth.authenticated) {
+    return <LoginScreen onLogin={login} authEnabled={auth.enabled} connectionError={error} />;
+  }
 
   if (!bootstrap) {
     return (
@@ -56,9 +72,10 @@ export function App() {
   const isRunning = status?.running ?? false;
   const runtimeLabel = isRunning
     ? status?.transportMode === "live" ? "Running · Live" : "Running · Fallback"
-    : connectionState === "reconnecting" ? "Reconnecting" : "Stopped";
+    : connectionState === "reconnecting" ? "Reconnecting" : connectionState === "idle" ? "Standby" : "Stopped";
   const pendingApprovals = snapshot?.approvals.filter((entry) => entry.status === "pending").length ?? status?.pendingApprovals ?? 0;
   const auditErrors = snapshot?.audit.filter((entry) => entry.severity === "error").length ?? 0;
+  const operator = auth.operator;
 
   return (
     <div className="min-h-screen flex">
@@ -97,7 +114,27 @@ export function App() {
           })}
         </nav>
 
-        <div className="px-4 py-4 border-t border-zinc-800/60 space-y-2.5">
+        <div className="px-4 py-4 border-t border-zinc-800/60 space-y-3">
+          {operator && (
+            <div className="rounded-md border border-zinc-800/70 bg-zinc-900/70 px-3 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Operator</p>
+                  <p className="mt-1 text-sm font-semibold text-zinc-100">{operator.username}</p>
+                  <p className="text-[11px] text-zinc-500 capitalize">{operator.role}</p>
+                </div>
+                {auth.enabled && (
+                  <button
+                    onClick={() => { void logout(); }}
+                    className="text-[11px] font-medium text-zinc-400 transition hover:text-zinc-100"
+                  >
+                    Log out
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center gap-2.5">
             <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${isRunning ? "bg-emerald-400" : connectionState === "reconnecting" ? "bg-amber-400" : "bg-zinc-600"}`} />
             <span className="text-[13px] text-zinc-400">{runtimeLabel}</span>

@@ -65,7 +65,6 @@ function createAnthropicProvider(config: LLMConfig): LLMProvider {
   };
 }
 
-// Translate our ToolDefinition[] to OpenAI's { type: "function", function: {...} }
 function toOpenAITools(tools: ToolDefinition[]): unknown[] {
   return tools.map((t) => ({
     type: "function",
@@ -77,17 +76,12 @@ function toOpenAITools(tools: ToolDefinition[]): unknown[] {
   }));
 }
 
-// Translate our messages to OpenAI format
-function toOpenAIMessages(
-  messages: LLMMessage[],
-): unknown[] {
+function toOpenAIMessages(messages: LLMMessage[]): unknown[] {
   return messages.map((m) => {
-    // System/simple text messages
     if (typeof m.content === "string") {
       return { role: m.role, content: m.content };
     }
 
-    // Assistant message with tool_use blocks
     if (m.role === "assistant" && Array.isArray(m.content)) {
       const textParts = m.content
         .filter((b): b is { type: "text"; text: string } => b.type === "text")
@@ -112,10 +106,8 @@ function toOpenAIMessages(
       };
     }
 
-    // User message with tool_result blocks
     if (m.role === "user" && Array.isArray(m.content)) {
       const results = m.content as ToolResultBlock[];
-      // OpenAI expects individual "tool" messages for each result
       return results.map((r) => ({
         role: "tool",
         tool_call_id: r.tool_use_id,
@@ -151,9 +143,14 @@ function createOpenAICompatibleProvider(
 
       const body: Record<string, unknown> = {
         model: config.model,
-        max_tokens: options.maxTokens ?? 4096,
         messages: toOpenAIMessages(messages),
       };
+
+      if (baseUrl.includes("api.openai.com")) {
+        body.max_completion_tokens = options.maxTokens ?? 4096;
+      } else {
+        body.max_tokens = options.maxTokens ?? 4096;
+      }
 
       if (tools && tools.length > 0) {
         body.tools = toOpenAITools(tools);
@@ -206,7 +203,6 @@ function createOpenAICompatibleProvider(
         }
       }
 
-      // Map finish_reason to our stopReason
       const stopReasonMap: Record<string, LLMResponse["stopReason"]> = {
         stop: "end_turn",
         tool_calls: "tool_use",
@@ -232,12 +228,12 @@ export function createLLMProvider(config: LLMConfig): LLMProvider {
     case "openai":
       return createOpenAICompatibleProvider(
         config,
-        "https://api.openai.com/v1",
+        config.baseUrl ?? "https://api.openai.com/v1",
       );
     case "openrouter":
       return createOpenAICompatibleProvider(
         config,
-        "https://openrouter.ai/api/v1",
+        config.baseUrl ?? "https://openrouter.ai/api/v1",
       );
     case "ollama":
       return createOpenAICompatibleProvider(
@@ -248,5 +244,3 @@ export function createLLMProvider(config: LLMConfig): LLMProvider {
       throw new Error(`Unknown LLM provider: ${config.provider}`);
   }
 }
-
-

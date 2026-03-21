@@ -2,14 +2,19 @@ import crypto from "node:crypto";
 import type { CashClawConfig } from "../config.js";
 import type { CateoModelRuntime, CateoRuntimeModelInfo } from "../llm/runtime.js";
 import type { LLMProvider, LLMResponse } from "../llm/types.js";
+import { appendCateoInteraction } from "../memory/datasets.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { buildCateoContext, inferRequestedArtifacts } from "./context.js";
 import { renderCateoInteraction } from "./render.js";
 import { getSchemaRef, validateArtifactContent } from "./schemas.js";
-import { createRevision, fingerprintEvidence, loadArtifactRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
+import { evaluateArtifactPackageRules, summarizeRuleOutcomes } from "./rules.js";
+import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
+import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import type {
   CateoArtifactContent,
+  CateoArtifactLookupCandidate,
+  CateoArtifactPersistAction,
   CateoArtifactRecord,
   CateoArtifactType,
   CateoAssistInput,
@@ -24,16 +29,21 @@ import type {
   CateoInspectionChecklist,
   CateoInteractionCheckpoint,
   CateoLeadPlan,
+  CateoRequesterInfo,
   CateoPartCatalogEntry,
   CateoPartsToolsList,
   CateoReviewerDecision,
   CateoRevisionRequest,
+  CateoRuleResult,
   CateoRoutingDecision,
   CateoServiceReport,
   CateoSignoffRequest,
   CateoStructureBlueprint,
   CateoTaskClass,
   CateoTroubleshootingProcedure,
+  CateoStageUsage,
+  CateoUsageSummary,
+  CateoValidationAttempt,
 } from "./types.js";
 
 const ARTIFACT_TYPES: CateoArtifactType[] = [
@@ -60,12 +70,45 @@ interface StageResult<T> {
   data: T;
   raw?: string;
   modelInfo: CateoRuntimeModelInfo;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+  };
 }
 
 interface ServiceOptions {
   actor?: string;
   requestId?: string;
   onCheckpoint?: (checkpoint: CateoInteractionCheckpoint) => void;
+  requester?: CateoRequesterInfo;
+}
+
+const ZERO_STAGE_USAGE = {
+  inputTokens: 0,
+  outputTokens: 0,
+};
+
+export class CateoExecutionError extends Error {
+  usage: CateoUsageSummary;
+
+  constructor(message: string, usage: CateoUsageSummary) {
+    super(message);
+    this.name = "CateoExecutionError";
+    this.usage = usage;
+  }
+}
+
+export function getCateoUsageFromError(error: unknown): CateoUsageSummary | undefined {
+  return error instanceof CateoExecutionError ? error.usage : undefined;
+}
+
+function buildUsageSummary(stages: CateoStageUsage[]): CateoUsageSummary {
+  return {
+    inputTokens: stages.reduce((sum, stage) => sum + stage.inputTokens, 0),
+    outputTokens: stages.reduce((sum, stage) => sum + stage.outputTokens, 0),
+    totalTokens: stages.reduce((sum, stage) => sum + stage.totalTokens, 0),
+    stages: stages.map((stage) => ({ ...stage })),
+  };
 }
 
 interface RawBuilderArtifactDraft {
@@ -148,18 +191,18 @@ function isArtifactType(value: unknown): value is CateoArtifactType {
   return typeof value === "string" && ARTIFACT_TYPES.includes(value as CateoArtifactType);
 }
 
-function assertLocalCateoRuntime(runtime: CateoModelRuntime): void {
+function assertCateoRuntime(runtime: CateoModelRuntime): void {
   if (!runtime.meta.orchestrationEnabled) {
-    throw new Error("Cateo local orchestration is disabled. Enable the local three-model runtime before serving regulated artifacts.");
+    throw new Error("Cateo orchestration is disabled. Enable the three-role runtime before serving regulated artifacts.");
   }
-  if (runtime.meta.lead.provider !== "ollama") {
-    throw new Error("Cateo artifact generation requires a local Ollama planner model.");
+  if (!runtime.lead) {
+    throw new Error("Cateo artifact generation requires a lead model.");
   }
-  if (!runtime.challenger || !runtime.meta.challenger || runtime.meta.challenger.provider !== "ollama") {
-    throw new Error("Cateo artifact generation requires a local Ollama reviewer model.");
+  if (!runtime.challenger || !runtime.meta.challenger) {
+    throw new Error("Cateo artifact generation requires a challenger model.");
   }
-  if (!runtime.structure || !runtime.meta.structure || runtime.meta.structure.provider !== "ollama") {
-    throw new Error("Cateo artifact generation requires a local Ollama builder model.");
+  if (!runtime.structure || !runtime.meta.structure) {
+    throw new Error("Cateo artifact generation requires a structure model.");
   }
 }
 
@@ -331,6 +374,10 @@ async function callJsonStage<T>(params: {
       signal: controller.signal,
       maxTokens: params.maxTokens,
     });
+    const usage = {
+      inputTokens: response.usage.inputTokens ?? 0,
+      outputTokens: response.usage.outputTokens ?? 0,
+    };
     const raw = extractText(response);
     const parsed = parseJsonObject<T>(raw);
     if (!parsed) {
@@ -347,10 +394,13 @@ async function callJsonStage<T>(params: {
           provider: params.modelInfo.provider,
           maxTokens: params.maxTokens,
           timeoutMs: params.timeoutMs,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.inputTokens + usage.outputTokens,
           fallbackReason: "non_json",
         },
       });
-      return { data: params.fallback, raw, modelInfo: params.modelInfo };
+      return { data: params.fallback, raw, modelInfo: params.modelInfo, usage };
     }
 
     appendAuditEvent({
@@ -365,13 +415,16 @@ async function callJsonStage<T>(params: {
         provider: params.modelInfo.provider,
         maxTokens: params.maxTokens,
         timeoutMs: params.timeoutMs,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.inputTokens + usage.outputTokens,
       },
     });
-    return { data: parsed, raw, modelInfo: params.modelInfo };
+    return { data: parsed, raw, modelInfo: params.modelInfo, usage };
   } catch (error) {
     const fallbackReason = timedOut ? "timeout" : "error";
     const raw = timedOut
-      ? `${params.stage} exceeded the local stage budget of ${params.timeoutMs}ms`
+      ? `${params.stage} exceeded the stage budget of ${params.timeoutMs}ms`
       : (error instanceof Error ? error.message : String(error));
     appendAuditEvent({
       actor: "model",
@@ -388,15 +441,17 @@ async function callJsonStage<T>(params: {
         provider: params.modelInfo.provider,
         maxTokens: params.maxTokens,
         timeoutMs: params.timeoutMs,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
         fallbackReason,
       },
     });
-    return { data: params.fallback, raw, modelInfo: params.modelInfo };
+    return { data: params.fallback, raw, modelInfo: params.modelInfo, usage: { ...ZERO_STAGE_USAGE } };
   } finally {
     clearTimeout(timeoutId);
   }
 }
-
 function findBlueprintTitle(blueprint: CateoStructureBlueprint | undefined, artifactType: CateoArtifactType, fallback: string): string {
   return blueprint?.artifactPlans.find((entry) => entry.artifactType === artifactType)?.title || fallback;
 }
@@ -810,6 +865,21 @@ function normalizeReviewerDecision(
   };
 }
 
+function collectBuilderValidationErrors(builderPackage: CateoBuilderPackage): string[] {
+  return builderPackage.artifactDrafts.flatMap((draft) => {
+    const errors = draft.validationErrors ?? [];
+    return errors.map((error) => `${draft.artifactType}: ${error}`);
+  });
+}
+
+function shouldMergeArtifact(candidate: CateoArtifactLookupCandidate | undefined): boolean {
+  if (!candidate) return false;
+  if (candidate.score >= 0.92) return true;
+  if (candidate.basis.includes("asset_exact") && candidate.score >= 0.58) return true;
+  if (candidate.basis.includes("work_order_exact") && candidate.score >= 0.5) return true;
+  return false;
+}
+
 function checkpointLabel(stage: CateoInteractionCheckpoint["stage"]): string {
   switch (stage) {
     case "accepted":
@@ -863,6 +933,7 @@ function buildProvenance(args: {
   taskClass: CateoTaskClass;
   modelsUsed: CateoRuntimeModelInfo[];
   evidenceFingerprint: string;
+  profileId?: string;
 }) {
   return {
     runId: args.runId,
@@ -873,25 +944,48 @@ function buildProvenance(args: {
     taskClass: args.taskClass,
     modelsUsed: args.modelsUsed,
     evidenceFingerprint: args.evidenceFingerprint,
+    profileId: args.profileId,
   };
 }
 export async function generateCateoArtifacts(
-  _config: CashClawConfig,
+  config: CashClawConfig,
   runtime: CateoModelRuntime,
   input: CateoAssistInput,
   options: ServiceOptions = {},
 ): Promise<CateoAssistResult> {
-  assertLocalCateoRuntime(runtime);
+  assertCateoRuntime(runtime);
 
   const actor = options.actor ?? "system";
   const nowIso = new Date().toISOString();
   const caseId = crypto.randomUUID();
+  const requester = options.requester ? { ...options.requester } : undefined;
   const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(input));
   const attachmentEvidence = ingestMediaAttachments(caseId, input.attachments, options.requestId);
   const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence);
-  const route = buildRoute(sanitizedInput, context);
+  let route = buildRoute(sanitizedInput, context);
+  const requestedTemplate = sanitizedInput.instructionTemplate;
+  const template = getInstructionTemplate(requestedTemplate?.taskClass ?? route.taskClass, route.requestedArtifacts);
+  route = {
+    ...route,
+    taskClass: template.taskClass,
+    requestedArtifacts: template.requiredArtifacts,
+  };
+  const templatePayload = renderInstructionTemplate(template);
   const promptPayload = buildPromptPayload(sanitizedInput, context, route);
+  const plannerPrompt = [
+    "You are Cateo's planner model for a controlled engineering artifact pipeline.",
+    "Return JSON only.",
+    "Use the instruction template, source hierarchy, and known context before relying on general reasoning.",
+    "Instruction template:",
+    templatePayload,
+    "Request and context payload:",
+    promptPayload,
+  ].join("\n\n");
   const checkpoints: CateoInteractionCheckpoint[] = [];
+  const stageUsages: CateoStageUsage[] = [];
+  const validationAttempts: CateoValidationAttempt[] = [];
+  const lookupCandidates: CateoArtifactLookupCandidate[] = [];
+  const persistActions: CateoArtifactPersistAction[] = [];
   const publishCheckpoint = (checkpoint: CateoInteractionCheckpoint): CateoInteractionCheckpoint => {
     checkpoints.push(checkpoint);
     options.onCheckpoint?.(checkpoint);
@@ -914,228 +1008,609 @@ export async function generateCateoArtifacts(
     return checkpoint;
   };
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "planning",
-    status: "running",
-    summary: "Planner is classifying the request and defining the evidence plan.",
-    taskClass: route.taskClass,
-    artifactTypes: route.requestedArtifacts,
-  }));
+  appendAuditEvent({
+    actor: "runtime",
+    category: "cateo_template",
+    action: "select",
+    outcome: "success",
+    message: `Selected instruction template ${template.templateId}@${template.version}`,
+    requestId: options.requestId,
+    metadata: {
+      requestedTemplateId: requestedTemplate?.templateId,
+      requestedVersion: requestedTemplate?.version,
+      requestedTaskClass: requestedTemplate?.taskClass,
+      appliedTemplateId: template.templateId,
+      appliedVersion: template.version,
+      taskClass: route.taskClass,
+      artifactTypes: route.requestedArtifacts,
+      provider: config.llm.provider,
+      leadModel: runtime.meta.lead.model,
+      challengerModel: runtime.meta.challenger?.model,
+      structureModel: runtime.meta.structure?.model,
+    },
+  });
 
-  const leadStage = await callJsonStage({
-    stage: "planner",
-    llm: runtime.lead,
-    modelInfo: runtime.meta.lead,
-    systemPrompt: "Return a compact JSON object for Cateo planning. No prose outside JSON.",
-    userPrompt: [
-      "You are Cateo's planner model for regulated inspection and troubleshooting.",
+  if (requestedTemplate?.templateId && requestedTemplate.templateId !== template.templateId) {
+    appendAuditEvent({
+      actor: "runtime",
+      category: "cateo_template",
+      action: "template_id_mismatch",
+      outcome: "warn",
+      severity: "warn",
+      message: `Requested template ${requestedTemplate.templateId} did not match the applied template ${template.templateId}`,
+      requestId: options.requestId,
+    });
+  }
+
+  if (requestedTemplate?.version && requestedTemplate.version !== template.version) {
+    appendAuditEvent({
+      actor: "runtime",
+      category: "cateo_template",
+      action: "version_mismatch",
+      outcome: "warn",
+      severity: "warn",
+      message: `Requested template version ${requestedTemplate.version} did not match the applied version ${template.version}`,
+      requestId: options.requestId,
+    });
+  }
+
+  try {
+    publishCheckpoint(buildCheckpoint({
+      stage: "accepted",
+      status: "completed",
+      summary: "Cateo accepted the request and bound it to a controlled artifact template.",
+      taskClass: route.taskClass,
+      artifactTypes: route.requestedArtifacts,
+    }));
+
+    publishCheckpoint(buildCheckpoint({
+      stage: "planning",
+      status: "running",
+      summary: "Planner is classifying the request and defining the evidence plan.",
+      taskClass: route.taskClass,
+      artifactTypes: route.requestedArtifacts,
+    }));
+
+    const leadStage = await callJsonStage({
+      stage: "planner",
+      llm: runtime.lead,
+      modelInfo: runtime.meta.lead,
+      systemPrompt: "Return a compact JSON object for Cateo planning. No prose outside JSON.",
+      userPrompt: plannerPrompt,
+      fallback: fallbackLeadPlan(route, context, sanitizedInput),
+      timeoutMs: CATEO_STAGE_BUDGET_MS.planner,
+      maxTokens: CATEO_STAGE_MAX_TOKENS.planner,
+      requestId: options.requestId,
+    });
+
+    stageUsages.push({
+      stage: "planner",
+      role: "lead",
+      model: leadStage.modelInfo,
+      inputTokens: leadStage.usage.inputTokens,
+      outputTokens: leadStage.usage.outputTokens,
+      totalTokens: leadStage.usage.inputTokens + leadStage.usage.outputTokens,
+    });
+
+    const leadFallback = fallbackLeadPlan(route, context, sanitizedInput);
+    const leadRecord = leadStage.data as Partial<CateoLeadPlan>;
+    const leadPlan: CateoLeadPlan = {
+      taskClass: route.taskClass,
+      objective: coerceString(leadRecord.objective, leadFallback.objective),
+      evidencePlan: coerceStringArray(leadRecord.evidencePlan).length > 0 ? coerceStringArray(leadRecord.evidencePlan) : leadFallback.evidencePlan,
+      assumptions: coerceStringArray(leadRecord.assumptions).length > 0 ? coerceStringArray(leadRecord.assumptions) : leadFallback.assumptions,
+      risks: coerceStringArray(leadRecord.risks).length > 0 ? coerceStringArray(leadRecord.risks) : leadFallback.risks,
+      decisionBasis: coerceStringArray(leadRecord.decisionBasis).length > 0 ? coerceStringArray(leadRecord.decisionBasis) : leadFallback.decisionBasis,
+      artifactPriorities: route.requestedArtifacts,
+      maintenanceConsiderations: coerceStringArray(leadRecord.maintenanceConsiderations).length > 0 ? coerceStringArray(leadRecord.maintenanceConsiderations) : leadFallback.maintenanceConsiderations,
+      partsConsiderations: coerceStringArray(leadRecord.partsConsiderations).length > 0 ? coerceStringArray(leadRecord.partsConsiderations) : leadFallback.partsConsiderations,
+    };
+
+    publishCheckpoint(buildCheckpoint({
+      stage: "planning",
+      status: "completed",
+      summary: `Planner classified this request as ${leadPlan.taskClass} and mapped ${route.requestedArtifacts.length} artifact(s): ${route.requestedArtifacts.join(", ")}.`,
+      taskClass: leadPlan.taskClass,
+      artifactTypes: route.requestedArtifacts,
+    }));
+    publishCheckpoint(buildCheckpoint({
+      stage: "building",
+      status: "running",
+      summary: "Builder is converting the plan into schema-governed Cateo artifacts.",
+      taskClass: route.taskClass,
+      artifactTypes: route.requestedArtifacts,
+    }));
+
+    const builderPrompt = [
+      "You are Cateo's builder model for structured engineering artifacts.",
       "Return JSON only.",
-      "Produce keys: taskClass, objective, evidencePlan, assumptions, risks, decisionBasis, artifactPriorities, maintenanceConsiderations, partsConsiderations.",
+      "Obey the instruction template and produce schema-ready artifacts. Invalid or incomplete drafts will be rejected and retried.",
+      "Instruction template:",
+      templatePayload,
+      "Request and context payload:",
       promptPayload,
-    ].join("\n\n"),
-    fallback: fallbackLeadPlan(route, context, sanitizedInput),
-    timeoutMs: CATEO_STAGE_BUDGET_MS.planner,
-    maxTokens: CATEO_STAGE_MAX_TOKENS.planner,
-    requestId: options.requestId,
-  });
+      "Lead plan:",
+      JSON.stringify(leadPlan, null, 2),
+    ].join("\n\n");
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "planning",
-    status: "completed",
-    summary: `Planner classified this request as ${leadStage.data.taskClass} and mapped ${route.requestedArtifacts.length} artifact(s): ${route.requestedArtifacts.join(", ")}.`,
-    taskClass: leadStage.data.taskClass,
-    artifactTypes: route.requestedArtifacts,
-  }));
-  publishCheckpoint(buildCheckpoint({
-    stage: "building",
-    status: "running",
-    summary: "Builder is converting the plan into schema-governed Cateo artifacts.",
-    taskClass: route.taskClass,
-    artifactTypes: route.requestedArtifacts,
-  }));
+    let builderRawStage = await callJsonStage<RawBuilderOutput>({
+      stage: "builder",
+      llm: runtime.structure!,
+      modelInfo: runtime.meta.structure!,
+      systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. No prose outside JSON.",
+      userPrompt: builderPrompt,
+      fallback: {
+        packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
+        artifactPlans: fallbackStructure(route, context).artifactPlans,
+        artifactDrafts: [],
+      },
+      timeoutMs: CATEO_STAGE_BUDGET_MS.builder,
+      maxTokens: CATEO_STAGE_MAX_TOKENS.builder,
+      requestId: options.requestId,
+    });
 
-  const builderRawStage = await callJsonStage<RawBuilderOutput>({
-    stage: "builder",
-    llm: runtime.structure!,
-    modelInfo: runtime.meta.structure!,
-    systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. No prose outside JSON.",
-    userPrompt: `${promptPayload}\n\nLead plan:\n${JSON.stringify(leadStage.data, null, 2)}`,
-    fallback: {
-      packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
-      artifactPlans: fallbackStructure(route, context).artifactPlans,
-      artifactDrafts: [],
-    },
-    timeoutMs: CATEO_STAGE_BUDGET_MS.builder,
-    maxTokens: CATEO_STAGE_MAX_TOKENS.builder,
-    requestId: options.requestId,
-  });
+    stageUsages.push({
+      stage: "builder",
+      role: "structure",
+      model: builderRawStage.modelInfo,
+      inputTokens: builderRawStage.usage.inputTokens,
+      outputTokens: builderRawStage.usage.outputTokens,
+      totalTokens: builderRawStage.usage.inputTokens + builderRawStage.usage.outputTokens,
+    });
 
-  const provisionalCritique = fallbackCritique(context);
-  const provisionalFinalSynthesis = fallbackFinal(route, context, leadStage.data, provisionalCritique);
-  const structureBlueprint = normalizeStructureBlueprint(builderRawStage.data, route, context);
-  const provisionalBuilderPackage = normalizeBuilderPackage({
-    raw: builderRawStage.data,
-    route,
-    input: sanitizedInput,
-    context,
-    leadPlan: leadStage.data,
-    critique: provisionalCritique,
-    blueprint: structureBlueprint,
-    finalSynthesis: provisionalFinalSynthesis,
-  });
+    const provisionalCritique = fallbackCritique(context);
+    const provisionalFinalSynthesis = fallbackFinal(route, context, leadPlan, provisionalCritique);
+    let structureBlueprint = normalizeStructureBlueprint(builderRawStage.data, route, context);
+    let builderPackage = normalizeBuilderPackage({
+      raw: builderRawStage.data,
+      route,
+      input: sanitizedInput,
+      context,
+      leadPlan,
+      critique: provisionalCritique,
+      blueprint: structureBlueprint,
+      finalSynthesis: provisionalFinalSynthesis,
+    });
+    let builderRawTrace = builderRawStage.raw ?? "";
+    let builderValidationErrors = collectBuilderValidationErrors(builderPackage);
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "building",
-    status: "completed",
-    summary: `Builder drafted ${provisionalBuilderPackage.artifactDrafts.length} artifact(s) for review: ${provisionalBuilderPackage.artifactDrafts.map((draft) => draft.artifactType).join(", ")}.`,
-    taskClass: route.taskClass,
-    artifactTypes: provisionalBuilderPackage.artifactDrafts.map((draft) => draft.artifactType),
-    artifactCount: provisionalBuilderPackage.artifactDrafts.length,
-  }));
-  publishCheckpoint(buildCheckpoint({
-    stage: "reviewing",
-    status: "running",
-    summary: "Reviewer is checking technical accuracy, completeness, and compliance before release.",
-    taskClass: route.taskClass,
-    artifactTypes: provisionalBuilderPackage.artifactDrafts.map((draft) => draft.artifactType),
-    artifactCount: provisionalBuilderPackage.artifactDrafts.length,
-  }));
+    if (builderValidationErrors.length === 0) {
+      validationAttempts.push({
+        stage: "builder",
+        attempt: 1,
+        outcome: "success",
+        errors: [],
+      });
+    } else {
+      validationAttempts.push({
+        stage: "builder",
+        attempt: 1,
+        outcome: "retry",
+        errors: builderValidationErrors,
+      });
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_validation",
+        action: "builder_retry",
+        outcome: "retry",
+        severity: "warn",
+        message: `Builder validation failed on the first pass and is being retried for ${builderValidationErrors.length} issue(s).`,
+        requestId: options.requestId,
+        metadata: {
+          artifactTypes: route.requestedArtifacts,
+          errors: builderValidationErrors,
+        },
+      });
 
-  const reviewerStage = await callJsonStage<ReviewerStageOutput>({
-    stage: "reviewer",
-    llm: runtime.challenger!,
-    modelInfo: runtime.meta.challenger!,
-    systemPrompt: "Return a compact JSON object with keys alternateHypotheses, blindSpots, missingAssumptions, evidenceGaps, recommendedAdjustments, and reviewDecision. reviewDecision must include overallStatus, technicalAccuracy, completeness, compliance, findings, approvedArtifactTypes, approvalState, confidence, summary, and requiredFollowUp. No prose outside JSON.",
-    userPrompt: `${promptPayload}\n\nLead plan:\n${JSON.stringify(leadStage.data, null, 2)}\n\nBuilder package:\n${JSON.stringify(provisionalBuilderPackage, null, 2)}`,
-    fallback: {
-      ...provisionalCritique,
-      reviewDecision: fallbackReviewerDecision(provisionalBuilderPackage, route, provisionalCritique),
-    },
-    timeoutMs: CATEO_STAGE_BUDGET_MS.reviewer,
-    maxTokens: CATEO_STAGE_MAX_TOKENS.reviewer,
-    requestId: options.requestId,
-  });
+      const builderRetryPrompt = [
+        builderPrompt,
+        "Previous validation errors:",
+        JSON.stringify(builderValidationErrors, null, 2),
+        "Return corrected JSON only. Do not omit required artifacts.",
+      ].join("\n\n");
 
-  const critique = normalizeReviewerCritique(reviewerStage.data, context);
-  const baseFinalSynthesis = fallbackFinal(route, context, leadStage.data, critique);
-  const builderPackage = normalizeBuilderPackage({
-    raw: builderRawStage.data,
-    route,
-    input: sanitizedInput,
-    context,
-    leadPlan: leadStage.data,
-    critique,
-    blueprint: structureBlueprint,
-    finalSynthesis: baseFinalSynthesis,
-  });
-  const reviewerDecision = normalizeReviewerDecision(reviewerStage.data.reviewDecision, builderPackage, route, critique);
-  const finalSynthesis: CateoFinalSynthesis = {
-    ...baseFinalSynthesis,
-    decision: reviewerDecision.approvalState,
-    confidence: reviewerDecision.confidence,
-    operatorNotes: uniqueStrings([
-      ...baseFinalSynthesis.operatorNotes,
-      reviewerDecision.summary,
-      ...reviewerDecision.findings,
-    ]),
-    nextActions: uniqueStrings([
-      ...baseFinalSynthesis.nextActions,
-      ...reviewerDecision.requiredFollowUp,
-    ]),
-  };
+      const builderRetryStage = await callJsonStage<RawBuilderOutput>({
+        stage: "builder",
+        llm: runtime.structure!,
+        modelInfo: runtime.meta.structure!,
+        systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. No prose outside JSON.",
+        userPrompt: builderRetryPrompt,
+        fallback: {
+          packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
+          artifactPlans: fallbackStructure(route, context).artifactPlans,
+          artifactDrafts: [],
+        },
+        timeoutMs: CATEO_STAGE_BUDGET_MS.builder,
+        maxTokens: CATEO_STAGE_MAX_TOKENS.builder,
+        requestId: options.requestId,
+      });
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "reviewing",
-    status: "completed",
-    summary: reviewerDecision.approvalState === "draft"
-      ? "Reviewer held the package in draft and requested follow-up before controlled release."
-      : `Reviewer validated ${builderPackage.artifactDrafts.length} artifact(s) for conversational rendering with ${reviewerDecision.confidence} confidence.`,
-    taskClass: route.taskClass,
-    confidence: reviewerDecision.confidence,
-    artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
-    artifactCount: builderPackage.artifactDrafts.length,
-  }));
-  publishCheckpoint(buildCheckpoint({
-    stage: "persisting",
-    status: "running",
-    summary: "Cateo is versioning the artifact package, provenance, and audit trace.",
-    taskClass: route.taskClass,
-    confidence: reviewerDecision.confidence,
-    artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
-    artifactCount: builderPackage.artifactDrafts.length,
-  }));
+      stageUsages.push({
+        stage: "builder",
+        role: "structure",
+        model: builderRetryStage.modelInfo,
+        inputTokens: builderRetryStage.usage.inputTokens,
+        outputTokens: builderRetryStage.usage.outputTokens,
+        totalTokens: builderRetryStage.usage.inputTokens + builderRetryStage.usage.outputTokens,
+      });
 
-  const runId = crypto.randomUUID();
-  const modelsUsed = [runtime.meta.lead, runtime.meta.structure!, runtime.meta.challenger!];
-  const evidenceFingerprint = fingerprintEvidence({
-    input: sanitizedInput,
-    context,
-    route,
-    builderPackage,
-    reviewerDecision,
-    finalSynthesis,
-  });
+      builderRawStage = builderRetryStage;
+      builderRawTrace = [builderRawTrace, builderRetryStage.raw].filter(Boolean).join("\n\n--- builder retry ---\n\n");
+      structureBlueprint = normalizeStructureBlueprint(builderRetryStage.data, route, context);
+      builderPackage = normalizeBuilderPackage({
+        raw: builderRetryStage.data,
+        route,
+        input: sanitizedInput,
+        context,
+        leadPlan,
+        critique: provisionalCritique,
+        blueprint: structureBlueprint,
+        finalSynthesis: provisionalFinalSynthesis,
+      });
+      builderValidationErrors = collectBuilderValidationErrors(builderPackage);
 
-  const artifacts = builderPackage.artifactDrafts.map((draft) => {
-    const createdAt = new Date().toISOString();
-    const validationErrors = validateArtifactContent(draft.artifactType, draft.content);
-    if (validationErrors.length > 0) {
-      throw new Error(`Generated ${draft.artifactType} failed schema validation: ${validationErrors.join("; ")}`);
+      validationAttempts.push({
+        stage: "builder",
+        attempt: 2,
+        outcome: builderValidationErrors.length === 0 ? "success" : "fallback",
+        errors: builderValidationErrors,
+      });
+
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_validation",
+        action: builderValidationErrors.length === 0 ? "builder_recovered" : "builder_fallback",
+        outcome: builderValidationErrors.length === 0 ? "success" : "fallback",
+        severity: builderValidationErrors.length === 0 ? "info" : "warn",
+        message: builderValidationErrors.length === 0
+          ? "Builder retry returned a schema-valid artifact package."
+          : "Builder retry still failed schema validation; deterministic artifact generation will remain in effect.",
+        requestId: options.requestId,
+        metadata: {
+          artifactTypes: route.requestedArtifacts,
+          errors: builderValidationErrors,
+        },
+      });
     }
 
-    const artifactId = crypto.randomUUID();
-    const revisionId = crypto.randomUUID();
-    const provenance = buildProvenance({
-      runId,
+    publishCheckpoint(buildCheckpoint({
+      stage: "building",
+      status: "completed",
+      summary: `Builder drafted ${builderPackage.artifactDrafts.length} artifact(s) for review: ${builderPackage.artifactDrafts.map((draft) => draft.artifactType).join(", ")}.`,
+      taskClass: route.taskClass,
+      artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
+      artifactCount: builderPackage.artifactDrafts.length,
+    }));
+    publishCheckpoint(buildCheckpoint({
+      stage: "reviewing",
+      status: "running",
+      summary: "Reviewer is checking technical accuracy, completeness, and compliance before release.",
+      taskClass: route.taskClass,
+      artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
+      artifactCount: builderPackage.artifactDrafts.length,
+    }));
+
+    const reviewerPrompt = [
+      "You are Cateo's reviewer model for technical accuracy, completeness, and compliance.",
+      "Return JSON only.",
+      "Evaluate blind spots, unsupported claims, measurable criteria, and whether the package should remain draft or advance to reviewed.",
+      "Instruction template:",
+      templatePayload,
+      "Request and context payload:",
+      promptPayload,
+      "Lead plan:",
+      JSON.stringify(leadPlan, null, 2),
+      "Builder package:",
+      JSON.stringify(builderPackage, null, 2),
+      "Validation attempts:",
+      JSON.stringify(validationAttempts, null, 2),
+    ].join("\n\n");
+
+    const reviewerStage = await callJsonStage<ReviewerStageOutput>({
+      stage: "reviewer",
+      llm: runtime.challenger!,
+      modelInfo: runtime.meta.challenger!,
+      systemPrompt: "Return a compact JSON object with keys alternateHypotheses, blindSpots, missingAssumptions, evidenceGaps, recommendedAdjustments, and reviewDecision. reviewDecision must include overallStatus, technicalAccuracy, completeness, compliance, findings, approvedArtifactTypes, approvalState, confidence, summary, and requiredFollowUp. No prose outside JSON.",
+      userPrompt: reviewerPrompt,
+      fallback: {
+        ...provisionalCritique,
+        reviewDecision: fallbackReviewerDecision(builderPackage, route, provisionalCritique),
+      },
+      timeoutMs: CATEO_STAGE_BUDGET_MS.reviewer,
+      maxTokens: CATEO_STAGE_MAX_TOKENS.reviewer,
       requestId: options.requestId,
-      createdAt,
-      actor,
-      taskClass: context.taskClass,
-      modelsUsed,
-      evidenceFingerprint,
     });
-    const summary = summarizeArtifactContent(draft.artifactType, draft.content);
-    const approvalState = reviewerDecision.approvedArtifactTypes.includes(draft.artifactType) ? reviewerDecision.approvalState : "draft";
+
+    stageUsages.push({
+      stage: "reviewer",
+      role: "challenger",
+      model: reviewerStage.modelInfo,
+      inputTokens: reviewerStage.usage.inputTokens,
+      outputTokens: reviewerStage.usage.outputTokens,
+      totalTokens: reviewerStage.usage.inputTokens + reviewerStage.usage.outputTokens,
+    });
+
+    const critique = normalizeReviewerCritique(reviewerStage.data, context);
+    const baseFinalSynthesis = fallbackFinal(route, context, leadPlan, critique);
+    const reviewerDecisionBase = normalizeReviewerDecision(reviewerStage.data.reviewDecision, builderPackage, route, critique);
+    const ruleResults = evaluateArtifactPackageRules({
+      template,
+      context,
+      builderPackage,
+      reviewerDecision: reviewerDecisionBase,
+      finalSynthesis: baseFinalSynthesis,
+    });
+    const ruleSummary = summarizeRuleOutcomes(ruleResults);
+    const ruleMessages = ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => `${entry.ruleId}: ${entry.message}`);
+    const escalatedByRules = ruleResults.some((entry) => entry.outcome === "escalate");
+
+    validationAttempts.push({
+      stage: "reviewer",
+      attempt: 1,
+      outcome: escalatedByRules ? "fallback" : "success",
+      errors: ruleMessages,
+    });
 
     appendAuditEvent({
       actor: "runtime",
-      category: "cateo_artifact",
-      action: "create",
-      outcome: "success",
-      message: `Created ${draft.artifactType} artifact ${artifactId}`,
+      category: "cateo_rules",
+      action: "evaluate",
+      outcome: escalatedByRules ? "escalated" : ruleSummary.flagged > 0 ? "flagged" : "pass",
+      severity: escalatedByRules ? "warn" : "info",
+      message: escalatedByRules
+        ? "Cateo rule evaluation escalated the package for additional review."
+        : ruleSummary.flagged > 0
+          ? "Cateo rule evaluation flagged follow-up items."
+          : "Cateo rule evaluation passed.",
       requestId: options.requestId,
       metadata: {
-        caseId: context.caseId,
-        assetId: context.asset?.assetId,
-        workOrderId: context.workOrder?.workOrderId,
-        generationMode: draft.generationMode,
+        templateId: template.templateId,
+        templateVersion: template.version,
+        flagged: ruleSummary.flagged,
+        escalated: ruleSummary.escalated,
+        failedValidation: ruleSummary.failedValidation,
+        messages: ruleMessages,
       },
     });
 
-    return saveArtifactRecord({
-      artifactId,
-      artifactType: draft.artifactType,
-      schema: getSchemaRef(draft.artifactType),
-      caseId: context.caseId,
-      assetId: context.asset?.assetId,
-      workOrderId: context.workOrder?.workOrderId,
-      currentRevisionId: revisionId,
-      createdAt,
-      updatedAt: createdAt,
-      revisions: [{
-        revisionId,
-        revisionNumber: 1,
-        approvalState,
-        createdAt,
-        createdBy: actor,
-        summary,
-        diffFromPrevious: [],
-        signoffs: [],
-        provenance,
-        content: draft.content,
-      }],
+    const reviewerDecision: CateoReviewerDecision = {
+      ...reviewerDecisionBase,
+      overallStatus: escalatedByRules ? "needs-revision" : reviewerDecisionBase.overallStatus,
+      approvalState: escalatedByRules ? "draft" : reviewerDecisionBase.approvalState,
+      approvedArtifactTypes: escalatedByRules ? [] : reviewerDecisionBase.approvedArtifactTypes,
+      findings: uniqueStrings([
+        ...reviewerDecisionBase.findings,
+        ...ruleMessages,
+      ]),
+      requiredFollowUp: uniqueStrings([
+        ...reviewerDecisionBase.requiredFollowUp,
+        ...ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => entry.message),
+      ]),
+      summary: escalatedByRules
+        ? "Reviewer and rules engine held the package in draft pending additional engineering follow-up."
+        : reviewerDecisionBase.summary,
+    };
+
+    const finalSynthesis: CateoFinalSynthesis = {
+      ...baseFinalSynthesis,
+      decision: reviewerDecision.approvalState,
+      confidence: reviewerDecision.confidence,
+      operatorNotes: uniqueStrings([
+        ...baseFinalSynthesis.operatorNotes,
+        reviewerDecision.summary,
+        ...reviewerDecision.findings,
+      ]),
+      nextActions: uniqueStrings([
+        ...baseFinalSynthesis.nextActions,
+        ...reviewerDecision.requiredFollowUp,
+      ]),
+    };
+
+    publishCheckpoint(buildCheckpoint({
+      stage: "reviewing",
+      status: "completed",
+      summary: reviewerDecision.approvalState === "draft"
+        ? escalatedByRules
+          ? "Reviewer and rules engine kept the package in draft and recorded required follow-up controls."
+          : "Reviewer held the package in draft and requested follow-up before controlled release."
+        : `Reviewer validated ${builderPackage.artifactDrafts.length} artifact(s) for conversational rendering with ${reviewerDecision.confidence} confidence.`,
+      taskClass: route.taskClass,
+      confidence: reviewerDecision.confidence,
+      artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
+      artifactCount: builderPackage.artifactDrafts.length,
+    }));
+    publishCheckpoint(buildCheckpoint({
+      stage: "persisting",
+      status: "running",
+      summary: "Cateo is versioning the artifact package, provenance, and audit trace.",
+      taskClass: route.taskClass,
+      confidence: reviewerDecision.confidence,
+      artifactTypes: builderPackage.artifactDrafts.map((draft) => draft.artifactType),
+      artifactCount: builderPackage.artifactDrafts.length,
+    }));
+
+    const runId = crypto.randomUUID();
+    const modelsUsed = [runtime.meta.lead, runtime.meta.structure!, runtime.meta.challenger!];
+    const evidenceFingerprint = fingerprintEvidence({
+      input: sanitizedInput,
+      context,
+      route,
+      template,
+      builderPackage,
+      reviewerDecision,
+      finalSynthesis,
     });
-  });
+    const usage = buildUsageSummary(stageUsages);
+
+    const artifacts = builderPackage.artifactDrafts.map((draft) => {
+      const createdAt = new Date().toISOString();
+      const validationErrors = validateArtifactContent(draft.artifactType, draft.content);
+      if (validationErrors.length > 0) {
+        throw new Error(`Generated ${draft.artifactType} failed schema validation: ${validationErrors.join("; ")}`);
+      }
+
+      const provenance = buildProvenance({
+        runId,
+        requestId: options.requestId,
+        createdAt,
+        actor,
+        taskClass: context.taskClass,
+        modelsUsed,
+        evidenceFingerprint,
+        profileId: requester?.profileId,
+      });
+      const summary = summarizeArtifactContent(draft.artifactType, draft.content);
+      const approvalState = reviewerDecision.approvedArtifactTypes.includes(draft.artifactType) ? reviewerDecision.approvalState : "draft";
+      const lookupText = [
+        sanitizedInput.symptomDescription,
+        sanitizedInput.errorCode,
+        context.failureCode?.code,
+        context.failureCode?.label,
+        summary,
+        reviewerDecision.summary,
+        ...context.contextSummary,
+      ].filter(Boolean).join("\n");
+
+      const matches = findSimilarArtifacts({
+        text: lookupText,
+        artifactType: draft.artifactType,
+        assetId: context.asset?.assetId,
+        workOrderId: context.workOrder?.workOrderId,
+        limit: 3,
+      }).map((match) => ({
+        artifactId: match.artifactId,
+        artifactType: match.artifactType as CateoArtifactType,
+        caseId: match.caseId,
+        assetId: match.assetId,
+        workOrderId: match.workOrderId,
+        score: match.score,
+        basis: match.basis,
+        revisionNumber: match.revisionNumber,
+        approvalState: match.approvalState === "approved" || match.approvalState === "reviewed" || match.approvalState === "draft"
+          ? match.approvalState
+          : "draft",
+        updatedAt: match.updatedAt,
+      } satisfies CateoArtifactLookupCandidate));
+      lookupCandidates.push(...matches);
+
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_lookup",
+        action: "search",
+        outcome: matches.length > 0 ? "matched" : "none",
+        message: `Cateo searched for existing ${draft.artifactType} artifacts before persistence.`,
+        requestId: options.requestId,
+        metadata: {
+          artifactType: draft.artifactType,
+          assetId: context.asset?.assetId,
+          workOrderId: context.workOrder?.workOrderId,
+          matches: matches.map((entry) => ({ artifactId: entry.artifactId, score: entry.score, basis: entry.basis })),
+        },
+      });
+
+      const bestMatch = matches[0];
+      if (shouldMergeArtifact(bestMatch)) {
+        const existing = loadArtifactRecord(bestMatch.artifactId);
+        if (existing) {
+          const current = existing.revisions[existing.revisions.length - 1];
+          const mergedCandidate = mergeContentPatch(current.content as unknown as Record<string, unknown>, draft.content as unknown as Record<string, unknown>) as unknown as CateoArtifactContent;
+          const mergedErrors = validateArtifactContent(draft.artifactType, mergedCandidate);
+          const nextContent = mergedErrors.length === 0 ? mergedCandidate : draft.content;
+          const updated = createRevision({
+            record: existing,
+            createdBy: actor,
+            summary: `Merged validated ${draft.artifactType} output from case ${context.caseId}`,
+            approvalState,
+            content: nextContent,
+            note: `Matched existing artifact ${bestMatch.artifactId} at score ${bestMatch.score.toFixed(2)} via ${bestMatch.basis.join(", ")}${mergedErrors.length > 0 ? "; merged content failed schema validation so Cateo stored the validated replacement draft instead." : ""}`,
+            signoffs: [],
+            provenance,
+          });
+
+          persistActions.push({
+            artifactType: draft.artifactType,
+            action: "merged",
+            artifactId: updated.artifactId,
+            revisionNumber: updated.revisions.length,
+            matchedArtifactId: bestMatch.artifactId,
+            matchScore: bestMatch.score,
+          });
+
+          appendAuditEvent({
+            actor: "runtime",
+            category: "cateo_artifact",
+            action: "merge",
+            outcome: "success",
+            message: `Merged ${draft.artifactType} into artifact ${updated.artifactId}`,
+            requestId: options.requestId,
+            metadata: {
+              caseId: context.caseId,
+              assetId: context.asset?.assetId,
+              workOrderId: context.workOrder?.workOrderId,
+              generationMode: draft.generationMode,
+              profileId: requester?.profileId,
+              matchedArtifactId: bestMatch.artifactId,
+              matchScore: bestMatch.score,
+              matchBasis: bestMatch.basis,
+              mergeMode: mergedErrors.length > 0 ? "replacement" : "merged_patch",
+            },
+          });
+
+          return updated;
+        }
+      }
+
+      const artifactId = crypto.randomUUID();
+      const revisionId = crypto.randomUUID();
+      const record = saveArtifactRecord({
+        artifactId,
+        artifactType: draft.artifactType,
+        schema: getSchemaRef(draft.artifactType),
+        caseId: context.caseId,
+        assetId: context.asset?.assetId,
+        workOrderId: context.workOrder?.workOrderId,
+        currentRevisionId: revisionId,
+        createdAt,
+        updatedAt: createdAt,
+        revisions: [{
+          revisionId,
+          revisionNumber: 1,
+          approvalState,
+          createdAt,
+          createdBy: actor,
+          summary,
+          diffFromPrevious: [],
+          signoffs: [],
+          provenance,
+          content: draft.content,
+        }],
+      });
+
+      persistActions.push({
+        artifactType: draft.artifactType,
+        action: "created",
+        artifactId: record.artifactId,
+        revisionNumber: 1,
+      });
+
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_artifact",
+        action: "create",
+        outcome: "success",
+        message: `Created ${draft.artifactType} artifact ${artifactId}`,
+        requestId: options.requestId,
+        metadata: {
+          caseId: context.caseId,
+          assetId: context.asset?.assetId,
+          workOrderId: context.workOrder?.workOrderId,
+          generationMode: draft.generationMode,
+          profileId: requester?.profileId,
+        },
+      });
+
+      return record;
+    });
 
   publishCheckpoint(buildCheckpoint({
     stage: "persisting",
@@ -1156,65 +1631,136 @@ export async function generateCateoArtifacts(
     artifactCount: artifacts.length,
   }));
 
-  const interaction = renderCateoInteraction(artifacts);
-  const trace = {
-    route,
-    leadPlan: leadStage.data,
-    challengerCritique: critique,
-    structureBlueprint,
-    builderPackage,
-    reviewerDecision,
-    finalSynthesis,
-    rawLeadPlan: leadStage.raw,
-    rawChallengerCritique: reviewerStage.raw,
-    rawStructureBlueprint: builderRawStage.raw,
-    rawBuilderPackage: builderRawStage.raw,
-    rawReviewerDecision: reviewerStage.raw,
-    rawFinalSynthesis: JSON.stringify(finalSynthesis, null, 2),
-  };
+    const interaction = renderCateoInteraction(artifacts);
+    const trace = {
+      route,
+      template,
+      validationAttempts,
+      ruleResults,
+      lookupCandidates,
+      persistActions,
+      prompts: {
+        planner: plannerPrompt,
+        builder: builderPrompt,
+        reviewer: reviewerPrompt,
+      },
+      leadPlan,
+      challengerCritique: critique,
+      structureBlueprint,
+      builderPackage,
+      reviewerDecision,
+      finalSynthesis,
+      rawLeadPlan: leadStage.raw,
+      rawChallengerCritique: reviewerStage.raw,
+      rawStructureBlueprint: builderRawTrace,
+      rawBuilderPackage: builderRawTrace,
+      rawReviewerDecision: reviewerStage.raw,
+      rawFinalSynthesis: JSON.stringify(finalSynthesis, null, 2),
+    };
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "rendering",
-    status: "completed",
-    summary: "Renderer prepared the conversational response from the artifact package.",
-    taskClass: route.taskClass,
-    confidence: interaction.confidence,
-    artifactTypes: artifacts.map((artifact) => artifact.artifactType),
-    artifactCount: artifacts.length,
-  }));
+    publishCheckpoint(buildCheckpoint({
+      stage: "rendering",
+      status: "completed",
+      summary: "Renderer prepared the conversational response from the artifact package.",
+      taskClass: route.taskClass,
+      confidence: interaction.confidence,
+      artifactTypes: artifacts.map((artifact) => artifact.artifactType),
+      artifactCount: artifacts.length,
+    }));
 
-  saveCaseRecord({
-    caseId: context.caseId,
-    runId,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-    input: sanitizedInput,
-    context,
-    artifacts: artifacts.map((artifact) => artifact.artifactId),
-    interaction,
-    trace,
-  });
+    const artifactIds = [...new Set(artifacts.map((artifact) => artifact.artifactId))];
+    saveCaseRecord({
+      caseId: context.caseId,
+      runId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      input: sanitizedInput,
+      context,
+      artifacts: artifactIds,
+      interaction,
+      requester,
+      usage,
+      trace,
+    });
 
-  publishCheckpoint(buildCheckpoint({
-    stage: "completed",
-    status: "completed",
-    summary: "Cateo response is ready.",
-    taskClass: route.taskClass,
-    confidence: interaction.confidence,
-    artifactTypes: artifacts.map((artifact) => artifact.artifactType),
-    artifactCount: artifacts.length,
-  }));
+    publishCheckpoint(buildCheckpoint({
+      stage: "completed",
+      status: "completed",
+      summary: "Cateo response is ready.",
+      taskClass: route.taskClass,
+      confidence: interaction.confidence,
+      artifactTypes: artifacts.map((artifact) => artifact.artifactType),
+      artifactCount: artifacts.length,
+    }));
 
-  return {
+    if (config.security.persistence.persistDatasets) {
+      appendCateoInteraction({
+        schemaVersion: "1.0",
+        kind: "cateo_interaction",
+        timestamp: Date.now(),
+        caseId: context.caseId,
+        runId,
+        profileId: requester?.profileId,
+        requesterId: requester?.requesterId,
+        organization: requester?.organization,
+        emailHash: requester?.emailHash,
+        taskClass: route.taskClass,
+        assetId: context.asset?.assetId,
+        workOrderId: context.workOrder?.workOrderId,
+        prompt: sanitizedInput.symptomDescription,
+        errorCode: sanitizedInput.errorCode,
+        observedConditions: context.observedConditions,
+        attachmentCount: context.attachments.length,
+        requestedArtifacts: route.requestedArtifacts,
+        artifactTypes: artifacts.map((artifact) => artifact.artifactType),
+        interactionMessage: interaction.message,
+        highlights: interaction.highlights,
+        nextActions: interaction.nextActions,
+        confidence: interaction.confidence,
+        contextSummary: context.contextSummary,
+        checkpoints: checkpoints.map((checkpoint) => ({
+          stage: checkpoint.stage,
+          status: checkpoint.status,
+          summary: checkpoint.summary,
+        })),
+        modelsUsed,
+        usage,
+        executiveSummary: finalSynthesis.executiveSummary,
+        rootCauseStatement: finalSynthesis.rootCauseStatement,
+        reviewerSummary: reviewerDecision.summary,
+      });
+    }
+
+    return {
     caseId: context.caseId,
     runId,
     summary: interaction.message,
     interaction,
     checkpoints,
     context,
+    requester,
+    usage,
     trace,
     artifacts,
   };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const usage = buildUsageSummary(stageUsages);
+    const lastCheckpoint = checkpoints[checkpoints.length - 1];
+    if (lastCheckpoint?.stage !== "failed") {
+      publishCheckpoint(buildCheckpoint({
+        stage: "failed",
+        status: "failed",
+        summary: `Cateo could not complete the request: ${message}`,
+        taskClass: route.taskClass,
+        artifactTypes: route.requestedArtifacts,
+      }));
+    }
+    if (error instanceof CateoExecutionError) {
+      throw error;
+    }
+    throw new CateoExecutionError(message, usage);
+  }
 }
 
 export function reviseCateoArtifact(request: CateoRevisionRequest, options: ServiceOptions = {}): CateoArtifactRecord {
@@ -1290,4 +1836,5 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
 

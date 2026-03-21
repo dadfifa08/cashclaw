@@ -32,7 +32,11 @@ import { redactText, sanitizeForAudit } from "./security/redact.js";
 import * as cli from "./moltlaunch/cli.js";
 import { resolveRuntimeControlSettings, type RuntimeControlSettings } from "./system/runtime_paths.js";
 import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./cateo/http_api.js";
-import { getInternalServiceToken } from "./system/service_auth.js";
+import { buildCommandCenterSnapshot, type CommandCenterSnapshot } from "./cateo/metrics.js";
+import { createInternalRequestVerifier, getInternalServiceToken } from "./system/service_auth.js";
+import { readRequestBody } from "./system/request_body.js";
+import { authenticateOperator, ensureOperatorBootstrap, hasRequiredRole, isOperatorAuthEnabled, type AuthenticatedOperator, type OperatorRole } from "./security/operators.js";
+import { createOperatorSessionManager, type OperatorSessionBinding, type OperatorSessionRecord } from "./security/operator_sessions.js";
 
 const MAX_BODY_BYTES = 1_048_576;
 const LIVE_PATH = "/api/live";
@@ -45,6 +49,10 @@ const WALLET_CACHE_TTL = 60_000;
 const AGENTCASH_CACHE_TTL = 60_000;
 const ETH_PRICE_CACHE_TTL = 60_000;
 const APPROVED_AGENTCASH_CLASSES = new Set<AgentCashAccessClass>(["research", "social", "media", "outbound"]);
+const VIEWER_ROLES: OperatorRole[] = ["viewer", "analyst", "reviewer", "admin"];
+const ANALYST_ROLES: OperatorRole[] = ["analyst", "reviewer", "admin"];
+const REVIEWER_ROLES: OperatorRole[] = ["reviewer", "admin"];
+const ADMIN_ROLES: OperatorRole[] = ["admin"];
 
 type ServerMode = "setup" | "running";
 
@@ -52,8 +60,6 @@ interface ServerContext {
   mode: ServerMode;
   config: CashClawConfig | null;
   heartbeat: Heartbeat | null;
-  sessionId: string;
-  csrfToken: string;
 }
 
 interface StatusPayload {
@@ -100,6 +106,7 @@ interface LiveRuntimeSnapshot {
   approvals: ApprovalRequest[];
   audit: AuditEvent[];
   config: CashClawConfig | null;
+  commandCenter: CommandCenterSnapshot;
 }
 
 interface BootstrapPayload {
@@ -108,6 +115,16 @@ interface BootstrapPayload {
   mode: ServerMode;
   step: string;
   snapshot: LiveRuntimeSnapshot;
+}
+
+interface AuthSessionPayload {
+  enabled: boolean;
+  authenticated: boolean;
+  operator: {
+    username: string;
+    role: OperatorRole;
+  } | null;
+  expiresAt: number | null;
 }
 
 interface ServerHelpers {
@@ -122,6 +139,7 @@ let ethPriceCache: { price: number; fetchedAt: number } | null = null;
 
 export async function startAgent(): Promise<http.Server> {
   const runtimeSettings = resolveRuntimeControlSettings();
+  const operatorBootstrap = ensureOperatorBootstrap();
   const config = loadConfig();
   const configured = isConfigured();
   if (config && config.agentCashEnabled === undefined && isAgentCashAvailable()) {
@@ -133,8 +151,6 @@ export async function startAgent(): Promise<http.Server> {
     mode: configured ? "running" : "setup",
     config,
     heartbeat: null,
-    sessionId: crypto.randomUUID(),
-    csrfToken: crypto.randomUUID(),
   };
 
   if (ctx.mode === "running" && ctx.config) {
@@ -144,7 +160,7 @@ export async function startAgent(): Promise<http.Server> {
     ctx.heartbeat = heartbeat;
   }
 
-  appendAuditEvent({ actor: "system", category: "runtime", action: "boot", outcome: "success", message: `Cateo server booted in ${ctx.mode} mode` });
+  appendAuditEvent({ actor: "system", category: "runtime", action: "boot", outcome: "success", message: `Cateo server booted in ${ctx.mode} mode`, metadata: { operatorAuthEnabled: operatorBootstrap.enabled, operatorUsers: operatorBootstrap.userCount } });
   return createServer(ctx, runtimeSettings);
 }
 
@@ -152,8 +168,26 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
   const liveClients = new Set<WebSocket>();
   const wss = new WebSocketServer({ noServer: true });
   const internalServiceToken = getInternalServiceToken();
+  const internalRequestVerifier = createInternalRequestVerifier(internalServiceToken);
+  const operatorAuthEnabled = isOperatorAuthEnabled();
+  const operatorSessions = createOperatorSessionManager({ sessionTtlMs: SESSION_TTL_SECONDS * 1000 });
   let broadcastTimer: ReturnType<typeof setTimeout> | null = null;
   let detachHeartbeatListener: (() => void) | null = null;
+
+  function getRequestSessionBinding(req: http.IncomingMessage): OperatorSessionBinding {
+    return {
+      remoteAddress: req.socket.remoteAddress ?? undefined,
+      userAgent: Array.isArray(req.headers["user-agent"]) ? req.headers["user-agent"][0] : req.headers["user-agent"],
+    };
+  }
+
+  function getOperatorSessionFromRequest(req: http.IncomingMessage): OperatorSessionRecord | null {
+    return operatorSessions.getSession(parseCookies(req)[SESSION_COOKIE] ?? null, getRequestSessionBinding(req));
+  }
+
+  function getOrIssueOperatorSession(req: http.IncomingMessage): OperatorSessionRecord | null {
+    return getOperatorSessionFromRequest(req);
+  }
 
   async function buildBootstrap(): Promise<BootstrapPayload> {
     return {
@@ -314,8 +348,9 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
         });
       });
 
-      if (!hasValidInternalToken(req, internalServiceToken)) {
-        auditDeniedRequest(req, requestId, "Missing or invalid internal service token");
+      const internalVerification = await internalRequestVerifier.verify(req, url.pathname, () => readBody(req));
+      if (!internalVerification.ok) {
+        auditDeniedRequest(req, requestId, internalVerification.reason ?? "Missing or invalid signed internal request");
         json(res, { error: "Unauthorized" }, 403);
         return;
       }
@@ -325,11 +360,12 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
     }
 
     if (url.pathname.startsWith("/api/")) {
+      let requestOperator: AuthenticatedOperator | null = null;
       const apiAction = `${req.method ?? "GET"} ${url.pathname}`;
       res.on("finish", () => {
         appendAuditEvent({
           actor: "server",
-          category: "api",
+          category: url.pathname.startsWith("/api/auth/") ? "auth_api" : "api",
           action: apiAction,
           outcome: String(res.statusCode),
           message: `${apiAction} -> ${res.statusCode}`,
@@ -339,6 +375,8 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
             remoteAddress: req.socket.remoteAddress,
             origin: req.headers.origin,
             fetchSite: req.headers["sec-fetch-site"],
+            operatorUsername: requestOperator?.username,
+            operatorRole: requestOperator?.role,
           },
         });
       });
@@ -349,21 +387,158 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
         return;
       }
 
+      let operatorSession = getOrIssueOperatorSession(req);
+      requestOperator = operatorSession?.operator ?? null;
+
+      if (url.pathname === "/api/auth/session") {
+        if (req.method !== "GET") {
+          json(res, { error: "GET only" }, 405);
+          return;
+        }
+        if (operatorSession) {
+          issueOperatorSessionCookies(res, operatorSession);
+        }
+        json(res, buildOperatorAuthPayload(operatorAuthEnabled, operatorSession));
+        return;
+      }
+
+      if (url.pathname === "/api/auth/login") {
+        if (req.method !== "POST") {
+          json(res, { error: "POST only" }, 405);
+          return;
+        }
+        if (!operatorAuthEnabled) {
+          json(res, { error: "Operator authentication is not configured. Set CATEO_OPERATOR_USERS or CATEO_OPERATOR_ADMIN_PASSWORD and restart the server.", code: "AUTH_NOT_CONFIGURED" }, 400);
+          return;
+        }
+
+        const body = parseJsonBody<{ username: string; password: string }>(await readBody(req));
+        const username = expectNonEmptyString(body.username, "username", 120);
+        const password = expectNonEmptyString(body.password, "password", 500);
+        const loginKey = buildLoginThrottleKey(req, username);
+        const throttle = operatorSessions.checkLoginThrottle(loginKey);
+        if (!throttle.allowed) {
+          if (throttle.retryAfterSeconds) {
+            res.setHeader("Retry-After", String(throttle.retryAfterSeconds));
+          }
+          appendAuditEvent({
+            actor: "server",
+            category: "auth",
+            action: "login",
+            outcome: "rate_limited",
+            severity: "warn",
+            message: "Operator login temporarily throttled",
+            requestId,
+            metadata: {
+              username: sanitizeForAudit(username),
+              remoteAddress: req.socket.remoteAddress,
+              retryAfterSeconds: throttle.retryAfterSeconds,
+              failures: throttle.failures,
+            },
+          });
+          json(res, { error: "Too many login attempts", code: "LOGIN_THROTTLED", retryAfterSeconds: throttle.retryAfterSeconds ?? null }, 429);
+          return;
+        }
+
+        const operator = authenticateOperator(username, password);
+        if (!operator) {
+          const failure = operatorSessions.recordFailedLogin(loginKey);
+          if (failure.retryAfterSeconds) {
+            res.setHeader("Retry-After", String(failure.retryAfterSeconds));
+          }
+          appendAuditEvent({
+            actor: "server",
+            category: "auth",
+            action: "login",
+            outcome: "denied",
+            severity: "warn",
+            message: "Operator login failed",
+            requestId,
+            metadata: {
+              username: sanitizeForAudit(username),
+              remoteAddress: req.socket.remoteAddress,
+              retryAfterSeconds: failure.retryAfterSeconds,
+              failures: failure.failures,
+            },
+          });
+          json(res, { error: "Invalid username or password", code: "INVALID_CREDENTIALS", retryAfterSeconds: failure.retryAfterSeconds ?? null }, failure.retryAfterSeconds ? 429 : 401);
+          return;
+        }
+
+        operatorSessions.clearLoginThrottle(loginKey);
+        operatorSessions.revokeSession(parseCookies(req)[SESSION_COOKIE]);
+        operatorSession = operatorSessions.issueSession(operator, getRequestSessionBinding(req));
+        requestOperator = operator;
+        issueOperatorSessionCookies(res, operatorSession);
+        appendAuditEvent({
+          actor: "operator",
+          category: "auth",
+          action: "login",
+          outcome: "success",
+          message: `Operator ${operator.username} logged in`,
+          requestId,
+          metadata: {
+            username: operator.username,
+            role: operator.role,
+            remoteAddress: req.socket.remoteAddress,
+          },
+        });
+        json(res, buildOperatorAuthPayload(operatorAuthEnabled, operatorSession));
+        return;
+      }
+
+      if (url.pathname === "/api/auth/logout") {
+        if (req.method !== "POST") {
+          json(res, { error: "POST only" }, 405);
+          return;
+        }
+        if (operatorSession && !hasValidCsrf(req, operatorSession)) {
+          auditDeniedRequest(req, requestId, "Invalid CSRF token for logout");
+          json(res, { error: "Unauthorized", code: "INVALID_CSRF" }, 403);
+          return;
+        }
+        const sessionId = parseCookies(req)[SESSION_COOKIE];
+        if (operatorSession) {
+          appendAuditEvent({
+            actor: "operator",
+            category: "auth",
+            action: "logout",
+            outcome: "success",
+            message: `Operator ${operatorSession.operator.username} logged out`,
+            requestId,
+            metadata: {
+              username: operatorSession.operator.username,
+              role: operatorSession.operator.role,
+              remoteAddress: req.socket.remoteAddress,
+            },
+          });
+        }
+        operatorSessions.revokeSession(sessionId);
+        clearOperatorSessionCookies(res);
+        json(res, { ok: true });
+        return;
+      }
+
+      if (!operatorSession) {
+        auditDeniedRequest(req, requestId, "Missing or invalid operator session");
+        json(res, { error: "Operator login required", code: "AUTH_REQUIRED" }, 401);
+        return;
+      }
+
+      if (!hasRequiredRole(operatorSession.operator.role, getAllowedOperatorRoles(url.pathname, req.method ?? "GET"))) {
+        auditDeniedRequest(req, requestId, `Operator role ${operatorSession.operator.role} is not permitted for ${req.method ?? "GET"} ${url.pathname}`);
+        json(res, { error: "Forbidden" }, 403);
+        return;
+      }
+
       if (url.pathname === "/api/bootstrap") {
-        issueOperatorSessionCookies(res, ctx);
         json(res, await helpers.buildBootstrap());
         return;
       }
 
-      if (!hasValidSession(req, ctx)) {
-        auditDeniedRequest(req, requestId, "Missing or invalid operator session");
-        json(res, { error: "Unauthorized" }, 403);
-        return;
-      }
-
-      if (req.method === "POST" && !hasValidCsrf(req, ctx)) {
+      if (req.method === "POST" && !hasValidCsrf(req, operatorSession)) {
         auditDeniedRequest(req, requestId, "Invalid CSRF token");
-        json(res, { error: "Unauthorized" }, 403);
+        json(res, { error: "Unauthorized", code: "INVALID_CSRF" }, 403);
         return;
       }
 
@@ -371,22 +546,37 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
       return;
     }
 
-    if (!path.extname(url.pathname)) {
-      issueOperatorSessionCookies(res, ctx);
-    }
-
     serveStatic(url.pathname, res);
   }
-
   server.on("upgrade", (req, socket, head) => {
     const requestId = crypto.randomUUID();
     const url = new URL(req.url ?? "/", runtimeSettings.baseUrl);
+    const operatorSession = getOperatorSessionFromRequest(req);
     if (url.pathname !== LIVE_PATH) {
       socket.destroy();
       return;
     }
 
-    if (!isTrustedWebSocketRequest(req, ctx, url, runtimeSettings)) {
+    if (!operatorSession) {
+      appendAuditEvent({
+        actor: "server",
+        category: "websocket",
+        action: "upgrade",
+        outcome: "denied",
+        severity: "warn",
+        message: "Live websocket requires an authenticated operator session",
+        requestId,
+        metadata: {
+          remoteAddress: req.socket.remoteAddress,
+          origin: req.headers.origin,
+        },
+      });
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    if (!isTrustedWebSocketRequest(req, operatorSession, url, runtimeSettings)) {
       appendAuditEvent({
         actor: "server",
         category: "websocket",
@@ -398,6 +588,8 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
         metadata: {
           remoteAddress: req.socket.remoteAddress,
           origin: req.headers.origin,
+          operatorUsername: operatorSession.operator.username,
+          operatorRole: operatorSession.operator.role,
         },
       });
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -414,6 +606,10 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
         outcome: "connected",
         message: "Live websocket connected",
         requestId,
+        metadata: {
+          operatorUsername: operatorSession.operator.username,
+          operatorRole: operatorSession.operator.role,
+        },
       });
       ws.on("close", () => liveClients.delete(ws));
       ws.on("error", () => liveClients.delete(ws));
@@ -424,7 +620,6 @@ function createServer(ctx: ServerContext, runtimeSettings: RuntimeControlSetting
       });
     });
   });
-
   server.on("close", () => {
     if (broadcastTimer) {
       clearTimeout(broadcastTimer);
@@ -483,9 +678,24 @@ function appendCookieHeader(res: http.ServerResponse, cookie: string): void {
   res.setHeader("Set-Cookie", next);
 }
 
-function issueOperatorSessionCookies(res: http.ServerResponse, ctx: ServerContext): void {
-  appendCookieHeader(res, `${SESSION_COOKIE}=${encodeURIComponent(ctx.sessionId)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`);
-  appendCookieHeader(res, `${CSRF_COOKIE}=${encodeURIComponent(ctx.csrfToken)}; Path=/; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`);
+function issueOperatorSessionCookies(res: http.ServerResponse, session: OperatorSessionRecord): void {
+  const ttlSeconds = Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000));
+  appendCookieHeader(res, `${SESSION_COOKIE}=${encodeURIComponent(session.sessionId)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ttlSeconds}`);
+  appendCookieHeader(res, `${CSRF_COOKIE}=${encodeURIComponent(session.csrfToken)}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`);
+}
+
+function clearOperatorSessionCookies(res: http.ServerResponse): void {
+  appendCookieHeader(res, `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`);
+  appendCookieHeader(res, `${CSRF_COOKIE}=; Path=/; SameSite=Strict; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`);
+}
+
+function buildOperatorAuthPayload(enabled: boolean, session: OperatorSessionRecord | null): AuthSessionPayload {
+  return {
+    enabled,
+    authenticated: Boolean(session),
+    operator: session ? { username: session.operator.username, role: session.operator.role } : null,
+    expiresAt: session?.expiresAt ?? null,
+  };
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {
@@ -510,31 +720,54 @@ function isTrustedApiRequest(req: http.IncomingMessage, runtimeSettings: Runtime
   return isLocalSocketRequest(req, runtimeSettings) && isTrustedBrowserContext(req, runtimeSettings);
 }
 
-function hasValidSession(req: http.IncomingMessage, ctx: ServerContext): boolean {
-  return parseCookies(req)[SESSION_COOKIE] === ctx.sessionId;
-}
-
-function hasValidCsrf(req: http.IncomingMessage, ctx: ServerContext): boolean {
+function hasValidCsrf(req: http.IncomingMessage, session: OperatorSessionRecord | null): boolean {
+  if (!session) {
+    return false;
+  }
   const header = Array.isArray(req.headers[CSRF_HEADER]) ? req.headers[CSRF_HEADER][0] : req.headers[CSRF_HEADER];
   const cookies = parseCookies(req);
-  return cookies[CSRF_COOKIE] === ctx.csrfToken && header === ctx.csrfToken;
+  return cookies[CSRF_COOKIE] === session.csrfToken && header === session.csrfToken;
 }
 
-function hasValidInternalToken(req: http.IncomingMessage, expectedToken: string): boolean {
-  const header = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) return false;
-  const presented = header.slice("Bearer ".length).trim();
-  const expectedBuffer = Buffer.from(expectedToken);
-  const presentedBuffer = Buffer.from(presented);
-  if (expectedBuffer.length !== presentedBuffer.length) return false;
-  return crypto.timingSafeEqual(expectedBuffer, presentedBuffer);
+function getAllowedOperatorRoles(pathname: string, method: string): OperatorRole[] {
+  const normalizedMethod = method.toUpperCase();
+  if (!pathname.startsWith("/api/")) {
+    return VIEWER_ROLES;
+  }
+  if (pathname === "/api/bootstrap") {
+    return VIEWER_ROLES;
+  }
+  if (pathname.startsWith("/api/setup/") || pathname === "/api/start" || pathname === "/api/stop" || pathname === "/api/config-update") {
+    return ADMIN_ROLES;
+  }
+  if (pathname === "/api/approvals/approve" || pathname === "/api/approvals/reject") {
+    return REVIEWER_ROLES;
+  }
+  if (pathname === "/api/chat" && normalizedMethod === "POST") {
+    return ANALYST_ROLES;
+  }
+  if (pathname === "/api/chat/clear" || pathname === "/api/knowledge/delete") {
+    return ADMIN_ROLES;
+  }
+  if (normalizedMethod === "GET") {
+    return VIEWER_ROLES;
+  }
+  return ANALYST_ROLES;
 }
 
-function isTrustedWebSocketRequest(req: http.IncomingMessage, ctx: ServerContext, url: URL, runtimeSettings: RuntimeControlSettings): boolean {
+function buildLoginThrottleKey(req: http.IncomingMessage, username: string): string {
+  return `${req.socket.remoteAddress ?? "unknown"}:${username.trim().toLowerCase()}`;
+}
+
+function isTrustedWebSocketRequest(req: http.IncomingMessage, session: OperatorSessionRecord | null, url: URL, runtimeSettings: RuntimeControlSettings): boolean {
   const origin = normalizeOrigin(req.headers.origin);
-  return isLocalSocketRequest(req, runtimeSettings) && !!origin && runtimeSettings.allowedOrigins.has(origin) && hasValidSession(req, ctx) && url.searchParams.get(CSRF_QUERY_PARAM) === ctx.csrfToken;
+  return isLocalSocketRequest(req, runtimeSettings)
+    && !!origin
+    && runtimeSettings.allowedOrigins.has(origin)
+    && !!session
+    && parseCookies(req)[SESSION_COOKIE] === session.sessionId
+    && url.searchParams.get(CSRF_QUERY_PARAM) === session.csrfToken;
 }
-
 function setSecurityHeaders(req: http.IncomingMessage, res: http.ServerResponse, runtimeSettings: RuntimeControlSettings) {
   const origin = normalizeOrigin(req.headers.origin);
   if (origin && runtimeSettings.allowedOrigins.has(origin)) {
@@ -579,21 +812,7 @@ function json(res: http.ServerResponse, data: unknown, status = 200) {
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    let size = 0;
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(new Error("Request body too large"));
-        return;
-      }
-      body += chunk.toString();
-    });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
+  return readRequestBody(req, { maxBytes: MAX_BODY_BYTES });
 }
 
 function parseJsonBody<T>(raw: string): T {
@@ -683,6 +902,7 @@ async function buildLiveSnapshot(ctx: ServerContext): Promise<LiveRuntimeSnapsho
     approvals: getApprovals(100),
     audit: loadRecentAuditEvents(200),
     config: maskConfig(ctx.config),
+    commandCenter: buildCommandCenterSnapshot(),
   };
 }
 

@@ -175,6 +175,11 @@ export interface CateoAssistInput {
   attachments?: CateoAttachmentInput[];
   digitalTwin?: CateoDigitalTwinInput;
   requestedArtifacts?: CateoArtifactType[];
+  instructionTemplate?: {
+    templateId?: string;
+    version?: string;
+    taskClass?: CateoTaskClass;
+  };
 }
 
 export interface CateoDigitalTwinDimensionResult {
@@ -351,6 +356,7 @@ export interface CateoArtifactProvenance {
   taskClass: CateoTaskClass;
   modelsUsed: CateoRuntimeModelInfo[];
   evidenceFingerprint: string;
+  profileId?: string;
 }
 
 export interface CateoJsonDiffEntry {
@@ -403,6 +409,8 @@ export interface CateoCaseRecord {
   context: CateoContextBundle;
   artifacts: string[];
   interaction?: CateoInteractionProjection;
+  requester?: CateoRequesterInfo;
+  usage?: CateoUsageSummary;
   trace: CateoReasoningTrace;
 }
 
@@ -507,6 +515,79 @@ export interface CateoInteractionCheckpoint {
   artifactTypes?: CateoArtifactType[];
   artifactCount?: number;
 }
+
+export interface CateoRequesterInfo {
+  requesterId: string;
+  profileId?: string;
+  displayName?: string;
+  organization?: string;
+  emailHash?: string;
+}
+
+export interface CateoStageUsage {
+  stage: "planner" | "builder" | "reviewer";
+  role: "lead" | "structure" | "challenger";
+  model: CateoRuntimeModelInfo;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface CateoUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  stages: CateoStageUsage[];
+}
+
+export interface CateoInstructionTemplate {
+  templateId: string;
+  version: string;
+  taskClass: CateoTaskClass;
+  responseBehavior: string[];
+  terminology: string[];
+  fieldExpectations: string[];
+  outputConstraints: string[];
+  requiredArtifacts: CateoArtifactType[];
+}
+
+export interface CateoValidationAttempt {
+  stage: "builder" | "reviewer";
+  attempt: number;
+  outcome: "success" | "retry" | "fallback";
+  errors: string[];
+}
+
+export interface CateoRuleResult {
+  ruleId: string;
+  severity: "info" | "warn" | "error";
+  outcome: "pass" | "flag" | "escalate";
+  message: string;
+  artifactType?: CateoArtifactType;
+  details?: string[];
+}
+
+export interface CateoArtifactLookupCandidate {
+  artifactId: string;
+  artifactType: CateoArtifactType;
+  caseId: string;
+  assetId?: string;
+  workOrderId?: string;
+  score: number;
+  basis: string[];
+  revisionNumber: number;
+  approvalState: CateoApprovalState;
+  updatedAt: string;
+}
+
+export interface CateoArtifactPersistAction {
+  artifactType: CateoArtifactType;
+  action: "created" | "merged";
+  artifactId: string;
+  revisionNumber: number;
+  matchedArtifactId?: string;
+  matchScore?: number;
+}
 export interface CateoInteractionProjection {
   message: string;
   highlights: string[];
@@ -520,6 +601,16 @@ export interface CateoInteractionProjection {
 
 export interface CateoReasoningTrace {
   route: CateoRoutingDecision;
+  template: CateoInstructionTemplate;
+  validationAttempts: CateoValidationAttempt[];
+  ruleResults: CateoRuleResult[];
+  lookupCandidates: CateoArtifactLookupCandidate[];
+  persistActions: CateoArtifactPersistAction[];
+  prompts: {
+    planner: string;
+    builder: string;
+    reviewer: string;
+  };
   leadPlan: CateoLeadPlan;
   challengerCritique?: CateoChallengerCritique;
   structureBlueprint?: CateoStructureBlueprint;
@@ -541,6 +632,8 @@ export interface CateoAssistResult {
   interaction: CateoInteractionProjection;
   checkpoints: CateoInteractionCheckpoint[];
   context: CateoContextBundle;
+  requester?: CateoRequesterInfo;
+  usage?: CateoUsageSummary;
   trace: CateoReasoningTrace;
   artifacts: CateoArtifactRecord[];
 }
@@ -561,4 +654,5 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
 
