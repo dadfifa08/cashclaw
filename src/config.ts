@@ -185,13 +185,13 @@ const DEFAULT_PILOT_CONFIG: PilotConfig = {
   hostedRoleModels: {},
   quota: {
     enabled: true,
-    dailyRequestLimit: 25,
-    dailyInputTokenLimit: 200_000,
-    dailyOutputTokenLimit: 200_000,
-    dailyTotalTokenLimit: 350_000,
-    reservationTokensPerJob: 16_000,
-    maxPendingJobsPerProfile: 4,
-    maxPromptChars: 12_000,
+    dailyRequestLimit: 8,
+    dailyInputTokenLimit: 80_000,
+    dailyOutputTokenLimit: 80_000,
+    dailyTotalTokenLimit: 120_000,
+    reservationTokensPerJob: 10_000,
+    maxPendingJobsPerProfile: 2,
+    maxPromptChars: 8_000,
   },
 };
 
@@ -492,3 +492,4 @@ export function isAgentCashAvailable(): boolean {
   const walletPath = path.join(os.homedir(), ".agentcash", "wallet.json");
   return fs.existsSync(walletPath);
 }
+

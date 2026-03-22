@@ -21,8 +21,8 @@ const REQUESTER_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const PROFILE_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const SSE_KEEPALIVE_MS = 15000;
 const SUBMISSION_WINDOW_MS = 10 * 60 * 1000;
-const SUBMISSION_LIMIT_PER_REQUESTER = 18;
-const SUBMISSION_LIMIT_PER_IP = 40;
+const SUBMISSION_LIMIT_PER_REQUESTER = 8;
+const SUBMISSION_LIMIT_PER_IP = 18;
 const submissionWindow = new Map<string, number[]>();
 
 interface PublicChatArtifactSummary {
@@ -202,12 +202,22 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
     return undefined;
   }
 
+  const reviewPending = Boolean(result.interaction?.requiresEngineerReview);
   const summary = result.summary?.trim() || result.interaction?.message || "Cateo prepared a controlled engineering response package.";
   const interaction = result.interaction
     ? {
-      message: result.interaction.message,
-      highlights: result.interaction.highlights ?? [],
-      nextActions: result.interaction.nextActions ?? [],
+      message: reviewPending
+        ? "Cateo assembled the requested engineering package and sent it to the engineer review bucket. It will be released to the customer profile after password-backed admin sign-off."
+        : result.interaction.message,
+      highlights: reviewPending
+        ? [
+          "The requested artifact package was generated and fully logged.",
+          "A human engineer review is required before customer release.",
+        ]
+        : result.interaction.highlights ?? [],
+      nextActions: reviewPending
+        ? ["Wait for engineer sign-off before downloading or acting on the final released package."]
+        : result.interaction.nextActions ?? [],
       confidence: result.interaction.confidence ?? "medium",
       artifactCount: result.interaction.artifactCount ?? result.artifacts.length,
       releaseStatus: result.interaction.releaseStatus,
@@ -218,7 +228,7 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
 
   return {
     message: interaction?.message ?? summary,
-    summary,
+    summary: reviewPending ? "Cateo generated the report package and queued engineer review before release." : summary,
     highlights: interaction?.highlights ?? [],
     nextActions: interaction?.nextActions ?? [],
     confidence: interaction?.confidence ?? "medium",
@@ -658,6 +668,8 @@ export async function startCateoSiteBridge(
 
   return server;
 }
+
+
 
 
 

@@ -482,7 +482,7 @@ export function submitAssistJob(
   input: CateoAssistInput,
   requesterId: string,
   requestId?: string,
-  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string },
+  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean },
 ): AssistJobSnapshot {
   compactJobs();
   const now = Date.now();
@@ -511,7 +511,7 @@ export function submitAssistJob(
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
     profileServiceTier: options?.profile?.serviceTier,
-    requiresEngineerReview: options?.profile?.reviewedOutputs ?? false,
+    requiresEngineerReview: options?.requiresEngineerReview ?? options?.profile?.reviewedOutputs ?? false,
   };
 
   jobs.set(jobId, record);
@@ -587,6 +587,7 @@ export function subscribeAssistJob(jobId: string, requesterId: string, listener:
     }
   };
 }
+
 
 
 

@@ -10,6 +10,7 @@ import type {
   CateoMatchedFailureCode,
   CateoPartCatalogEntry,
   CateoPartResolution,
+  CateoProductOffering,
   CateoTaskClass,
 } from "./types.js";
 
@@ -19,6 +20,40 @@ function uniqueStrings(values: Array<string | undefined | null>): string[] {
 
 function tokenize(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 3);
+}
+
+const PRODUCT_TASK_CLASS: Record<CateoProductOffering, CateoTaskClass> = {
+  "troubleshooting-guide": "troubleshooting",
+  "preventive-maintenance-report": "preventive-maintenance",
+  "deviation-investigation-report": "root-cause-analysis",
+  "audit-ready-documentation-package": "documentation",
+  "work-instructions-sop": "documentation",
+  "validation-qualification-protocol": "documentation",
+  "predictive-failure-analysis": "root-cause-analysis",
+  fmea: "root-cause-analysis",
+  "cost-impact-downtime-report": "root-cause-analysis",
+  "parts-inventory-optimization": "preventive-maintenance",
+  "digital-twin-comparison-report": "inspection",
+  "camera-based-diagnostic-report": "inspection",
+};
+
+const PRODUCT_ARTIFACTS: Record<CateoProductOffering, CateoArtifactType[]> = {
+  "troubleshooting-guide": ["troubleshooting-procedure", "diagnostic-reasoning-log", "parts-tools-list", "service-report"],
+  "preventive-maintenance-report": ["inspection-checklist", "parts-tools-list", "service-report"],
+  "deviation-investigation-report": ["diagnostic-reasoning-log", "service-report", "troubleshooting-procedure"],
+  "audit-ready-documentation-package": ["service-report", "diagnostic-reasoning-log", "inspection-checklist"],
+  "work-instructions-sop": ["troubleshooting-procedure", "service-report"],
+  "validation-qualification-protocol": ["inspection-checklist", "service-report", "diagnostic-reasoning-log"],
+  "predictive-failure-analysis": ["diagnostic-reasoning-log", "service-report", "parts-tools-list"],
+  fmea: ["diagnostic-reasoning-log", "service-report", "troubleshooting-procedure"],
+  "cost-impact-downtime-report": ["service-report", "diagnostic-reasoning-log", "parts-tools-list"],
+  "parts-inventory-optimization": ["parts-tools-list", "service-report", "diagnostic-reasoning-log"],
+  "digital-twin-comparison-report": ["inspection-checklist", "diagnostic-reasoning-log", "service-report"],
+  "camera-based-diagnostic-report": ["inspection-checklist", "diagnostic-reasoning-log", "service-report"],
+};
+
+function labelProductOffering(productOffering: CateoProductOffering | undefined): string | undefined {
+  return productOffering ? productOffering.replace(/-/g, " ") : undefined;
 }
 
 function scorePart(part: CateoPartCatalogEntry, tokens: Set<string>, model: string | undefined, partResolution: CateoPartResolution | undefined): number {
@@ -60,31 +95,47 @@ function mergeDigitalTwinInputs(primary: CateoDigitalTwinInput | undefined, deri
   };
 }
 
-function partCatalogFromResolution(partResolution: CateoPartResolution | undefined): CateoPartCatalogEntry[] {
-  if (!partResolution?.partNumber) {
-    return [];
+function syntheticPartCatalogEntries(input: CateoAssistInput, partResolution: CateoPartResolution | undefined): CateoPartCatalogEntry[] {
+  const suppliedPartNumber = input.partNumber?.trim();
+  const resolvedPartNumber = partResolution?.partNumber?.trim();
+  const entries: CateoPartCatalogEntry[] = [];
+  if (suppliedPartNumber) {
+    entries.push({
+      sku: suppliedPartNumber,
+      description: input.contextNotes?.trim() || suppliedPartNumber,
+      compatibleModels: input.machine?.model ? [input.machine.model] : [],
+    });
   }
-  return [{
-    sku: partResolution.partNumber,
-    description: partResolution.partDescription || partResolution.partNumber,
-    compatibleModels: [],
-  }];
+  if (resolvedPartNumber && resolvedPartNumber.toLowerCase() !== suppliedPartNumber?.toLowerCase()) {
+    entries.push({
+      sku: resolvedPartNumber,
+      description: partResolution?.partDescription || resolvedPartNumber,
+      compatibleModels: input.machine?.model ? [input.machine.model] : [],
+    });
+  }
+  return entries;
 }
 
 export function inferCateoTaskClass(input: CateoAssistInput): CateoTaskClass {
+  if (input.productOffering) {
+    return PRODUCT_TASK_CLASS[input.productOffering] ?? "mixed";
+  }
+
   const corpus = [
     input.title,
     input.query,
     input.errorCode,
+    input.partNumber,
+    input.contextNotes,
     input.symptomDescription,
     ...(input.observedConditions ?? []),
     ...(input.requestedArtifacts ?? []),
   ].filter(Boolean).join(" \n ").toLowerCase();
 
-  if (/(inspection|walkdown|checklist|survey|visual|pass\/fail)/.test(corpus) || input.digitalTwin || (input.attachments?.length ?? 0) > 0) return "inspection";
-  if (/(pm\b|preventive|interval|lubrication|maintenance window)/.test(corpus)) return "preventive-maintenance";
-  if (/(root cause|rca|failure analysis|diagnostic reasoning)/.test(corpus)) return "root-cause-analysis";
-  if (/(procedure|sop|work instruction|documentation)/.test(corpus)) return "documentation";
+  if (/(inspection|walkdown|checklist|survey|visual|pass\/fail|camera diagnostic|digital twin)/.test(corpus) || input.digitalTwin || (input.attachments?.length ?? 0) > 0) return "inspection";
+  if (/(pm\b|preventive|interval|lubrication|maintenance window|parts optimization|inventory)/.test(corpus)) return "preventive-maintenance";
+  if (/(root cause|rca|failure analysis|diagnostic reasoning|fmea|deviation|investigation|downtime|cost impact|predictive)/.test(corpus)) return "root-cause-analysis";
+  if (/(procedure|sop|work instruction|documentation|audit ready|validation|qualification|iq\/oq\/pq)/.test(corpus)) return "documentation";
   if (/(error|fault|alarm|trip|fail|diagnos|troubleshoot|symptom)/.test(corpus) || input.errorCode) return "troubleshooting";
   return "mixed";
 }
@@ -92,6 +143,9 @@ export function inferCateoTaskClass(input: CateoAssistInput): CateoTaskClass {
 export function inferRequestedArtifacts(input: CateoAssistInput, taskClass = inferCateoTaskClass(input)): CateoArtifactType[] {
   if (input.requestedArtifacts && input.requestedArtifacts.length > 0) {
     return [...new Set(input.requestedArtifacts)];
+  }
+  if (input.productOffering) {
+    return [...new Set(PRODUCT_ARTIFACTS[input.productOffering] ?? [])];
   }
   switch (taskClass) {
     case "inspection": return ["inspection-checklist", "service-report", "diagnostic-reasoning-log"];
@@ -107,8 +161,12 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
   const taskClass = inferCateoTaskClass(input);
   const matchedFailureCode = matchFailureCode(input.errorCode, input.taxonomy?.failureCodes);
   const machineModel = input.machine?.model ?? input.asset?.model;
+  const productLabel = labelProductOffering(input.productOffering);
   const searchTokens = new Set(tokenize([
     input.errorCode,
+    input.partNumber,
+    input.contextNotes,
+    productLabel,
     matchedFailureCode?.label,
     matchedFailureCode?.description,
     input.symptomDescription,
@@ -120,7 +178,7 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     ...attachmentEvidence.map((entry) => `${entry.name} ${entry.mimeType ?? ""}`),
   ].filter(Boolean).join(" ")));
 
-  const suggestedParts = [...(input.partsCatalog ?? []), ...partCatalogFromResolution(partResolution ?? undefined)]
+  const suggestedParts = [...(input.partsCatalog ?? []), ...syntheticPartCatalogEntries(input, partResolution ?? undefined)]
     .map((part) => ({ part, score: scorePart(part, searchTokens, machineModel, partResolution ?? undefined) }))
     .filter((entry) => entry.score > 0)
     .sort((left, right) => right.score - left.score)
@@ -131,6 +189,8 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
   const serviceHistory = [...(input.serviceHistory ?? [])].sort((left, right) => right.occurredAt.localeCompare(left.occurredAt)).slice(0, 12);
 
   const contextSummary = uniqueStrings([
+    productLabel ? `Requested deliverable: ${productLabel}.` : undefined,
+    input.partNumber ? `User supplied manufacturing part number: ${input.partNumber}.` : undefined,
     partResolution?.partNumber ? `Resolved manufacturing part number: ${partResolution.partNumber} (${partResolution.confidencePct}% confidence).` : undefined,
     partResolution?.partDescription ? `Resolved part description: ${partResolution.partDescription}.` : undefined,
     partResolution?.manufacturer ? `Resolved manufacturer: ${partResolution.manufacturer}.` : undefined,
@@ -147,11 +207,13 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     ...attachmentEvidence.slice(0, 3).map((entry) => `${entry.kind} evidence ${entry.name}${entry.width && entry.height ? ` at ${entry.width}x${entry.height}` : ""}.`),
     digitalTwin?.status === "fail" ? `Digital twin deviations detected: ${digitalTwin.flaggedFeatures.join("; ")}.` : undefined,
     digitalTwin?.status === "pass" ? "Digital twin geometry checks passed within tolerance." : undefined,
+    input.contextNotes ? `Additional operator context: ${input.contextNotes}.` : undefined,
     ...((partResolution?.evidence ?? []).slice(0, 4)),
   ]);
 
-  const resolvedTitle = partResolution?.partNumber
-    ? `${taskClass.replace(/-/g, " ")} case for ${partResolution.partNumber}`
+  const identifyingPart = partResolution?.partNumber || input.partNumber;
+  const resolvedTitle = identifyingPart
+    ? `${taskClass.replace(/-/g, " ")} case for ${identifyingPart}`
     : input.title?.trim() || `${taskClass.replace(/-/g, " ")} case for ${input.asset?.assetId ?? input.machine?.model ?? "unidentified asset"}`;
 
   return {
@@ -163,7 +225,7 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     workOrder: input.workOrder ?? null,
     failureCode: matchedFailureCode,
     partResolution: partResolution ?? null,
-    observedConditions: uniqueStrings(input.observedConditions ?? []),
+    observedConditions: uniqueStrings([...(input.observedConditions ?? []), input.contextNotes]),
     serviceHistory,
     suggestedParts,
     attachments: attachmentEvidence,

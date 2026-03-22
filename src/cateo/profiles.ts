@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import path from "node:path";
-import type { CashClawConfig } from "../config.js";
+import type { CashClawConfig, PilotQuotaConfig } from "../config.js";
 import { getConfigDir, getPilotConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
@@ -9,6 +9,36 @@ import type { CateoServiceTier } from "./types.js";
 const PROFILE_DB_VERSION = "cateo-profile-db-v2";
 const MAX_REQUESTER_IDS = 20;
 const MAX_HISTORY_DAYS = 60;
+
+function effectiveQuotaForTier(base: PilotQuotaConfig, serviceTier: CateoServiceTier): PilotQuotaConfig {
+  if (serviceTier === "reviewed") {
+    return {
+      ...base,
+      dailyRequestLimit: Math.max(base.dailyRequestLimit, Math.round(base.dailyRequestLimit * 2)),
+      dailyInputTokenLimit: Math.max(base.dailyInputTokenLimit, Math.round(base.dailyInputTokenLimit * 2.5)),
+      dailyOutputTokenLimit: Math.max(base.dailyOutputTokenLimit, Math.round(base.dailyOutputTokenLimit * 2.5)),
+      dailyTotalTokenLimit: Math.max(base.dailyTotalTokenLimit, Math.round(base.dailyTotalTokenLimit * 2.5)),
+      reservationTokensPerJob: Math.max(base.reservationTokensPerJob, Math.round(base.reservationTokensPerJob * 1.5)),
+      maxPendingJobsPerProfile: Math.max(base.maxPendingJobsPerProfile, base.maxPendingJobsPerProfile + 2),
+      maxPromptChars: Math.max(base.maxPromptChars, Math.round(base.maxPromptChars * 1.5)),
+    };
+  }
+
+  if (serviceTier === "enterprise") {
+    return {
+      ...base,
+      dailyRequestLimit: Math.max(base.dailyRequestLimit, Math.round(base.dailyRequestLimit * 5)),
+      dailyInputTokenLimit: Math.max(base.dailyInputTokenLimit, Math.round(base.dailyInputTokenLimit * 6)),
+      dailyOutputTokenLimit: Math.max(base.dailyOutputTokenLimit, Math.round(base.dailyOutputTokenLimit * 6)),
+      dailyTotalTokenLimit: Math.max(base.dailyTotalTokenLimit, Math.round(base.dailyTotalTokenLimit * 6)),
+      reservationTokensPerJob: Math.max(base.reservationTokensPerJob, Math.round(base.reservationTokensPerJob * 2.5)),
+      maxPendingJobsPerProfile: Math.max(base.maxPendingJobsPerProfile, base.maxPendingJobsPerProfile + 6),
+      maxPromptChars: Math.max(base.maxPromptChars, Math.round(base.maxPromptChars * 3)),
+    };
+  }
+
+  return { ...base };
+}
 
 interface CateoQuotaReservation {
   reservationId: string;
@@ -240,7 +270,7 @@ function normalizeUsageDay(record: CateoProfileRecord): CateoQuotaUsageDay {
 function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): CateoProfileSnapshot {
   const pilot = getPilotConfig(config);
   const usage = normalizeUsageDay(record);
-  const quota = pilot.quota;
+  const quota = effectiveQuotaForTier(pilot.quota, record.serviceTier);
   const history = [usage, ...(record.usageHistory ?? [])]
     .map((entry) => toHistoryPoint(entry))
     .reduce<CateoQuotaHistoryPoint[]>((carry, current) => {
@@ -435,17 +465,18 @@ export function reservePilotQuota(
   }
 
   const usage = record.usage;
-  const estimate = pilot.quota.enabled ? pilot.quota.reservationTokensPerJob : 0;
-  if (usage.pendingJobs >= pilot.quota.maxPendingJobsPerProfile) {
+  const quota = effectiveQuotaForTier(pilot.quota, record.serviceTier);
+  const estimate = quota.enabled ? quota.reservationTokensPerJob : 0;
+  if (usage.pendingJobs >= quota.maxPendingJobsPerProfile) {
     throw new CateoPilotQuotaError("pending_limit_exceeded", `This pilot profile already has ${usage.pendingJobs} pending job(s).`, 429, currentSnapshot);
   }
-  if (pilot.quota.enabled && usage.acceptedRequests >= pilot.quota.dailyRequestLimit) {
+  if (quota.enabled && usage.acceptedRequests >= quota.dailyRequestLimit) {
     throw new CateoPilotQuotaError("request_limit_exceeded", "This pilot profile has reached the daily request limit.", 429, currentSnapshot);
   }
-  if (pilot.quota.enabled && usage.usedTotalTokens + usage.reservedTotalTokens + estimate > pilot.quota.dailyTotalTokenLimit) {
+  if (quota.enabled && usage.usedTotalTokens + usage.reservedTotalTokens + estimate > quota.dailyTotalTokenLimit) {
     throw new CateoPilotQuotaError("token_limit_exceeded", "This pilot profile does not have enough remaining token budget for another queued job.", 429, currentSnapshot);
   }
-  if (pilot.quota.enabled && (usage.usedInputTokens >= pilot.quota.dailyInputTokenLimit || usage.usedOutputTokens >= pilot.quota.dailyOutputTokenLimit)) {
+  if (quota.enabled && (usage.usedInputTokens >= quota.dailyInputTokenLimit || usage.usedOutputTokens >= quota.dailyOutputTokenLimit)) {
     throw new CateoPilotQuotaError("directional_token_limit_exceeded", "This pilot profile has exhausted a daily token budget bucket.", 429, currentSnapshot);
   }
 
@@ -609,3 +640,4 @@ export function listPilotProfiles(config: CashClawConfig): CateoProfileSnapshot[
     .map((record) => toProfileSnapshot(config, { ...record, usage: normalizeUsageDay(record) }))
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
+

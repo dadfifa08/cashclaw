@@ -15,6 +15,20 @@ export type CateoTaskClass =
   | "documentation"
   | "mixed";
 
+
+export type CateoProductOffering =
+  | "troubleshooting-guide"
+  | "preventive-maintenance-report"
+  | "deviation-investigation-report"
+  | "audit-ready-documentation-package"
+  | "work-instructions-sop"
+  | "validation-qualification-protocol"
+  | "predictive-failure-analysis"
+  | "fmea"
+  | "cost-impact-downtime-report"
+  | "parts-inventory-optimization"
+  | "digital-twin-comparison-report"
+  | "camera-based-diagnostic-report";
 export type CateoSkillExposure = "public" | "cashclaw" | "both";
 
 export type CateoApprovalState = "draft" | "reviewed" | "approved";
@@ -113,6 +127,9 @@ export interface CateoWorkOrderLink {
   title?: string;
   priority?: "low" | "medium" | "high" | "critical";
   status?: string;
+  productOffering?: CateoProductOffering;
+  partNumber?: string;
+  contextNotes?: string;
 }
 
 export interface CateoServiceHistoryEntry {
@@ -213,6 +230,9 @@ export interface CateoAssistInput {
   title?: string;
   query?: string;
   errorCode?: string;
+  productOffering?: CateoProductOffering;
+  partNumber?: string;
+  contextNotes?: string;
   symptomDescription: string;
   observedConditions?: string[];
   asset?: CateoAssetRegistryLink;
@@ -906,6 +926,7 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
 
 
 

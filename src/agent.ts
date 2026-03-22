@@ -1691,15 +1691,15 @@ async function handleApprovalDecision(
 function serveStatic(pathname: string, res: http.ServerResponse) {
   const baseDir = import.meta.dirname;
   const distUi = path.join(baseDir, "..", "dist", "ui");
-  const uiDir = fs.existsSync(path.join(distUi, "index.html")) ? distUi : path.join(baseDir, "ui");
-  const resolvedUiDir = path.resolve(uiDir);
-  let filePath = path.resolve(uiDir, pathname === "/" ? "index.html" : pathname.slice(1));
-
-  if (!filePath.startsWith(resolvedUiDir)) {
-    res.writeHead(403);
-    res.end("Forbidden");
+  const builtIndex = path.join(distUi, "index.html");
+  if (!fs.existsSync(builtIndex)) {
+    res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Dashboard assets are unavailable. Run npm run build:ui or restart Cateo.");
     return;
   }
+
+  const resolvedUiDir = path.resolve(distUi);
+  let filePath = path.resolve(distUi, pathname === "/" ? "index.html" : pathname.slice(1));
 
   if (!path.extname(filePath)) {
     filePath = path.join(resolvedUiDir, "index.html");
@@ -1728,6 +1728,7 @@ function serveStatic(pathname: string, res: http.ServerResponse) {
   res.writeHead(200, { "Content-Type": mimeTypes[path.extname(filePath)] ?? "application/octet-stream" });
   fs.createReadStream(filePath).pipe(res);
 }
+
 
 
 
