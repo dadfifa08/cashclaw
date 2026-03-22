@@ -2,7 +2,8 @@ import http from "node:http";
 import type { CashClawConfig } from "../config.js";
 import { readRequestBody } from "../system/request_body.js";
 import { buildCommandCenterSnapshot } from "./metrics.js";
-import { fetchRedditReviewQueue, listAdminArtifacts, listAdminCases, listAdminConversations, listViewerCases, submitRedditReviewDecision } from "./admin_views.js";
+import { createReportingPack, deleteAdminView, listReportingPacks, listSavedAdminViews, saveAdminView } from "./admin_packs.js";
+import { fetchRedditReviewQueue, listAdminArtifacts, listAdminCases, listAdminConversations, listAdminPartMaster, listViewerCases, loadAdminArtifactDetail, loadAdminCaseDetail, loadAdminPartDetail, loadAdminTaxonomy, submitRedditReviewDecision } from "./admin_views.js";
 import {
   beginPublicUserTwoFactorSetup,
   CateoPublicAuthError,
@@ -359,7 +360,88 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
       json(res, { ok: true, items, stats: { total: items.length, approved: items.filter((item) => item.approvalState === "approved").length, reviewed: items.filter((item) => item.approvalState === "reviewed").length, draft: items.filter((item) => item.approvalState === "draft").length }, session });
       return true;
     }
-    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reddit/reviews`) {
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/parts`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const filters = {
+        q: url.searchParams.get("q")?.trim() || undefined,
+        manufacturer: url.searchParams.get("manufacturer")?.trim() || undefined,
+        productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
+        failureCode: url.searchParams.get("failureCode")?.trim() || undefined,
+        partNumber: url.searchParams.get("partNumber")?.trim() || undefined,
+      };
+      const items = listAdminPartMaster(filters);
+      json(res, {
+        ok: true,
+        items,
+        stats: {
+          total: items.length,
+          released: items.filter((item) => item.releasedArtifactCount > 0).length,
+          duplicateArtifacts: items.reduce((sum, item) => sum + item.duplicateArtifactCount, 0),
+        },
+        session,
+      });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/taxonomy`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      json(res, { ok: true, taxonomy: loadAdminTaxonomy(), session });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/views`) {
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      if (req.method === "GET") {
+        json(res, { ok: true, items: listSavedAdminViews(activeSession.user.userId), session: activeSession });
+        return true;
+      }
+      if (req.method === "POST") {
+        const body = parseJson<{ title: string; description?: string; scope: "command-center" | "cases" | "conversations" | "artifacts" | "parts"; filters: Record<string, string | undefined> }>(await readBody(req));
+        const item = saveAdminView({
+          title: body.title,
+          description: body.description,
+          scope: body.scope,
+          filters: body.filters,
+          ownerUserId: activeSession.user.userId,
+          ownerDisplayName: activeSession.user.displayName,
+        });
+        json(res, { ok: true, item, items: listSavedAdminViews(activeSession.user.userId), session: activeSession });
+        return true;
+      }
+      json(res, { error: "GET or POST only" }, 405);
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/views/delete`) {
+      if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      const body = parseJson<{ viewId: string }>(await readBody(req));
+      deleteAdminView(body.viewId, activeSession.user.userId);
+      json(res, { ok: true, items: listSavedAdminViews(activeSession.user.userId), session: activeSession });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reporting-packs`) {
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      if (req.method === "GET") {
+        json(res, { ok: true, items: listReportingPacks(), session: activeSession });
+        return true;
+      }
+      if (req.method === "POST") {
+        const body = parseJson<{ title: string; description?: string; filters: Record<string, string | undefined> }>(await readBody(req));
+        const item = createReportingPack({
+          title: body.title,
+          description: body.description,
+          filters: body.filters,
+          generatedBy: activeSession.user.displayName || activeSession.user.email || activeSession.user.username || activeSession.user.userId,
+        });
+        json(res, { ok: true, item, items: listReportingPacks(), session: activeSession });
+        return true;
+      }
+      json(res, { error: "GET or POST only" }, 405);
+      return true;
+    }    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reddit/reviews`) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
       if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
       const reddit = await fetchRedditReviewQueue();
@@ -383,7 +465,33 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/profiles/update`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const body = parseJson<{ profileId: string; status?: "active" | "suspended"; serviceTier?: "free" | "reviewed" | "enterprise"; reviewedOutputs?: boolean; artifactDownloadAccess?: boolean; displayName?: string; organization?: string }>(await readBody(req)); const profile = updatePilotProfileAdmin(config, body.profileId, body, requestId); json(res, { ok: true, profile, session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/transcribe`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!requesterId) { json(res, { error: "Missing or invalid X-Cateo-Client-Id" }, 400); return true; } const body = parseJson<{ name?: string; mimeType?: string; contentBase64: string }>(await readBody(req)); const transcript = await transcribeAudioWithOpenAI(config, { ...body, requesterId }, requestId); json(res, { ok: true, transcript, session }); return true; }
 
-    const conversationMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)$/);
+    const adminCaseMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/cases\/([^/]+)$/);
+    if (adminCaseMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const detail = loadAdminCaseDetail(decodeURIComponent(adminCaseMatch[1]));
+      if (!detail) { json(res, { error: "Case not found" }, 404); return true; }
+      json(res, { ok: true, detail, session });
+      return true;
+    }
+    const adminArtifactMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/artifacts\/([^/]+)$/);
+    if (adminArtifactMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const detail = loadAdminArtifactDetail(decodeURIComponent(adminArtifactMatch[1]));
+      if (!detail) { json(res, { error: "Artifact not found" }, 404); return true; }
+      json(res, { ok: true, detail, session });
+      return true;
+    }
+    const adminPartMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/parts\/([^/]+)$/);
+    if (adminPartMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const detail = loadAdminPartDetail(decodeURIComponent(adminPartMatch[1]));
+      if (!detail) { json(res, { error: "Part not found" }, 404); return true; }
+      json(res, { ok: true, detail, session });
+      return true;
+    }    const conversationMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)$/);
     if (conversationMatch) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } const conversation = await syncConversationJobs(decodeURIComponent(conversationMatch[1]), requesterId); if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; } json(res, { ok: true, conversation, session }); return true; }
     const saveMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/save$/);
     if (saveMatch) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } const body = parseJson<{ saved: boolean }>(await readBody(req)); const conversation = setConversationSaved(decodeURIComponent(saveMatch[1]), viewer, !!body.saved); json(res, { ok: true, conversation }); return true; }
@@ -406,6 +514,9 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
   }
   return false;
 }
+
+
+
 
 
 

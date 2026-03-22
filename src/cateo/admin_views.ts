@@ -1,4 +1,6 @@
 import { listConversationSummaries, loadConversationRecord } from "./conversations.js";
+import { buildCateoApprovalMatrix, type CateoApprovalMatrix } from "./approval_matrix.js";
+import { getCateoControlledTaxonomy, getCateoPartMasterRecord, listCateoPartMasterRecords, type CateoControlledTaxonomySnapshot, type CateoPartMasterRecord } from "./part_master.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows } from "./store.js";
 import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
 
@@ -441,4 +443,176 @@ export async function submitRedditReviewDecision(input: { replyQueueId: number; 
   } finally {
     clearTimeout(timer);
   }
+}
+
+
+
+function toAdminArtifactItemFromRecord(artifact: CateoArtifactRecord, linkedCase?: CateoCaseRecord | null): AdminArtifactItem | null {
+  const latest = artifact.revisions.at(-1);
+  if (!latest) return null;
+  return {
+    artifactId: artifact.artifactId,
+    artifactType: artifact.artifactType,
+    title: latest.metadata?.artifactTitle,
+    summary: latest.summary,
+    approvalState: latest.approvalState,
+    revisionNumber: latest.revisionNumber,
+    updatedAt: artifact.updatedAt,
+    assetId: artifact.assetId,
+    workOrderId: artifact.workOrderId,
+    partNumber: latest.metadata?.parts?.primaryPartNumber ?? latest.metadata?.partNumber,
+    failureCode: latest.metadata?.classification?.failureCode,
+    taxonomyTags: latest.metadata?.taxonomyTags ?? [],
+    serviceTier: linkedCase?.requester?.serviceTier,
+    workflowMode: linkedCase?.input.workflow?.mode,
+    productOffering: linkedCase?.input.productOffering,
+    displayName: linkedCase?.requester?.displayName,
+    organization: linkedCase?.requester?.organization,
+    duplicateState: artifact.duplicateState,
+    caseId: artifact.caseId,
+  };
+}
+
+export interface AdminTimelineItem {
+  timelineId: string;
+  label: string;
+  detail: string;
+  timestamp: string;
+  tone: "info" | "warn" | "critical";
+}
+
+export interface AdminCaseDetail {
+  item: AdminCaseItem;
+  record: CateoCaseRecord;
+  approvalMatrix: CateoApprovalMatrix;
+  partRecord: CateoPartMasterRecord | null;
+  relatedArtifacts: AdminArtifactItem[];
+  conversation: ReturnType<typeof loadConversationRecord>;
+  timeline: AdminTimelineItem[];
+  taxonomy: CateoControlledTaxonomySnapshot;
+}
+
+export interface AdminArtifactDetail {
+  item: AdminArtifactItem;
+  record: CateoArtifactRecord;
+  caseItem: AdminCaseItem | null;
+  approvalMatrix: CateoApprovalMatrix | null;
+  partRecord: CateoPartMasterRecord | null;
+  timeline: AdminTimelineItem[];
+}
+
+export interface AdminPartDetail {
+  part: CateoPartMasterRecord;
+  relatedCases: AdminCaseItem[];
+  relatedArtifacts: AdminArtifactItem[];
+  taxonomy: CateoControlledTaxonomySnapshot;
+}
+
+function buildCaseTimeline(record: CateoCaseRecord, artifacts: CateoArtifactRecord[]): AdminTimelineItem[] {
+  const items: AdminTimelineItem[] = [
+    {
+      timelineId: `${record.caseId}-created`,
+      label: "Case created",
+      detail: record.input.workflow?.mode === "reviewed-document" ? "Structured reviewed-document intake captured." : "Conversational request captured.",
+      timestamp: record.createdAt,
+      tone: "info",
+    },
+    {
+      timelineId: `${record.caseId}-updated`,
+      label: "Latest case update",
+      detail: record.interaction?.releaseStatus === "available" ? "Released to the requester profile." : record.interaction?.releaseStatus === "clarification-required" ? "Blocked pending clarifying information." : "Awaiting controlled release or additional review.",
+      timestamp: record.updatedAt,
+      tone: record.interaction?.releaseStatus === "clarification-required" ? "warn" : "info",
+    },
+  ];
+
+  for (const artifact of artifacts) {
+    const latest = artifact.revisions.at(-1);
+    if (!latest) continue;
+    items.push({
+      timelineId: `${artifact.artifactId}-${latest.revisionId}`,
+      label: `${artifact.artifactType} rev ${latest.revisionNumber}`,
+      detail: `${latest.approvalState} · ${latest.summary}`,
+      timestamp: latest.createdAt,
+      tone: latest.approvalState === "approved" ? "info" : latest.approvalState === "reviewed" ? "info" : "warn",
+    });
+  }
+
+  return items.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+}
+
+function buildArtifactTimeline(record: CateoArtifactRecord): AdminTimelineItem[] {
+  return [...record.revisions]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .map((revision) => ({
+      timelineId: revision.revisionId,
+      label: `Revision ${revision.revisionNumber}`,
+      detail: `${revision.approvalState} · ${revision.summary}`,
+      timestamp: revision.createdAt,
+      tone: revision.approvalState === "approved" ? "info" : revision.approvalState === "reviewed" ? "info" : "warn",
+    }));
+}
+
+export function loadAdminCaseDetail(caseId: string): AdminCaseDetail | null {
+  const record = loadCaseRecord(caseId);
+  if (!record) return null;
+  const relatedArtifacts = record.artifacts
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+  const item = toAdminCaseItem(record);
+  return {
+    item,
+    record,
+    approvalMatrix: buildCateoApprovalMatrix(record, relatedArtifacts),
+    partRecord: getCateoPartMasterRecord(record.context.partResolution?.partNumber ?? record.input.partNumber ?? ""),
+    relatedArtifacts: relatedArtifacts
+      .map((artifact) => toAdminArtifactItemFromRecord(artifact, record))
+      .filter((artifact): artifact is AdminArtifactItem => Boolean(artifact)),
+    conversation: record.conversationId ? loadConversationRecord(record.conversationId) : null,
+    timeline: buildCaseTimeline(record, relatedArtifacts),
+    taxonomy: getCateoControlledTaxonomy(),
+  };
+}
+
+export function loadAdminArtifactDetail(artifactId: string): AdminArtifactDetail | null {
+  const record = loadArtifactRecord(artifactId);
+  if (!record) return null;
+  const linkedCase = loadCaseRecord(record.caseId);
+  const item = toAdminArtifactItemFromRecord(record, linkedCase);
+  if (!item) return null;
+  return {
+    item,
+    record,
+    caseItem: linkedCase ? toAdminCaseItem(linkedCase) : null,
+    approvalMatrix: linkedCase ? buildCateoApprovalMatrix(linkedCase, [record]) : null,
+    partRecord: getCateoPartMasterRecord(item.partNumber ?? ""),
+    timeline: buildArtifactTimeline(record),
+  };
+}
+
+export function listAdminPartMaster(filters: Record<string, string | undefined> = {}): CateoPartMasterRecord[] {
+  return listCateoPartMasterRecords({
+    q: filters.q,
+    manufacturer: filters.manufacturer,
+    productOffering: filters.productOffering,
+    failureCode: filters.failureCode,
+    partNumber: filters.partNumber,
+  });
+}
+
+export function loadAdminPartDetail(partNumber: string): AdminPartDetail | null {
+  const part = getCateoPartMasterRecord(partNumber);
+  if (!part) return null;
+  const relatedCases = listAdminCases({ partNumber: part.canonicalPartNumber }).filter((item) => part.caseIds.includes(item.caseId));
+  const relatedArtifacts = listAdminArtifacts({ partNumber: part.canonicalPartNumber }).filter((item) => part.artifactIds.includes(item.artifactId));
+  return {
+    part,
+    relatedCases,
+    relatedArtifacts,
+    taxonomy: getCateoControlledTaxonomy(),
+  };
+}
+
+export function loadAdminTaxonomy(): CateoControlledTaxonomySnapshot {
+  return getCateoControlledTaxonomy();
 }

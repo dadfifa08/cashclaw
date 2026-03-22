@@ -1,0 +1,452 @@
+import path from "node:path";
+import { getConfigDir } from "../config.js";
+import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import type { CateoArtifactRecord, CateoArtifactRelation, CateoCaseRecord, CateoProductOffering, CateoRiskTier, CateoTaskClass } from "./types.js";
+
+const PART_MASTER_VERSION = "cateo-part-master-v1";
+
+export interface CateoTaxonomyValuePoint {
+  label: string;
+  count: number;
+  samples: string[];
+}
+
+export interface CateoControlledTaxonomySnapshot {
+  version: string;
+  updatedAt: string;
+  dimensions: {
+    domains: CateoTaxonomyValuePoint[];
+    disciplines: CateoTaxonomyValuePoint[];
+    subsystems: CateoTaxonomyValuePoint[];
+    failureMechanisms: CateoTaxonomyValuePoint[];
+    failureEffects: CateoTaxonomyValuePoint[];
+    operatingStates: CateoTaxonomyValuePoint[];
+    environments: CateoTaxonomyValuePoint[];
+    componentPaths: CateoTaxonomyValuePoint[];
+    locationPaths: CateoTaxonomyValuePoint[];
+    failureCodes: CateoTaxonomyValuePoint[];
+    productOfferings: CateoTaxonomyValuePoint[];
+    taskClasses: CateoTaxonomyValuePoint[];
+  };
+}
+
+export interface CateoPartMasterRecord {
+  canonicalPartNumber: string;
+  normalizedPartNumber: string;
+  displayTitle: string;
+  description?: string;
+  manufacturer?: string;
+  partFamily?: string;
+  aliases: string[];
+  interchangeablePartNumbers: string[];
+  componentTitles: string[];
+  taxonomyTags: string[];
+  productOfferings: CateoProductOffering[];
+  taskClasses: CateoTaskClass[];
+  failureCodes: string[];
+  failureModes: string[];
+  organizations: string[];
+  assetIds: string[];
+  workOrderIds: string[];
+  artifactIds: string[];
+  caseIds: string[];
+  relationTargets: string[];
+  approvalStates: Record<string, number>;
+  riskTiers: CateoRiskTier[];
+  lastSeenAt: string;
+  sourceEvidenceCount: number;
+  duplicateArtifactCount: number;
+  releasedArtifactCount: number;
+  taxonomy: {
+    domains: string[];
+    disciplines: string[];
+    subsystems: string[];
+    failureMechanisms: string[];
+    failureEffects: string[];
+    operatingStates: string[];
+    environments: string[];
+    componentPaths: string[];
+    locationPaths: string[];
+  };
+}
+
+export interface CateoPartMasterSnapshot {
+  version: string;
+  updatedAt: string;
+  stats: {
+    partCount: number;
+    manufacturerCount: number;
+    duplicateArtifactCount: number;
+    releasedArtifactCount: number;
+    unresolvedPartCount: number;
+  };
+  parts: CateoPartMasterRecord[];
+  taxonomy: CateoControlledTaxonomySnapshot;
+}
+
+export interface CateoPartMasterFilters {
+  q?: string;
+  manufacturer?: string;
+  productOffering?: string;
+  failureCode?: string;
+  partNumber?: string;
+}
+
+function partMasterPath(): string {
+  return path.join(getConfigDir(), "cateo", "db", "part_master.json");
+}
+
+function unique(values: Array<string | undefined | null>): string[] {
+  return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
+}
+
+function normalizePartNumber(value: string | undefined | null): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return trimmed.toUpperCase().replace(/\s+/g, "");
+}
+
+function displayPartNumber(value: string | undefined | null): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.toUpperCase() : null;
+}
+
+function pushTaxonomy(map: Map<string, { count: number; samples: Set<string> }>, label: string | undefined | null, sample?: string | undefined | null): void {
+  const normalized = label?.trim();
+  if (!normalized) return;
+  const current = map.get(normalized) ?? { count: 0, samples: new Set<string>() };
+  current.count += 1;
+  if (sample?.trim()) current.samples.add(sample.trim());
+  map.set(normalized, current);
+}
+
+function toTaxonomyPoints(map: Map<string, { count: number; samples: Set<string> }>, limit = 24): CateoTaxonomyValuePoint[] {
+  return [...map.entries()]
+    .sort((left, right) => right[1].count - left[1].count || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([label, value]) => ({
+      label,
+      count: value.count,
+      samples: [...value.samples].sort().slice(0, 6),
+    }));
+}
+
+function appendRelationTargets(targets: string[], relations: CateoArtifactRelation[] | undefined): string[] {
+  if (!relations || relations.length === 0) return targets;
+  return unique([
+    ...targets,
+    ...relations.map((relation) => `${relation.targetType}:${relation.targetId}`),
+  ]);
+}
+
+function emptyTaxonomySnapshot(): CateoControlledTaxonomySnapshot {
+  return {
+    version: PART_MASTER_VERSION,
+    updatedAt: new Date(0).toISOString(),
+    dimensions: {
+      domains: [],
+      disciplines: [],
+      subsystems: [],
+      failureMechanisms: [],
+      failureEffects: [],
+      operatingStates: [],
+      environments: [],
+      componentPaths: [],
+      locationPaths: [],
+      failureCodes: [],
+      productOfferings: [],
+      taskClasses: [],
+    },
+  };
+}
+
+function emptySnapshot(): CateoPartMasterSnapshot {
+  return {
+    version: PART_MASTER_VERSION,
+    updatedAt: new Date(0).toISOString(),
+    stats: {
+      partCount: 0,
+      manufacturerCount: 0,
+      duplicateArtifactCount: 0,
+      releasedArtifactCount: 0,
+      unresolvedPartCount: 0,
+    },
+    parts: [],
+    taxonomy: emptyTaxonomySnapshot(),
+  };
+}
+
+function collectPartNumbers(record: CateoArtifactRecord, linkedCase?: CateoCaseRecord | null): string[] {
+  const latest = record.revisions.at(-1);
+  const metadata = latest?.metadata;
+  return unique([
+    metadata?.parts?.primaryPartNumber,
+    metadata?.partNumber,
+    linkedCase?.context.partResolution?.partNumber,
+    linkedCase?.input.partNumber,
+    ...(metadata?.parts?.requiredPartLines ?? []).map((line) => line.partNumber),
+  ]);
+}
+
+export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecord[]; caseRecords: CateoCaseRecord[] }): CateoPartMasterSnapshot {
+  const caseById = new Map(args.caseRecords.map((record) => [record.caseId, record]));
+  const partMap = new Map<string, CateoPartMasterRecord>();
+  const manufacturers = new Set<string>();
+  const domains = new Map<string, { count: number; samples: Set<string> }>();
+  const disciplines = new Map<string, { count: number; samples: Set<string> }>();
+  const subsystems = new Map<string, { count: number; samples: Set<string> }>();
+  const failureMechanisms = new Map<string, { count: number; samples: Set<string> }>();
+  const failureEffects = new Map<string, { count: number; samples: Set<string> }>();
+  const operatingStates = new Map<string, { count: number; samples: Set<string> }>();
+  const environments = new Map<string, { count: number; samples: Set<string> }>();
+  const componentPaths = new Map<string, { count: number; samples: Set<string> }>();
+  const locationPaths = new Map<string, { count: number; samples: Set<string> }>();
+  const failureCodes = new Map<string, { count: number; samples: Set<string> }>();
+  const productOfferings = new Map<string, { count: number; samples: Set<string> }>();
+  const taskClasses = new Map<string, { count: number; samples: Set<string> }>();
+
+  for (const artifact of args.artifactRecords) {
+    const latest = artifact.revisions.at(-1);
+    const metadata = latest?.metadata;
+    if (!latest || !metadata) continue;
+    const linkedCase = caseById.get(artifact.caseId) ?? null;
+    const partNumbers = collectPartNumbers(artifact, linkedCase);
+    if (partNumbers.length === 0) continue;
+
+    for (const rawPartNumber of partNumbers) {
+      const normalizedPart = normalizePartNumber(rawPartNumber);
+      if (!normalizedPart) continue;
+      const current = partMap.get(normalizedPart) ?? {
+        canonicalPartNumber: displayPartNumber(rawPartNumber) ?? normalizedPart,
+        normalizedPartNumber: normalizedPart,
+        displayTitle: metadata.parts?.primaryPartDescription ?? metadata.partDescription ?? metadata.artifactTitle ?? normalizedPart,
+        description: metadata.parts?.primaryPartDescription ?? metadata.partDescription ?? undefined,
+        manufacturer: metadata.asset?.manufacturer ?? undefined,
+        partFamily: metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily,
+        aliases: [],
+        interchangeablePartNumbers: [],
+        componentTitles: [],
+        taxonomyTags: [],
+        productOfferings: [],
+        taskClasses: [],
+        failureCodes: [],
+        failureModes: [],
+        organizations: [],
+        assetIds: [],
+        workOrderIds: [],
+        artifactIds: [],
+        caseIds: [],
+        relationTargets: [],
+        approvalStates: {},
+        riskTiers: [],
+        lastSeenAt: artifact.updatedAt,
+        sourceEvidenceCount: 0,
+        duplicateArtifactCount: 0,
+        releasedArtifactCount: 0,
+        taxonomy: {
+          domains: [],
+          disciplines: [],
+          subsystems: [],
+          failureMechanisms: [],
+          failureEffects: [],
+          operatingStates: [],
+          environments: [],
+          componentPaths: [],
+          locationPaths: [],
+        },
+      } satisfies CateoPartMasterRecord;
+
+      current.canonicalPartNumber = current.canonicalPartNumber || (displayPartNumber(rawPartNumber) ?? normalizedPart);
+      current.displayTitle = current.displayTitle || metadata.partDescription || normalizedPart;
+      current.description = current.description || metadata.parts?.primaryPartDescription || metadata.partDescription || undefined;
+      current.manufacturer = current.manufacturer || metadata.asset?.manufacturer || undefined;
+      current.partFamily = current.partFamily || metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily || undefined;
+      current.aliases = unique([
+        ...current.aliases,
+        ...partNumbers,
+        metadata.partNumber,
+        ...(metadata.parts?.requiredPartLines ?? []).map((line) => line.partNumber),
+      ]);
+      current.interchangeablePartNumbers = unique([
+        ...current.interchangeablePartNumbers,
+        ...(metadata.parts?.interchangeablePartNumbers ?? []),
+        ...(metadata.parts?.requiredPartLines ?? []).flatMap((line) => line.interchangeablePartNumbers ?? []),
+      ]);
+      current.componentTitles = unique([...current.componentTitles, metadata.componentTitle]);
+      current.taxonomyTags = unique([...current.taxonomyTags, ...(metadata.taxonomyTags ?? [])]);
+      current.productOfferings = unique([...current.productOfferings, linkedCase?.input.productOffering]) as CateoProductOffering[];
+      current.taskClasses = unique([...current.taskClasses, linkedCase?.context.taskClass, metadata.taskClass]) as CateoTaskClass[];
+      current.failureCodes = unique([...current.failureCodes, metadata.classification?.failureCode, linkedCase?.context.failureCode?.code]);
+      current.failureModes = unique([...current.failureModes, metadata.classification?.failureMode, metadata.classification?.failureLabel]);
+      current.organizations = unique([...current.organizations, linkedCase?.requester?.organization]);
+      current.assetIds = unique([...current.assetIds, metadata.asset?.assetId, artifact.assetId]);
+      current.workOrderIds = unique([...current.workOrderIds, metadata.workOrder?.workOrderId, artifact.workOrderId]);
+      current.artifactIds = unique([...current.artifactIds, artifact.artifactId]);
+      current.caseIds = unique([...current.caseIds, artifact.caseId]);
+      current.relationTargets = appendRelationTargets(current.relationTargets, metadata.relations);
+      current.riskTiers = unique([...current.riskTiers, linkedCase?.input.workflow?.riskTier]) as CateoRiskTier[];
+      current.approvalStates[latest.approvalState] = (current.approvalStates[latest.approvalState] ?? 0) + 1;
+      current.lastSeenAt = current.lastSeenAt > artifact.updatedAt ? current.lastSeenAt : artifact.updatedAt;
+      current.sourceEvidenceCount += Math.max(1, metadata.evidence?.attachmentIds?.length ?? 0) + Math.max(0, metadata.evidence?.documentRefs?.length ?? 0);
+      if ((artifact.duplicateState ?? "canonical") !== "canonical") {
+        current.duplicateArtifactCount += 1;
+      }
+      if (latest.approvalState === "approved" || latest.approvalState === "reviewed") {
+        current.releasedArtifactCount += 1;
+      }
+      current.taxonomy.domains = unique([...current.taxonomy.domains, metadata.taxonomy.domain]);
+      current.taxonomy.disciplines = unique([...current.taxonomy.disciplines, metadata.taxonomy.discipline]);
+      current.taxonomy.subsystems = unique([...current.taxonomy.subsystems, metadata.taxonomy.subsystem]);
+      current.taxonomy.failureMechanisms = unique([...current.taxonomy.failureMechanisms, metadata.taxonomy.failureMechanism]);
+      current.taxonomy.failureEffects = unique([...current.taxonomy.failureEffects, metadata.taxonomy.failureEffect]);
+      current.taxonomy.operatingStates = unique([...current.taxonomy.operatingStates, metadata.taxonomy.operatingState]);
+      current.taxonomy.environments = unique([...current.taxonomy.environments, metadata.taxonomy.environment]);
+      current.taxonomy.componentPaths = unique([...current.taxonomy.componentPaths, metadata.taxonomy.componentPath?.join(" > ")]);
+      current.taxonomy.locationPaths = unique([...current.taxonomy.locationPaths, metadata.taxonomy.locationPath?.join(" > ")]);
+      partMap.set(normalizedPart, current);
+
+      if (current.manufacturer) manufacturers.add(current.manufacturer);
+      pushTaxonomy(domains, metadata.taxonomy.domain, current.canonicalPartNumber);
+      pushTaxonomy(disciplines, metadata.taxonomy.discipline, current.canonicalPartNumber);
+      pushTaxonomy(subsystems, metadata.taxonomy.subsystem, current.canonicalPartNumber);
+      pushTaxonomy(failureMechanisms, metadata.taxonomy.failureMechanism, current.canonicalPartNumber);
+      pushTaxonomy(failureEffects, metadata.taxonomy.failureEffect, current.canonicalPartNumber);
+      pushTaxonomy(operatingStates, metadata.taxonomy.operatingState, current.canonicalPartNumber);
+      pushTaxonomy(environments, metadata.taxonomy.environment, current.canonicalPartNumber);
+      pushTaxonomy(componentPaths, metadata.taxonomy.componentPath?.join(" > "), current.canonicalPartNumber);
+      pushTaxonomy(locationPaths, metadata.taxonomy.locationPath?.join(" > "), current.canonicalPartNumber);
+      pushTaxonomy(failureCodes, metadata.classification?.failureCode, current.canonicalPartNumber);
+      pushTaxonomy(productOfferings, linkedCase?.input.productOffering, current.canonicalPartNumber);
+      pushTaxonomy(taskClasses, linkedCase?.context.taskClass ?? metadata.taskClass, current.canonicalPartNumber);
+    }
+  }
+
+  for (const record of args.caseRecords) {
+    const resolvedPart = displayPartNumber(record.context.partResolution?.partNumber ?? record.input.partNumber);
+    const normalizedPart = normalizePartNumber(resolvedPart);
+    if (!normalizedPart || partMap.has(normalizedPart)) continue;
+    partMap.set(normalizedPart, {
+      canonicalPartNumber: resolvedPart ?? normalizedPart,
+      normalizedPartNumber: normalizedPart,
+      displayTitle: record.context.partResolution?.partDescription ?? record.context.title,
+      description: record.context.partResolution?.partDescription ?? undefined,
+      manufacturer: record.context.partResolution?.manufacturer ?? record.context.machine?.manufacturer ?? undefined,
+      partFamily: undefined,
+      aliases: unique([resolvedPart, ...(record.context.partResolution?.aliases ?? [])]),
+      interchangeablePartNumbers: [],
+      componentTitles: [],
+      taxonomyTags: [],
+      productOfferings: unique([record.input.productOffering]) as CateoProductOffering[],
+      taskClasses: unique([record.context.taskClass]) as CateoTaskClass[],
+      failureCodes: unique([record.context.failureCode?.code]),
+      failureModes: unique(record.context.partResolution?.failureModes ?? []),
+      organizations: unique([record.requester?.organization]),
+      assetIds: unique([record.context.asset?.assetId]),
+      workOrderIds: unique([record.context.workOrder?.workOrderId]),
+      artifactIds: unique(record.artifacts),
+      caseIds: [record.caseId],
+      relationTargets: [],
+      approvalStates: {},
+      riskTiers: unique([record.input.workflow?.riskTier]) as CateoRiskTier[],
+      lastSeenAt: record.updatedAt,
+      sourceEvidenceCount: Math.max(1, record.context.attachments.length + record.context.serviceHistory.length),
+      duplicateArtifactCount: 0,
+      releasedArtifactCount: 0,
+      taxonomy: {
+        domains: [],
+        disciplines: [],
+        subsystems: [],
+        failureMechanisms: [],
+        failureEffects: [],
+        operatingStates: [],
+        environments: [],
+        componentPaths: [],
+        locationPaths: unique(record.context.asset?.locationHierarchy ?? record.context.machine?.locationHierarchy ?? []),
+      },
+    });
+  }
+
+  const parts = [...partMap.values()].sort((left, right) => left.canonicalPartNumber.localeCompare(right.canonicalPartNumber));
+  const snapshot: CateoPartMasterSnapshot = {
+    version: PART_MASTER_VERSION,
+    updatedAt: new Date().toISOString(),
+    stats: {
+      partCount: parts.length,
+      manufacturerCount: manufacturers.size,
+      duplicateArtifactCount: parts.reduce((sum, part) => sum + part.duplicateArtifactCount, 0),
+      releasedArtifactCount: parts.reduce((sum, part) => sum + part.releasedArtifactCount, 0),
+      unresolvedPartCount: parts.filter((part) => !part.description || !part.manufacturer).length,
+    },
+    parts,
+    taxonomy: {
+      version: PART_MASTER_VERSION,
+      updatedAt: new Date().toISOString(),
+      dimensions: {
+        domains: toTaxonomyPoints(domains),
+        disciplines: toTaxonomyPoints(disciplines),
+        subsystems: toTaxonomyPoints(subsystems),
+        failureMechanisms: toTaxonomyPoints(failureMechanisms),
+        failureEffects: toTaxonomyPoints(failureEffects),
+        operatingStates: toTaxonomyPoints(operatingStates),
+        environments: toTaxonomyPoints(environments),
+        componentPaths: toTaxonomyPoints(componentPaths),
+        locationPaths: toTaxonomyPoints(locationPaths),
+        failureCodes: toTaxonomyPoints(failureCodes),
+        productOfferings: toTaxonomyPoints(productOfferings),
+        taskClasses: toTaxonomyPoints(taskClasses),
+      },
+    },
+  };
+  return snapshot;
+}
+
+export function syncCateoPartMaster(args: { artifactRecords: CateoArtifactRecord[]; caseRecords: CateoCaseRecord[] }): CateoPartMasterSnapshot {
+  const snapshot = buildCateoPartMaster(args);
+  writeProtectedJson(partMasterPath(), snapshot);
+  return snapshot;
+}
+
+export function loadCateoPartMaster(): CateoPartMasterSnapshot {
+  return readProtectedJson<CateoPartMasterSnapshot>(partMasterPath(), emptySnapshot());
+}
+
+export function listCateoPartMasterRecords(filters: CateoPartMasterFilters = {}): CateoPartMasterRecord[] {
+  const q = filters.q?.trim().toLowerCase();
+  const manufacturer = filters.manufacturer?.trim().toLowerCase();
+  const productOffering = filters.productOffering?.trim().toLowerCase();
+  const failureCode = filters.failureCode?.trim().toLowerCase();
+  const partNumber = filters.partNumber?.trim().toLowerCase();
+  return loadCateoPartMaster().parts
+    .filter((part) => {
+      const haystack = JSON.stringify({
+        canonicalPartNumber: part.canonicalPartNumber,
+        displayTitle: part.displayTitle,
+        description: part.description,
+        manufacturer: part.manufacturer,
+        aliases: part.aliases,
+        componentTitles: part.componentTitles,
+        organizations: part.organizations,
+        productOfferings: part.productOfferings,
+        failureCodes: part.failureCodes,
+        failureModes: part.failureModes,
+      }).toLowerCase();
+      if (q && !haystack.includes(q)) return false;
+      if (manufacturer && !(part.manufacturer ?? "").toLowerCase().includes(manufacturer)) return false;
+      if (productOffering && !part.productOfferings.some((value) => value.toLowerCase().includes(productOffering))) return false;
+      if (failureCode && !part.failureCodes.some((value) => value.toLowerCase().includes(failureCode))) return false;
+      if (partNumber && !part.canonicalPartNumber.toLowerCase().includes(partNumber) && !part.aliases.some((value) => value.toLowerCase().includes(partNumber))) return false;
+      return true;
+    })
+    .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt) || left.canonicalPartNumber.localeCompare(right.canonicalPartNumber));
+}
+
+export function getCateoPartMasterRecord(partNumber: string): CateoPartMasterRecord | null {
+  const normalizedPart = normalizePartNumber(partNumber);
+  if (!normalizedPart) return null;
+  return loadCateoPartMaster().parts.find((part) => part.normalizedPartNumber === normalizedPart) ?? null;
+}
+
+export function getCateoControlledTaxonomy(): CateoControlledTaxonomySnapshot {
+  return loadCateoPartMaster().taxonomy;
+}
+

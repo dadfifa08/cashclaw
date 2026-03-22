@@ -4,6 +4,7 @@ import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
 import { syncCateoOntology } from "./ontology.js";
+import { syncCateoPartMaster } from "./part_master.js";
 import { searchVectorIndex, upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
 import type {
   CateoArtifactContent,
@@ -278,6 +279,7 @@ function rebuildMaterializedIndexes(): void {
     .map((row) => readProtectedJson<CateoCaseRecord | null>(casePath(row.caseId), null))
     .filter((record): record is CateoCaseRecord => Boolean(record));
   syncCateoOntology({ artifactRecords, caseRecords });
+  syncCateoPartMaster({ artifactRecords, caseRecords });
 }
 
 export function buildJsonDiff(before: unknown, after: unknown): CateoJsonDiffEntry[] {
@@ -462,3 +464,4 @@ export function findSimilarArtifacts(params: {
     .sort((left, right) => right.score - left.score || right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, params.limit ?? 5);
 }
+
