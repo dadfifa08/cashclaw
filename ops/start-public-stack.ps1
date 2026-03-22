@@ -21,7 +21,8 @@ $PwshExe = if ($PwshCommand) { $PwshCommand.Source } else { "C:\Users\dadfi\AppD
 $BridgeRunner = (Resolve-Path (Join-Path $PSScriptRoot "run-site-bridge.ps1")).Path
 $NamedTunnelToken = $env:CATEO_CLOUDFLARE_TUNNEL_TOKEN
 $ConfiguredPublicUrl = if ($PublicUrl) { $PublicUrl.Trim().TrimEnd('/') } elseif ($env:CATEO_PUBLIC_BACKEND_URL) { $env:CATEO_PUBLIC_BACKEND_URL.Trim().TrimEnd('/') } else { $null }
-$TunnelMode = if ($NamedTunnelToken) { "named" } else { "quick" }
+$NamedTunnelReady = -not [string]::IsNullOrWhiteSpace($NamedTunnelToken) -and -not [string]::IsNullOrWhiteSpace($ConfiguredPublicUrl)
+$TunnelMode = if ($NamedTunnelReady) { "named" } else { "quick" }
 
 New-Item -ItemType Directory -Force $RuntimeDir | Out-Null
 
@@ -177,8 +178,8 @@ if (-not (Test-Path $CloudflaredExe)) {
   throw "cloudflared not found at $CloudflaredExe"
 }
 
-if ($TunnelMode -eq "named" -and -not $ConfiguredPublicUrl) {
-  throw "Set CATEO_PUBLIC_BACKEND_URL (or pass -PublicUrl) when using CATEO_CLOUDFLARE_TUNNEL_TOKEN."
+if ($NamedTunnelToken -and -not $ConfiguredPublicUrl) {
+  Write-Warning "CATEO_CLOUDFLARE_TUNNEL_TOKEN is set but CATEO_PUBLIC_BACKEND_URL is missing. Falling back to quick tunnel mode until the public hostname is ready."
 }
 
 $previousState = Read-State
