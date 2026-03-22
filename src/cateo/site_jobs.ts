@@ -478,6 +478,67 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+export function submitCompletedAssistJob(
+  input: CateoAssistInput,
+  result: AssistJobResult,
+  requesterId: string,
+  requestId?: string,
+  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean; statusDetail?: string },
+): AssistJobSnapshot {
+  compactJobs();
+  const now = Date.now();
+  const jobId = crypto.randomUUID();
+  const acceptedSequence = nextAcceptedSequence;
+  nextAcceptedSequence += 1;
+  const acceptedCheckpoint = createCheckpoint({
+    stage: "accepted",
+    status: "completed",
+    summary: "Request received and matched to an existing validated troubleshooting procedure.",
+  });
+  const completedCheckpoint = createCheckpoint({
+    stage: "completed",
+    status: "completed",
+    summary: options?.statusDetail || "Validated troubleshooting procedure returned immediately from the internal catalog.",
+    taskClass: result.context.taskClass,
+    confidence: result.interaction.confidence,
+    artifactTypes: result.artifacts.map((artifact) => artifact.artifactType),
+    artifactCount: result.artifacts.length,
+  });
+  const record: AssistJobRecord = {
+    jobId,
+    requesterId,
+    profileId: options?.profile?.profileId,
+    quotaReservationId: options?.quotaReservationId,
+    acceptedSequence,
+    title: deriveTitle(input),
+    promptPreview: derivePromptPreview(input),
+    status: "completed",
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    finishedAt: now,
+    requestId,
+    checkpoints: [acceptedCheckpoint, completedCheckpoint],
+    result,
+    profileDisplayName: options?.profile?.displayName,
+    profileOrganization: options?.profile?.organization,
+    profileServiceTier: options?.profile?.serviceTier,
+    requiresEngineerReview: options?.requiresEngineerReview ?? options?.profile?.reviewedOutputs ?? false,
+  };
+
+  jobs.set(jobId, record);
+  appendAuditEvent({
+    actor: "server",
+    category: "site_job",
+    action: "assist_completed_immediate",
+    outcome: "completed",
+    message: `Cateo site job ${jobId} completed immediately from the validated catalog`,
+    requestId,
+    metadata: { jobId, requesterId, profileId: record.profileId, acceptedSequence: record.acceptedSequence },
+  });
+  return snapshot(record);
+}
+
 export function submitAssistJob(
   input: CateoAssistInput,
   requesterId: string,

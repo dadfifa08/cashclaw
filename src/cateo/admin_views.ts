@@ -25,7 +25,9 @@ export interface AdminCaseItem {
   taskClass: CateoTaskClass;
   productOffering?: CateoProductOffering;
   workflowMode?: CateoWorkflowMode;
+  businessType?: string;
   partNumber?: string;
+  issueType?: string;
   serviceTier?: CateoServiceTier;
   releaseStatus?: CateoInteractionReleaseStatus;
   confidence?: CateoConfidence;
@@ -61,7 +63,9 @@ export interface AdminConversationItem {
   lastMessagePreview?: string;
   productOffering?: CateoProductOffering;
   workflowMode?: CateoWorkflowMode;
+  businessType?: string;
   partNumber?: string;
+  issueType?: string;
   releaseStatus?: CateoInteractionReleaseStatus;
   serviceTier?: CateoServiceTier;
   displayName?: string;
@@ -80,6 +84,8 @@ export interface AdminArtifactItem {
   assetId?: string;
   workOrderId?: string;
   partNumber?: string;
+  businessType?: string;
+  issueType?: string;
   failureCode?: string;
   taxonomyTags: string[];
   serviceTier?: CateoServiceTier;
@@ -185,7 +191,9 @@ function toAdminCaseItem(record: CateoCaseRecord): AdminCaseItem {
     taskClass: record.context.taskClass,
     productOffering: record.input.productOffering,
     workflowMode: record.input.workflow?.mode,
+    businessType: record.input.businessType ?? record.context.businessType,
     partNumber: record.context.partResolution?.partNumber ?? record.input.partNumber,
+    issueType: record.context.issueType ?? record.input.issueType ?? record.input.errorCode,
     serviceTier: record.requester?.serviceTier,
     releaseStatus: record.interaction?.releaseStatus,
     confidence: record.interaction?.confidence,
@@ -218,6 +226,8 @@ function matchesCaseFilters(item: AdminCaseItem, filters: Record<string, string 
     item.taskClass,
     item.productOffering,
     item.partNumber,
+    item.businessType,
+    item.issueType,
     item.displayName,
     item.organization,
     item.assetId,
@@ -287,7 +297,9 @@ export function listAdminConversations(filters: Record<string, string | undefine
         lastMessagePreview: summary.lastMessagePreview,
         productOffering: related?.productOffering,
         workflowMode: related?.workflowMode,
+        businessType: related?.businessType,
         partNumber: related?.partNumber,
+        issueType: related?.issueType,
         releaseStatus: related?.releaseStatus,
         serviceTier: related?.serviceTier,
         displayName: related?.displayName,
@@ -295,7 +307,7 @@ export function listAdminConversations(filters: Record<string, string | undefine
         caseId: related?.caseId,
       } satisfies AdminConversationItem;
     })
-    .filter((item) => includesFilter([item.title, item.lastMessagePreview, item.productOffering, item.partNumber, item.displayName, item.organization], q))
+    .filter((item) => includesFilter([item.title, item.lastMessagePreview, item.productOffering, item.businessType, item.partNumber, item.issueType, item.displayName, item.organization], q))
     .filter((item) => !filters.productOffering || item.productOffering === filters.productOffering)
     .filter((item) => !filters.releaseStatus || item.releaseStatus === filters.releaseStatus)
     .filter((item) => !filters.serviceTier || item.serviceTier === filters.serviceTier)
@@ -324,6 +336,8 @@ export function listAdminArtifacts(filters: Record<string, string | undefined> =
         assetId: row.assetId,
         workOrderId: row.workOrderId,
         partNumber: row.partNumber,
+        businessType: row.businessType,
+        issueType: row.issueType,
         failureCode: row.failureCode,
         taxonomyTags: row.taxonomyTags,
         serviceTier: linkedCase?.requester?.serviceTier,
@@ -336,7 +350,7 @@ export function listAdminArtifacts(filters: Record<string, string | undefined> =
       };
     })
     .filter((item): item is AdminArtifactItem => item !== null)
-    .filter((item) => includesFilter([item.title, item.summary, item.partNumber, item.failureCode, item.assetId, item.workOrderId, item.productOffering, item.displayName, item.organization, ...(item.taxonomyTags ?? [])], q))
+    .filter((item) => includesFilter([item.title, item.summary, item.partNumber, item.businessType, item.issueType, item.failureCode, item.assetId, item.workOrderId, item.productOffering, item.displayName, item.organization, ...(item.taxonomyTags ?? [])], q))
     .filter((item) => !filters.artifactType || item.artifactType === filters.artifactType)
     .filter((item) => !filters.approvalState || item.approvalState === filters.approvalState)
     .filter((item) => !filters.productOffering || item.productOffering === filters.productOffering)
@@ -461,6 +475,8 @@ function toAdminArtifactItemFromRecord(artifact: CateoArtifactRecord, linkedCase
     assetId: artifact.assetId,
     workOrderId: artifact.workOrderId,
     partNumber: latest.metadata?.parts?.primaryPartNumber ?? latest.metadata?.partNumber,
+    businessType: latest.metadata?.businessType,
+    issueType: latest.metadata?.classification?.failureLabel ?? latest.metadata?.classification?.failureMode,
     failureCode: latest.metadata?.classification?.failureCode,
     taxonomyTags: latest.metadata?.taxonomyTags ?? [],
     serviceTier: linkedCase?.requester?.serviceTier,

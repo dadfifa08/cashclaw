@@ -8,7 +8,8 @@ import { buildCateoContext, inferRequestedArtifacts } from "./context.js";
 import { renderCateoInteraction } from "./render.js";
 import { getSchemaRef, validateArtifactContent } from "./schemas.js";
 import { evaluateArtifactPackageRules, summarizeRuleOutcomes } from "./rules.js";
-import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
+import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, loadCaseRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
+import { persistTroubleshootingReportPackage } from "./report_exports.js";
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
@@ -26,6 +27,7 @@ import type {
   CateoArtifactType,
   CateoAssistInput,
   CateoAssistResult,
+  CateoCaseRecord,
   CateoBuilderPackage,
   CateoChallengerCritique,
   CateoConfidence,
@@ -37,6 +39,7 @@ import type {
   CateoInteractionCheckpoint,
   CateoLeadPlan,
   CateoRequesterInfo,
+  CateoReasoningTrace,
   CateoPartCatalogEntry,
   CateoPartsToolsList,
   CateoReviewerDecision,
@@ -906,6 +909,363 @@ function shouldMergeArtifact(candidate: CateoArtifactLookupCandidate | undefined
   if (candidate.basis.includes("asset_exact") && candidate.score >= 0.58) return true;
   if (candidate.basis.includes("work_order_exact") && candidate.score >= 0.5) return true;
   return false;
+}
+
+function normalizedText(value: string | undefined | null): string | undefined {
+  const trimmed = value?.trim().toLowerCase();
+  return trimmed || undefined;
+}
+
+function valuesInclude(haystacks: Array<string | undefined | null>, needles: Array<string | undefined | null>): boolean {
+  const normalizedHaystack = haystacks.map((value) => normalizedText(value)).filter((value): value is string => Boolean(value));
+  const normalizedNeedles = needles.map((value) => normalizedText(value)).filter((value): value is string => Boolean(value));
+  if (normalizedNeedles.length === 0) {
+    return false;
+  }
+  return normalizedNeedles.some((needle) => normalizedHaystack.some((haystack) => haystack.includes(needle) || needle.includes(haystack)));
+}
+
+function reuseIssueSignals(input: CateoAssistInput, context: CateoContextBundle): string[] {
+  return uniqueStrings([
+    input.issueType,
+    input.errorCode,
+    context.issueType,
+    context.failureCode?.code,
+    context.failureCode?.label,
+    context.taskClass,
+  ]);
+}
+
+function reuseSystemSignals(input: CateoAssistInput, context: CateoContextBundle): string[] {
+  return uniqueStrings([
+    context.asset?.assetId,
+    context.asset?.assetType,
+    context.asset?.model,
+    context.machine?.manufacturer,
+    context.machine?.model,
+    input.title,
+  ]);
+}
+
+function scoreProcedureReuseCandidate(params: {
+  candidate: CateoArtifactLookupCandidate;
+  artifact: CateoArtifactRecord;
+  input: CateoAssistInput;
+  context: CateoContextBundle;
+}): number {
+  const latest = params.artifact.revisions.at(-1);
+  const metadata = latest?.metadata;
+  if (!latest || !metadata) {
+    return -1;
+  }
+  if (latest.approvalState === "draft") {
+    return -1;
+  }
+  const requestedPart = normalizedText(params.context.partResolution?.partNumber || params.input.partNumber);
+  const candidatePart = normalizedText(metadata.parts?.primaryPartNumber || metadata.partNumber);
+  if (!requestedPart || !candidatePart || requestedPart != candidatePart) {
+    return -1;
+  }
+
+  let score = params.candidate.score;
+  const issueMatched = valuesInclude(
+    [metadata.classification?.failureCode, metadata.classification?.failureLabel, metadata.classification?.failureMode],
+    reuseIssueSignals(params.input, params.context),
+  );
+  const systemMatched = valuesInclude(
+    [metadata.asset?.assetId, metadata.asset?.assetType, metadata.asset?.manufacturer, metadata.asset?.model, metadata.componentTitle],
+    reuseSystemSignals(params.input, params.context),
+  );
+
+  if (issueMatched) score += 1.4;
+  if (systemMatched) score += 0.8;
+  if (latest.approvalState === "approved") score += 0.6;
+  if (params.artifact.duplicateState === "duplicate") score -= 1;
+  return score;
+}
+
+export async function findMatchingValidatedProcedure(
+  config: CashClawConfig,
+  input: CateoAssistInput,
+  options: ServiceOptions = {},
+): Promise<CateoAssistResult | null> {
+  const actor = options.actor ?? "system";
+  const requester = options.requester ? { ...options.requester } : undefined;
+  const normalizedInput = normalizeAssistInput(input);
+  const mediaEnhanced = await enrichAssistInputWithOpenAIMedia(config, normalizedInput, options.requestId);
+  const enrichedInput = mediaEnhanced.input;
+  const caseId = crypto.randomUUID();
+  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(enrichedInput));
+  const attachmentEvidence = ingestMediaAttachments(caseId, enrichedInput.attachments, options.requestId);
+  const partResolution = await resolveCateoPart(config, sanitizedInput, options.requestId);
+  if (partResolution.needsClarification) {
+    return null;
+  }
+  const context = buildCateoContext(caseId, sanitizedInput, attachmentEvidence, partResolution);
+  if (context.taskClass !== "troubleshooting") {
+    return null;
+  }
+
+  let route = buildRoute(sanitizedInput, context);
+  const requestedTemplate = sanitizedInput.instructionTemplate;
+  const template = getInstructionTemplate(requestedTemplate?.taskClass ?? route.taskClass, route.requestedArtifacts);
+  route = {
+    ...route,
+    taskClass: template.taskClass,
+    requestedArtifacts: template.requiredArtifacts,
+  };
+  const adapters: CateoAdapterCapability[] = listCateoAdapters();
+  const activeAdapters = adapters.filter((adapter) => adapter.status === "detected" || adapter.status === "available");
+  const activeSkills: CateoSkillActivation[] = resolveCateoSkillsForAssistInput(sanitizedInput, route.taskClass);
+  route = {
+    ...route,
+    activeSkillIds: activeSkills.map((skill) => skill.id),
+    capabilityTags: [...new Set([...activeSkills.flatMap((skill) => skill.datasetTags), ...activeAdapters.map((adapter) => adapter.id)])],
+    reasons: [...route.reasons, ...summarizeSkillReasons(activeSkills).slice(0, 4)],
+  };
+
+  const matches = findSimilarArtifacts({
+    text: [
+      sanitizedInput.symptomDescription,
+      sanitizedInput.issueType,
+      sanitizedInput.errorCode,
+      context.issueType,
+      context.failureCode?.code,
+      context.failureCode?.label,
+      context.asset?.assetId,
+      context.machine?.manufacturer,
+      context.machine?.model,
+      sanitizedInput.businessType,
+    ].filter(Boolean).join("\n"),
+    artifactType: "troubleshooting-procedure",
+    assetId: context.asset?.assetId,
+    workOrderId: context.workOrder?.workOrderId,
+    partNumber: context.partResolution?.partNumber,
+    limit: 8,
+    minScore: 0.35,
+  }).map((match) => ({
+    artifactId: match.artifactId,
+    artifactType: match.artifactType as CateoArtifactType,
+    caseId: match.caseId,
+    assetId: match.assetId,
+    workOrderId: match.workOrderId,
+    score: match.score,
+    basis: match.basis,
+    revisionNumber: match.revisionNumber,
+    approvalState: match.approvalState === "approved" || match.approvalState === "reviewed" || match.approvalState === "draft"
+      ? match.approvalState
+      : "draft",
+    updatedAt: match.updatedAt,
+  } satisfies CateoArtifactLookupCandidate));
+
+  const ranked: Array<{ candidate: CateoArtifactLookupCandidate; artifact: CateoArtifactRecord; reuseScore: number }> = matches
+    .map((candidate): { candidate: CateoArtifactLookupCandidate; artifact: CateoArtifactRecord | null } => ({
+      candidate,
+      artifact: loadArtifactRecord(candidate.artifactId),
+    }))
+    .filter((entry) => Boolean(entry.artifact))
+    .map((entry) => {
+      const artifact = entry.artifact as CateoArtifactRecord;
+      return {
+        candidate: entry.candidate,
+        artifact,
+        reuseScore: scoreProcedureReuseCandidate({ candidate: entry.candidate, artifact, input: sanitizedInput, context }),
+      };
+    })
+    .filter((entry) => entry.reuseScore >= 1.85)
+    .sort((left, right) => right.reuseScore - left.reuseScore || right.candidate.updatedAt.localeCompare(left.candidate.updatedAt));
+
+  const best = ranked[0];
+  if (!best) {
+    return null;
+  }
+
+  const sourceCase = loadCaseRecord(best.candidate.caseId);
+  const relatedArtifacts: CateoArtifactRecord[] = (sourceCase?.artifacts ?? [best.artifact.artifactId])
+    .map((artifactId: string) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact))
+    .filter((artifact) => {
+      const latest = artifact.revisions.at(-1);
+      const part = normalizedText(latest?.metadata?.parts?.primaryPartNumber || latest?.metadata?.partNumber);
+      const requestedPart = normalizedText(context.partResolution?.partNumber || sanitizedInput.partNumber);
+      if (requestedPart && part && requestedPart !== part) {
+        return false;
+      }
+      return latest?.approvalState === "approved" || latest?.approvalState === "reviewed";
+    });
+
+  const artifacts: CateoArtifactRecord[] = relatedArtifacts.length > 0 ? relatedArtifacts : [best.artifact];
+  const interaction = renderCateoInteraction(artifacts);
+  interaction.message = `Cateo found an existing validated troubleshooting procedure for ${context.partResolution?.partNumber}. Returning the current controlled version immediately.
+
+${interaction.message}`;
+  interaction.highlights = uniqueStrings([
+    `Matched validated procedure ${best.artifact.artifactId} for ${context.partResolution?.partNumber}.`,
+    ...interaction.highlights,
+  ]);
+  interaction.releaseStatus = "available";
+  interaction.requiresEngineerReview = false;
+
+  const nowIso = new Date().toISOString();
+  const runId = crypto.randomUUID();
+  const leadPlan = fallbackLeadPlan(route, context, sanitizedInput);
+  const finalSynthesis = fallbackFinal(route, context, leadPlan);
+  const checkpoints = [
+    buildCheckpoint({
+      stage: "accepted",
+      status: "completed",
+      summary: "Cateo accepted the request and checked the validated troubleshooting catalog.",
+      taskClass: route.taskClass,
+      artifactTypes: ["troubleshooting-procedure"],
+      artifactCount: artifacts.length,
+    }),
+    buildCheckpoint({
+      stage: "completed",
+      status: "completed",
+      summary: "Cateo returned an existing validated troubleshooting procedure without queuing a new generation run.",
+      taskClass: route.taskClass,
+      confidence: interaction.confidence,
+      artifactTypes: artifacts.map((artifact) => artifact.artifactType),
+      artifactCount: artifacts.length,
+    }),
+  ];
+  const usage = buildUsageSummary([]);
+  const trace: CateoReasoningTrace = {
+    route,
+    template,
+    partResolution,
+    activeSkills,
+    adapters: activeAdapters,
+    validationAttempts: [],
+    ruleResults: [],
+    lookupCandidates: matches,
+    persistActions: [],
+    prompts: {
+      planner: "",
+      builder: "",
+      reviewer: "",
+    },
+    leadPlan,
+    finalSynthesis,
+    reviewerDecision: {
+      overallStatus: "pass",
+      technicalAccuracy: "pass",
+      completeness: "pass",
+      compliance: "pass",
+      findings: [`Matched validated procedure ${best.artifact.artifactId}.`],
+      approvedArtifactTypes: ["troubleshooting-procedure"],
+      approvalState: best.candidate.approvalState === "approved" ? "approved" : "reviewed",
+      confidence: interaction.confidence,
+      summary: `Returned validated procedure ${best.artifact.artifactId} from the internal catalog.`,
+      requiredFollowUp: [],
+    },
+  };
+
+  const caseRecord: CateoCaseRecord = {
+    caseId: context.caseId,
+    runId,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    input: sanitizedInput,
+    context,
+    artifacts: [...new Set(artifacts.map((artifact: CateoArtifactRecord) => artifact.artifactId))],
+    interaction,
+    requester,
+    conversationId: requester?.conversationId,
+    userId: requester?.userId,
+    usage,
+    trace,
+  };
+
+  saveCaseRecord(caseRecord);
+  try {
+    persistTroubleshootingReportPackage(caseRecord, artifacts);
+  } catch (reportError) {
+    appendAuditEvent({
+      actor: "runtime",
+      category: "cateo_report_package",
+      action: "persist",
+      outcome: "warn",
+      severity: "warn",
+      message: `Failed to persist reused troubleshooting report package for case ${context.caseId}`,
+      requestId: options.requestId,
+      metadata: { error: reportError instanceof Error ? reportError.message : String(reportError) },
+    });
+  }
+
+  appendAuditEvent({
+    actor: "runtime",
+    category: "cateo_lookup",
+    action: "reuse_validated_procedure",
+    outcome: "success",
+    message: `Returned existing validated procedure ${best.artifact.artifactId} for case ${context.caseId}`,
+    requestId: options.requestId,
+    metadata: {
+      matchedArtifactId: best.artifact.artifactId,
+      matchedCaseId: best.candidate.caseId,
+      caseId: context.caseId,
+      partNumber: context.partResolution?.partNumber,
+      issueType: context.issueType,
+      businessType: context.businessType,
+      reuseScore: best.reuseScore,
+    },
+  });
+
+  if (config.security.persistence.persistDatasets) {
+    appendCateoInteraction({
+      schemaVersion: "1.0",
+      kind: "cateo_interaction",
+      timestamp: Date.now(),
+      caseId: context.caseId,
+      runId,
+      profileId: requester?.profileId,
+      requesterId: requester?.requesterId,
+      userId: requester?.userId,
+      conversationId: requester?.conversationId,
+      organization: requester?.organization,
+      emailHash: requester?.emailHash,
+      taskClass: route.taskClass,
+      assetId: context.asset?.assetId,
+      workOrderId: context.workOrder?.workOrderId,
+      prompt: sanitizedInput.symptomDescription,
+      errorCode: sanitizedInput.errorCode,
+      observedConditions: context.observedConditions,
+      attachmentCount: context.attachments.length,
+      requestedArtifacts: route.requestedArtifacts,
+      activeSkillIds: activeSkills.map((skill) => skill.id),
+      activeAdapterIds: activeAdapters.map((adapter) => adapter.id),
+      capabilityTags: route.capabilityTags,
+      artifactTypes: artifacts.map((artifact) => artifact.artifactType),
+      interactionMessage: interaction.message,
+      highlights: interaction.highlights,
+      nextActions: interaction.nextActions,
+      confidence: interaction.confidence,
+      contextSummary: context.contextSummary,
+      checkpoints: checkpoints.map((checkpoint) => ({
+        stage: checkpoint.stage,
+        status: checkpoint.status,
+        summary: checkpoint.summary,
+      })),
+      modelsUsed: [],
+      usage,
+      executiveSummary: finalSynthesis.executiveSummary,
+      rootCauseStatement: finalSynthesis.rootCauseStatement,
+      reviewerSummary: `Validated procedure ${best.artifact.artifactId} reused from the internal catalog.`,
+    });
+  }
+
+  return {
+    caseId: context.caseId,
+    runId,
+    summary: interaction.message,
+    interaction,
+    checkpoints,
+    context,
+    requester,
+    usage,
+    trace,
+    artifacts,
+  };
 }
 
 function checkpointLabel(stage: CateoInteractionCheckpoint["stage"]): string {
@@ -1918,7 +2278,7 @@ export async function generateCateoArtifacts(
     }));
 
     const artifactIds = [...new Set(artifacts.map((artifact) => artifact.artifactId))];
-    saveCaseRecord({
+    const caseRecord = {
       caseId: context.caseId,
       runId,
       createdAt: nowIso,
@@ -1932,7 +2292,24 @@ export async function generateCateoArtifacts(
       userId: requester?.userId,
       usage,
       trace,
-    });
+    };
+
+    try {
+      persistTroubleshootingReportPackage(caseRecord, artifacts);
+    } catch (reportError) {
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_report_package",
+        action: "persist",
+        outcome: "warn",
+        severity: "warn",
+        message: `Failed to persist troubleshooting report package for case ${context.caseId}`,
+        requestId: options.requestId,
+        metadata: { error: reportError instanceof Error ? reportError.message : String(reportError) },
+      });
+    }
+
+    saveCaseRecord(caseRecord);
 
     publishCheckpoint(buildCheckpoint({
       stage: "completed",
@@ -2093,6 +2470,10 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
+
+
+
 
 
 

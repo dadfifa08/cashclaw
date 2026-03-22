@@ -1,13 +1,14 @@
 import type { CateoArtifactType, CateoInstructionTemplate, CateoTaskClass } from "./types.js";
+import { loadTroubleshootingRulesDocument } from "./rules_document.js";
 
-const TEMPLATE_VERSION = "1.0.0";
+const TEMPLATE_VERSION = "1.1.0";
 
 function uniqueArtifacts(values: CateoArtifactType[]): CateoArtifactType[] {
   return [...new Set(values)];
 }
 
 function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifactType[]): CateoInstructionTemplate {
-  return {
+  const template: CateoInstructionTemplate = {
     templateId: `cateo.${taskClass}`,
     version: TEMPLATE_VERSION,
     taskClass,
@@ -32,6 +33,16 @@ function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifac
     ],
     requiredArtifacts: uniqueArtifacts(requiredArtifacts),
   };
+
+  if (taskClass === "troubleshooting" || taskClass === "mixed" || taskClass === "root-cause-analysis") {
+    template.controlledRulesDocument = loadTroubleshootingRulesDocument();
+    template.outputConstraints = [
+      ...template.outputConstraints,
+      "Follow the controlled troubleshooting rules document when producing or revising troubleshooting content.",
+    ];
+  }
+
+  return template;
 }
 
 const TEMPLATES: Record<CateoTaskClass, CateoInstructionTemplate> = {

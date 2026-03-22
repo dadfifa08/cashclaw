@@ -240,6 +240,7 @@ export function buildArtifactEnterpriseMetadata(args: {
     artifactTitle: args.summary,
     artifactSummary: args.summary,
     taskClass: args.context.taskClass,
+    businessType: args.context.businessType,
     approvalState: args.reviewerDecision.approvalState,
     confidence: args.reviewerDecision.confidence,
     riskLevel: inferRiskLevel({
@@ -251,6 +252,8 @@ export function buildArtifactEnterpriseMetadata(args: {
     taxonomyTags: unique([
       resolvedPartNumber,
       args.context.partResolution?.manufacturer,
+      args.context.businessType,
+      args.context.issueType,
       args.context.failureCode?.code,
       args.context.failureCode?.label,
       args.context.asset?.assetType,
@@ -267,6 +270,7 @@ export function buildArtifactEnterpriseMetadata(args: {
     sourceTemplateVersion: args.template.version,
     taxonomy: {
       domain: args.context.taskClass === "preventive-maintenance" ? "maintenance" : args.context.taskClass === "root-cause-analysis" ? "reliability" : args.context.taskClass,
+      industry: args.context.businessType,
       subsystem: args.context.asset?.assetType || args.context.machine?.model || args.context.partResolution?.manufacturer,
       componentPath: unique([args.context.machine?.manufacturer, args.context.machine?.model, args.context.asset?.assetId, args.context.partResolution?.partNumber]),
       locationPath: args.context.asset?.locationHierarchy ?? args.context.machine?.locationHierarchy ?? [],
@@ -356,6 +360,8 @@ export function buildArtifactEnterpriseMetadata(args: {
       artifactKeywords: unique([
         args.context.asset?.assetId,
         args.context.machine?.model,
+        args.context.businessType,
+        args.context.issueType,
         args.context.failureCode?.code,
         args.context.failureCode?.label,
         args.context.partResolution?.partNumber,

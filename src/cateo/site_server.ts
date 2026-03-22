@@ -6,9 +6,10 @@ import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./http_api.js";
 import { handleCateoSitePublicApi } from "./public_api.js";
 import { createInternalRequestVerifier, getInternalServiceToken } from "../system/service_auth.js";
 import { readRequestBody } from "../system/request_body.js";
-import { getAssistJob, listAssistBacklog, submitAssistJob, subscribeAssistJob } from "./site_jobs.js";
+import { getAssistJob, listAssistBacklog, submitAssistJob, submitCompletedAssistJob, subscribeAssistJob } from "./site_jobs.js";
 import type { AssistBacklogSnapshot, AssistJobEvent, AssistJobSnapshot } from "./site_jobs.js";
-import { CateoPilotQuotaError, getPilotProfile, reservePilotQuota, upsertPilotProfile, type CateoProfileSnapshot } from "./profiles.js";
+import { CateoPilotQuotaError, getPilotProfile, reservePilotQuota, settlePilotQuota, upsertPilotProfile, type CateoProfileSnapshot } from "./profiles.js";
+import { findMatchingValidatedProcedure } from "./service.js";
 import type { CateoAssistInput, CateoInteractionCheckpoint } from "./types.js";
 
 const DEFAULT_SITE_BRIDGE_HOST = "127.0.0.1";
@@ -445,6 +446,8 @@ function measureAssistPromptChars(input: CateoAssistInput): number {
     input.title,
     input.query,
     input.errorCode,
+    input.issueType,
+    input.businessType,
     input.symptomDescription,
     ...(input.observedConditions ?? []),
     input.asset?.assetId,
@@ -567,14 +570,45 @@ export async function startCateoSiteBridge(
           try {
             assertSubmissionAllowed(requesterId, req.socket.remoteAddress ?? undefined);
             const reservation = reservePilotQuota(config, sessionProfile.profileId, requesterId, requestId);
-            const job = submitAssistJob(body, requesterId, requestId, {
-              profile: reservation.profile,
-              quotaReservationId: reservation.reservationId,
-            });
-            noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
-            const backlog = listAssistBacklog(requesterId);
-            json(res, { ok: true, message: summarizeQueueJob(job), job: toPublicJob(job), backlog: toPublicBacklog(backlog), profile: reservation.profile }, 202);
-            return;
+            try {
+              const immediate = await findMatchingValidatedProcedure(config, body, {
+                actor: "site",
+                requestId,
+                requester: {
+                  profileId: reservation.profile.profileId,
+                  requesterId,
+                  displayName: reservation.profile.displayName,
+                  organization: reservation.profile.organization,
+                  serviceTier: reservation.profile.serviceTier,
+                  requiresEngineerReview: reservation.profile.reviewedOutputs,
+                },
+              });
+              if (immediate) {
+                const job = submitCompletedAssistJob(body, immediate, requesterId, requestId, {
+                  profile: reservation.profile,
+                  quotaReservationId: reservation.reservationId,
+                  requiresEngineerReview: reservation.profile.reviewedOutputs,
+                  statusDetail: "Validated troubleshooting procedure returned immediately from the internal catalog.",
+                });
+                settlePilotQuota(config, reservation.profile.profileId, reservation.reservationId, { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, "completed", requestId);
+                noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
+                const backlog = listAssistBacklog(requesterId);
+                json(res, { ok: true, message: summarizeQueueJob(job), job: toPublicJob(job), backlog: toPublicBacklog(backlog), profile: currentProfileSnapshot(reservation.profile.profileId, requesterId) ?? reservation.profile }, 200);
+                return;
+              }
+
+              const job = submitAssistJob(body, requesterId, requestId, {
+                profile: reservation.profile,
+                quotaReservationId: reservation.reservationId,
+              });
+              noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
+              const backlog = listAssistBacklog(requesterId);
+              json(res, { ok: true, message: summarizeQueueJob(job), job: toPublicJob(job), backlog: toPublicBacklog(backlog), profile: reservation.profile }, 202);
+              return;
+            } catch (error) {
+              settlePilotQuota(config, reservation.profile.profileId, reservation.reservationId, { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, "failed", requestId);
+              throw error;
+            }
           } catch (error) {
             if (error instanceof CateoPilotQuotaError) {
               json(res, { error: error.message, code: error.code, profile: error.profile ?? sessionProfile }, error.status);

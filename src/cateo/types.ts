@@ -29,6 +29,30 @@ export type CateoProductOffering =
   | "parts-inventory-optimization"
   | "digital-twin-comparison-report"
   | "camera-based-diagnostic-report";
+export const CATEO_BUSINESS_TYPES = [
+  "medical-devices",
+  "clinical-diagnostics",
+  "pharmaceutical-manufacturing",
+  "biotech-lifesciences",
+  "research-laboratory",
+  "aerospace-defense",
+  "automotive",
+  "industrial-manufacturing",
+  "semiconductor",
+  "electronics",
+  "energy-utilities",
+  "oil-gas",
+  "chemical-processing",
+  "food-beverage",
+  "water-wastewater",
+  "building-automation",
+  "transportation-logistics",
+  "telecommunications",
+  "information-technology",
+  "software-systems",
+  "general-engineering",
+] as const;
+export type CateoBusinessType = typeof CATEO_BUSINESS_TYPES[number];
 export type CateoSkillExposure = "public" | "cashclaw" | "both";
 
 export type CateoApprovalState = "draft" | "reviewed" | "approved";
@@ -244,6 +268,8 @@ export interface CateoAssistInput {
   title?: string;
   query?: string;
   errorCode?: string;
+  issueType?: string;
+  businessType?: CateoBusinessType;
   productOffering?: CateoProductOffering;
   partNumber?: string;
   contextNotes?: string;
@@ -310,6 +336,8 @@ export interface CateoContextBundle {
   caseId: string;
   title: string;
   taskClass: CateoTaskClass;
+  issueType?: string;
+  businessType?: CateoBusinessType;
   asset: CateoAssetRegistryLink | null;
   machine: CateoMachineMetadata | null;
   workOrder: CateoWorkOrderLink | null;
@@ -477,6 +505,7 @@ export interface CateoArtifactEnterpriseMetadata {
   artifactTitle: string;
   artifactSummary: string;
   taskClass: CateoTaskClass;
+  businessType?: CateoBusinessType;
   approvalState: CateoApprovalState;
   confidence: CateoConfidence;
   riskLevel: CateoRiskLevel;
@@ -489,6 +518,7 @@ export interface CateoArtifactEnterpriseMetadata {
   sourceTemplateVersion?: string;
   taxonomy: {
     domain: "inspection" | "maintenance" | "reliability" | "troubleshooting" | "documentation" | "mixed";
+    industry?: CateoBusinessType;
     subsystem?: string;
     componentPath: string[];
     locationPath: string[];
@@ -827,6 +857,10 @@ export interface CateoInstructionTemplate {
   fieldExpectations: string[];
   outputConstraints: string[];
   requiredArtifacts: CateoArtifactType[];
+  controlledRulesDocument?: {
+    path: string;
+    content: string;
+  };
 }
 
 export interface CateoValidationAttempt {
@@ -925,6 +959,48 @@ export interface CateoAssistResult {
   artifacts: CateoArtifactRecord[];
 }
 
+export type CateoProcedureFeedbackRating =
+  | "helpful"
+  | "needs-correction"
+  | "missing-steps"
+  | "wrong-part"
+  | "other";
+
+export type CateoProcedureFeedbackStatus = "pending-review" | "approved" | "rejected";
+
+export interface CateoProcedureFeedbackDecision {
+  actor: string;
+  action: "approve" | "reject";
+  note?: string;
+  decidedAt: string;
+  releasedRevisionRefs: Array<{
+    artifactId: string;
+    revisionId: string;
+    revisionNumber: number;
+  }>;
+}
+
+export interface CateoProcedureFeedbackRecord {
+  feedbackId: string;
+  conversationId: string;
+  caseId: string;
+  artifactIds: string[];
+  requesterId?: string;
+  profileId?: string;
+  userId?: string;
+  submittedAt: string;
+  updatedAt: string;
+  status: CateoProcedureFeedbackStatus;
+  rating: CateoProcedureFeedbackRating;
+  comments: string;
+  businessType?: CateoBusinessType;
+  systemName?: string;
+  partNumber?: string;
+  issueType?: string;
+  feedbackTags: string[];
+  adminDecision?: CateoProcedureFeedbackDecision;
+}
+
 export interface CateoRevisionRequest {
   artifactId: string;
   editor: string;
@@ -941,6 +1017,8 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
+
 
 
 

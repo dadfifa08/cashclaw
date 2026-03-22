@@ -125,6 +125,8 @@ export function inferCateoTaskClass(input: CateoAssistInput): CateoTaskClass {
     input.title,
     input.query,
     input.errorCode,
+    input.issueType,
+    input.businessType,
     input.partNumber,
     input.contextNotes,
     input.workflow?.documentIntent,
@@ -168,6 +170,8 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
   const productLabel = labelProductOffering(input.productOffering);
   const searchTokens = new Set(tokenize([
     input.errorCode,
+    input.issueType,
+    input.businessType,
     input.partNumber,
     input.contextNotes,
     input.workflow?.documentIntent,
@@ -198,6 +202,8 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
 
   const contextSummary = uniqueStrings([
     productLabel ? `Requested deliverable: ${productLabel}.` : undefined,
+    input.businessType ? `Type of business: ${input.businessType.replace(/-/g, " ")}.` : undefined,
+    input.issueType ? `Declared issue type: ${input.issueType}.` : undefined,
     input.workflow?.mode ? `Workflow mode: ${input.workflow.mode.replace(/-/g, " ")}.` : undefined,
     input.workflow?.documentIntent ? `Requested document intent: ${input.workflow.documentIntent}.` : undefined,
     input.workflow?.businessJustification ? `Business justification: ${input.workflow.businessJustification}.` : undefined,
@@ -234,6 +240,8 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     caseId,
     title: resolvedTitle,
     taskClass,
+    issueType: input.issueType?.trim() || matchedFailureCode?.label || input.errorCode || undefined,
+    businessType: input.businessType,
     asset: input.asset ?? null,
     machine: input.machine ?? null,
     workOrder: input.workOrder ?? null,

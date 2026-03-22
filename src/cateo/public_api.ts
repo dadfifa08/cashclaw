@@ -33,7 +33,9 @@ import {
 } from "./conversations.js";
 import { transcribeAudioWithOpenAI } from "./openai_media.js";
 import { getAssistJob } from "./site_jobs.js";
+import { listProcedureFeedback, listProcedureFeedbackForConversation, reviewProcedureFeedback, submitProcedureFeedback } from "./feedback.js";
 import { signOffCateoArtifact } from "./service.js";
+import { persistTroubleshootingReportPackage } from "./report_exports.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord } from "./store.js";
 import { listPilotProfiles, updatePilotProfileAdmin } from "./profiles.js";
 import type { CateoAssistInput, CateoAssistResult, CateoCaseRecord } from "./types.js";
@@ -120,6 +122,33 @@ function artifactVisible(record: NonNullable<ReturnType<typeof loadArtifactRecor
   return Boolean(latest && (latest.approvalState === "approved" || latest.approvalState === "reviewed"));
 }
 
+function loadConversationTroubleshootingReportPackage(conversationId: string, viewer: { requesterId?: string; userId?: string; profileId?: string; admin?: boolean }) {
+  const conversation = loadConversationRecord(conversationId);
+  if (!conversation || !canAccess(conversation, viewer)) return null;
+
+  const latestCaseId =
+    [...conversation.messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.status === "completed" && message.caseId)
+      ?.caseId ?? conversation.caseIds.at(-1);
+
+  if (!latestCaseId) return null;
+
+  const caseRecord = loadCaseRecord(latestCaseId);
+  if (!caseRecord) return null;
+
+  const artifacts = caseRecord.artifacts
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact));
+
+  if (artifacts.length === 0) return null;
+
+  return {
+    conversation,
+    caseRecord,
+    reportPackage: persistTroubleshootingReportPackage(caseRecord, artifacts),
+  };
+}
 function buildAdminReviewItems(): AdminReviewItem[] {
   return listCaseCatalogRows()
     .map((row) => loadCaseRecord(row.caseId))
@@ -461,6 +490,8 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/overview`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } json(res, { ok: true, metrics: buildCommandCenterSnapshot(), users: listPublicUsers(config).slice(0, MAX_USERS), profiles: listPilotProfiles(config).slice(0, MAX_USERS), conversations: listConversationSummaries({ admin: true }).slice(0, MAX_CONVERSATIONS), session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const items = buildAdminReviewItems(); json(res, { ok: true, items, stats: { pendingCases: items.length, pendingArtifacts: items.reduce((sum, item) => sum + item.draftArtifactCount, 0), enterpriseCases: items.filter((item) => item.serviceTier === "enterprise").length, reviewedTierCases: items.filter((item) => item.serviceTier === "reviewed").length }, session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews/release`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const activeSession = requireSession(config, req, requesterId, requestId); const body = parseJson<{ caseId: string; password: string; otpCode?: string; note?: string }>(await readBody(req)); reauthorizePublicUser(config, activeSession.user.userId, { password: body.password, otpCode: body.otpCode }, requestId); const caseRecord = loadCaseRecord(body.caseId); if (!caseRecord) { json(res, { error: "Case not found" }, 404); return true; } const actor = activeSession.user.displayName || activeSession.user.email || activeSession.user.username || activeSession.user.userId; const released = releaseReviewedCase(caseRecord, actor, body.note, requestId); json(res, { ok: true, caseId: released.caseRecord.caseId, releaseStatus: released.caseRecord.interaction?.releaseStatus, releasedArtifactIds: released.releasedArtifactIds, pending: buildAdminReviewItems(), session: activeSession }); return true; }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/feedback`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const items = listProcedureFeedback("pending-review"); json(res, { ok: true, items, stats: { pending: items.length, approved: listProcedureFeedback("approved").length, rejected: listProcedureFeedback("rejected").length }, session }); return true; }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/feedback/decision`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const activeSession = requireSession(config, req, requesterId, requestId); const body = parseJson<{ feedbackId: string; action: "approve" | "reject"; note?: string }>(await readBody(req)); const actor = activeSession.user.displayName || activeSession.user.email || activeSession.user.username || activeSession.user.userId; const item = reviewProcedureFeedback({ feedbackId: body.feedbackId, action: body.action, actor, note: body.note }, requestId); json(res, { ok: true, item, items: listProcedureFeedback("pending-review"), session: activeSession }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/profiles`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } json(res, { ok: true, items: listPilotProfiles(config), session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/profiles/update`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const body = parseJson<{ profileId: string; status?: "active" | "suspended"; serviceTier?: "free" | "reviewed" | "enterprise"; reviewedOutputs?: boolean; artifactDownloadAccess?: boolean; displayName?: string; organization?: string }>(await readBody(req)); const profile = updatePilotProfileAdmin(config, body.profileId, body, requestId); json(res, { ok: true, profile, session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/transcribe`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!requesterId) { json(res, { error: "Missing or invalid X-Cateo-Client-Id" }, 400); return true; } const body = parseJson<{ name?: string; mimeType?: string; contentBase64: string }>(await readBody(req)); const transcript = await transcribeAudioWithOpenAI(config, { ...body, requesterId }, requestId); json(res, { ok: true, transcript, session }); return true; }
@@ -491,8 +522,38 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
       if (!detail) { json(res, { error: "Part not found" }, 404); return true; }
       json(res, { ok: true, detail, session });
       return true;
-    }    const conversationMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)$/);
-    if (conversationMatch) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } const conversation = await syncConversationJobs(decodeURIComponent(conversationMatch[1]), requesterId); if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; } json(res, { ok: true, conversation, session }); return true; }
+    }
+    const conversationMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)$/);
+    if (conversationMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      const conversation = await syncConversationJobs(decodeURIComponent(conversationMatch[1]), requesterId);
+      if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; }
+      json(res, { ok: true, conversation, session });
+      return true;
+    }
+    const conversationReportMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/report$/);
+    if (conversationReportMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      const payload = loadConversationTroubleshootingReportPackage(decodeURIComponent(conversationReportMatch[1]), viewer);
+      if (!payload) { json(res, { error: "Troubleshooting report not found" }, 404); return true; }
+      json(res, { ok: true, conversationId: payload.conversation.conversationId, caseId: payload.caseRecord.caseId, report: payload.reportPackage, feedback: listProcedureFeedbackForConversation(payload.conversation.conversationId), session });
+      return true;
+    }
+    const conversationFeedbackMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/feedback$/);
+    if (conversationFeedbackMatch) {
+      const conversationId = decodeURIComponent(conversationFeedbackMatch[1]);
+      const conversation = loadConversationRecord(conversationId);
+      if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; }
+      const latestCaseId = [...conversation.messages].reverse().find((message) => message.role === "assistant" && message.caseId)?.caseId ?? conversation.caseIds.at(-1);
+      const caseRecord = latestCaseId ? loadCaseRecord(latestCaseId) : null;
+      if (!caseRecord) { json(res, { error: "No completed troubleshooting case is available for feedback." }, 404); return true; }
+      if (req.method === "GET") { json(res, { ok: true, items: listProcedureFeedbackForConversation(conversationId), session }); return true; }
+      if (req.method !== "POST") { json(res, { error: "GET or POST only" }, 405); return true; }
+      const body = parseJson<{ rating: import("./types.js").CateoProcedureFeedbackRating; comments: string }>(await readBody(req));
+      const item = submitProcedureFeedback({ conversationId, caseId: caseRecord.caseId, artifactIds: caseRecord.artifacts, requesterId: viewer.requesterId, profileId: viewer.profileId, userId: viewer.userId, rating: body.rating, comments: body.comments, businessType: caseRecord.input.businessType, systemName: caseRecord.context.machine?.model || caseRecord.context.asset?.assetType || caseRecord.context.asset?.assetId, partNumber: caseRecord.context.partResolution?.partNumber || caseRecord.input.partNumber, issueType: caseRecord.context.issueType }, requestId);
+      json(res, { ok: true, item, items: listProcedureFeedbackForConversation(conversationId), session });
+      return true;
+    }
     const saveMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/save$/);
     if (saveMatch) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } const body = parseJson<{ saved: boolean }>(await readBody(req)); const conversation = setConversationSaved(decodeURIComponent(saveMatch[1]), viewer, !!body.saved); json(res, { ok: true, conversation }); return true; }
     const shareMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/share$/);
@@ -514,6 +575,13 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
   }
   return false;
 }
+
+
+
+
+
+
+
 
 
 

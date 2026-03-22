@@ -29,6 +29,8 @@ export interface ArtifactCatalogRow {
   summary: string;
   updatedAt: string;
   partNumber?: string;
+  businessType?: string;
+  issueType?: string;
   componentTitle?: string;
   failureCode?: string;
   lifecycleState?: string;
@@ -53,6 +55,8 @@ export interface CaseCatalogRow {
   productOffering?: string;
   workflowMode?: string;
   partNumber?: string;
+  businessType?: string;
+  issueType?: string;
   releaseStatus?: string;
   confidence?: string;
   serviceTier?: string;
@@ -205,6 +209,8 @@ function upsertArtifactCatalog(record: CateoArtifactRecord): void {
     summary: current.summary,
     updatedAt: record.updatedAt,
     partNumber: metadata?.parts?.primaryPartNumber ?? metadata?.partNumber,
+    businessType: metadata?.businessType,
+    issueType: metadata?.classification?.failureLabel ?? metadata?.classification?.failureMode,
     componentTitle: metadata?.componentTitle,
     failureCode: metadata?.classification?.failureCode,
     lifecycleState: metadata?.lifecycleState,
@@ -243,6 +249,8 @@ function upsertCaseCatalog(record: CateoCaseRecord): void {
     productOffering: record.input.productOffering,
     workflowMode: record.input.workflow?.mode,
     partNumber: record.context.partResolution?.partNumber ?? record.input.partNumber,
+    businessType: record.input.businessType ?? record.context.businessType,
+    issueType: record.context.issueType ?? record.input.issueType ?? record.input.errorCode,
     releaseStatus: record.interaction?.releaseStatus,
     confidence: record.interaction?.confidence,
     serviceTier: record.requester?.serviceTier,
