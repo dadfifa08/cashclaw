@@ -1,0 +1,444 @@
+import { listConversationSummaries, loadConversationRecord } from "./conversations.js";
+import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows } from "./store.js";
+import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
+
+export interface CateoAdminViewer {
+  requesterId?: string;
+  userId?: string;
+  profileId?: string;
+  admin?: boolean;
+}
+
+export interface QualityGateItem {
+  gateId: string;
+  label: string;
+  status: "complete" | "pending" | "blocked";
+  note?: string;
+}
+
+export interface AdminCaseItem {
+  caseId: string;
+  runId: string;
+  title: string;
+  taskClass: CateoTaskClass;
+  productOffering?: CateoProductOffering;
+  workflowMode?: CateoWorkflowMode;
+  partNumber?: string;
+  serviceTier?: CateoServiceTier;
+  releaseStatus?: CateoInteractionReleaseStatus;
+  confidence?: CateoConfidence;
+  assetId?: string;
+  workOrderId?: string;
+  conversationId?: string;
+  requesterId?: string;
+  userId?: string;
+  profileId?: string;
+  displayName?: string;
+  organization?: string;
+  artifactCount: number;
+  createdAt: string;
+  updatedAt: string;
+  interactionSummary?: string;
+  businessJustification?: string;
+  drjJustification?: string;
+  documentIntent?: string;
+  complianceScope: string[];
+  riskTier?: string;
+  requiresEngineerReview: boolean;
+  qualityGates: QualityGateItem[];
+}
+
+export interface AdminConversationItem {
+  conversationId: string;
+  title: string;
+  titleSource?: string;
+  saved: boolean;
+  pendingCount: number;
+  messageCount: number;
+  updatedAt: number;
+  lastMessagePreview?: string;
+  productOffering?: CateoProductOffering;
+  workflowMode?: CateoWorkflowMode;
+  partNumber?: string;
+  releaseStatus?: CateoInteractionReleaseStatus;
+  serviceTier?: CateoServiceTier;
+  displayName?: string;
+  organization?: string;
+  caseId?: string;
+}
+
+export interface AdminArtifactItem {
+  artifactId: string;
+  artifactType: string;
+  title?: string;
+  summary?: string;
+  approvalState: string;
+  revisionNumber: number;
+  updatedAt: string;
+  assetId?: string;
+  workOrderId?: string;
+  partNumber?: string;
+  failureCode?: string;
+  taxonomyTags: string[];
+  serviceTier?: CateoServiceTier;
+  workflowMode?: CateoWorkflowMode;
+  productOffering?: CateoProductOffering;
+  displayName?: string;
+  organization?: string;
+  duplicateState?: string;
+  caseId: string;
+}
+
+export interface AdminRedditReviewItem {
+  replyQueueId: number;
+  redditPostId?: string | null;
+  subreddit?: string | null;
+  title?: string | null;
+  status?: string | null;
+  confidence?: number | null;
+  proposedComment?: string | null;
+}
+
+export interface AdminRedditReviewEnvelope {
+  configured: boolean;
+  reachable: boolean;
+  items: AdminRedditReviewItem[];
+  error?: string;
+}
+
+export interface AdminRedditReviewDecisionResult {
+  configured: boolean;
+  reachable: boolean;
+  item?: AdminRedditReviewItem;
+  error?: string;
+}
+
+function normalized(value: string | undefined | null): string | undefined {
+  const next = value?.trim();
+  return next ? next.toLowerCase() : undefined;
+}
+
+function includesFilter(haystack: Array<string | undefined | null>, query: string | undefined): boolean {
+  if (!query) return true;
+  const text = haystack.filter(Boolean).join("\n").toLowerCase();
+  return text.includes(query);
+}
+
+function hasViewerAccess(record: CateoCaseRecord, viewer: CateoAdminViewer): boolean {
+  if (viewer.admin) return true;
+  if (viewer.userId && record.userId === viewer.userId) return true;
+  if (viewer.profileId && record.requester?.profileId === viewer.profileId) return true;
+  if (viewer.requesterId && record.requester?.requesterId === viewer.requesterId) return true;
+  return false;
+}
+
+function buildQualityGates(record: CateoCaseRecord): QualityGateItem[] {
+  const reviewerDecision = record.trace.reviewerDecision;
+  const releaseStatus = record.interaction?.releaseStatus;
+  return [
+    {
+      gateId: "intake",
+      label: "Structured intake",
+      status: "complete",
+      note: record.input.workflow?.mode === "reviewed-document" ? "Deterministic reviewed-document request captured." : "Conversational request captured.",
+    },
+    {
+      gateId: "ai-draft",
+      label: "AI draft package",
+      status: record.artifacts.length > 0 ? "complete" : "pending",
+      note: record.artifacts.length > 0 ? `${record.artifacts.length} artifact(s) generated.` : "Awaiting artifact package generation.",
+    },
+    {
+      gateId: "ai-review",
+      label: "Second-agent review",
+      status: reviewerDecision?.overallStatus === "needs-revision" ? "blocked" : reviewerDecision ? "complete" : "pending",
+      note: reviewerDecision?.summary ?? "Awaiting reviewer stage output.",
+    },
+    {
+      gateId: "admin-review",
+      label: "Admin quality release",
+      status: releaseStatus === "available" ? "complete" : releaseStatus === "clarification-required" ? "blocked" : "pending",
+      note: releaseStatus === "available"
+        ? "Released after controlled sign-off."
+        : releaseStatus === "pending-engineer-review"
+          ? "Queued for admin password-backed sign-off."
+          : releaseStatus === "clarification-required"
+            ? "Blocked pending additional customer clarification."
+            : "Awaiting release decision.",
+    },
+    {
+      gateId: "customer-release",
+      label: "Customer release",
+      status: releaseStatus === "available" ? "complete" : "pending",
+      note: releaseStatus === "available" ? "Visible in the customer workspace." : "Not yet released to the customer.",
+    },
+  ];
+}
+
+function toAdminCaseItem(record: CateoCaseRecord): AdminCaseItem {
+  return {
+    caseId: record.caseId,
+    runId: record.runId,
+    title: record.context.title,
+    taskClass: record.context.taskClass,
+    productOffering: record.input.productOffering,
+    workflowMode: record.input.workflow?.mode,
+    partNumber: record.context.partResolution?.partNumber ?? record.input.partNumber,
+    serviceTier: record.requester?.serviceTier,
+    releaseStatus: record.interaction?.releaseStatus,
+    confidence: record.interaction?.confidence,
+    assetId: record.context.asset?.assetId,
+    workOrderId: record.context.workOrder?.workOrderId,
+    conversationId: record.conversationId,
+    requesterId: record.requester?.requesterId,
+    userId: record.userId,
+    profileId: record.requester?.profileId,
+    displayName: record.requester?.displayName,
+    organization: record.requester?.organization,
+    artifactCount: record.artifacts.length,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    interactionSummary: record.interaction?.message,
+    businessJustification: record.input.workflow?.businessJustification,
+    drjJustification: record.input.workflow?.drjJustification,
+    documentIntent: record.input.workflow?.documentIntent,
+    complianceScope: record.input.workflow?.complianceScope ?? [],
+    riskTier: record.input.workflow?.riskTier,
+    requiresEngineerReview: Boolean(record.interaction?.requiresEngineerReview ?? record.requester?.requiresEngineerReview),
+    qualityGates: buildQualityGates(record),
+  };
+}
+
+function matchesCaseFilters(item: AdminCaseItem, filters: Record<string, string | undefined>): boolean {
+  const q = normalized(filters.q);
+  if (!includesFilter([
+    item.title,
+    item.taskClass,
+    item.productOffering,
+    item.partNumber,
+    item.displayName,
+    item.organization,
+    item.assetId,
+    item.workOrderId,
+    item.interactionSummary,
+    item.documentIntent,
+    item.businessJustification,
+    item.drjJustification,
+    ...(item.complianceScope ?? []),
+  ], q)) {
+    return false;
+  }
+  if (filters.productOffering && item.productOffering !== filters.productOffering) return false;
+  if (filters.releaseStatus && item.releaseStatus !== filters.releaseStatus) return false;
+  if (filters.serviceTier && item.serviceTier !== filters.serviceTier) return false;
+  if (filters.workflowMode && item.workflowMode !== filters.workflowMode) return false;
+  if (filters.taskClass && item.taskClass !== filters.taskClass) return false;
+  if (filters.partNumber && !(item.partNumber ?? "").toLowerCase().includes(filters.partNumber.trim().toLowerCase())) return false;
+  return true;
+}
+
+export function listAdminCases(filters: Record<string, string | undefined> = {}): AdminCaseItem[] {
+  return listCaseCatalogRows()
+    .map((row) => loadCaseRecord(row.caseId))
+    .filter((record): record is CateoCaseRecord => Boolean(record))
+    .map(toAdminCaseItem)
+    .filter((item) => matchesCaseFilters(item, filters))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function listViewerCases(viewer: CateoAdminViewer, filters: Record<string, string | undefined> = {}): AdminCaseItem[] {
+  return listCaseCatalogRows()
+    .map((row) => loadCaseRecord(row.caseId))
+    .filter((record): record is CateoCaseRecord => Boolean(record))
+    .filter((record) => hasViewerAccess(record, viewer))
+    .map(toAdminCaseItem)
+    .filter((item) => matchesCaseFilters(item, filters))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function latestCaseByConversationId(): Map<string, AdminCaseItem> {
+  const map = new Map<string, AdminCaseItem>();
+  for (const item of listAdminCases()) {
+    if (!item.conversationId) continue;
+    const current = map.get(item.conversationId);
+    if (!current || item.updatedAt > current.updatedAt) {
+      map.set(item.conversationId, item);
+    }
+  }
+  return map;
+}
+
+export function listAdminConversations(filters: Record<string, string | undefined> = {}): AdminConversationItem[] {
+  const caseMap = latestCaseByConversationId();
+  const q = normalized(filters.q);
+  return listConversationSummaries({ admin: true })
+    .map((summary) => {
+      const related = caseMap.get(summary.conversationId);
+      return {
+        conversationId: summary.conversationId,
+        title: summary.title,
+        titleSource: summary.titleSource,
+        saved: summary.saved,
+        pendingCount: summary.pendingCount,
+        messageCount: summary.messageCount,
+        updatedAt: summary.updatedAt,
+        lastMessagePreview: summary.lastMessagePreview,
+        productOffering: related?.productOffering,
+        workflowMode: related?.workflowMode,
+        partNumber: related?.partNumber,
+        releaseStatus: related?.releaseStatus,
+        serviceTier: related?.serviceTier,
+        displayName: related?.displayName,
+        organization: related?.organization,
+        caseId: related?.caseId,
+      } satisfies AdminConversationItem;
+    })
+    .filter((item) => includesFilter([item.title, item.lastMessagePreview, item.productOffering, item.partNumber, item.displayName, item.organization], q))
+    .filter((item) => !filters.productOffering || item.productOffering === filters.productOffering)
+    .filter((item) => !filters.releaseStatus || item.releaseStatus === filters.releaseStatus)
+    .filter((item) => !filters.serviceTier || item.serviceTier === filters.serviceTier)
+    .filter((item) => !filters.saved || String(item.saved) === filters.saved)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+export function listAdminArtifacts(filters: Record<string, string | undefined> = {}): AdminArtifactItem[] {
+  const q = normalized(filters.q);
+  return listArtifactCatalogRows()
+    .map((row): AdminArtifactItem | null => {
+      const artifact = loadArtifactRecord(row.artifactId);
+      const latest = artifact?.revisions.at(-1);
+      const linkedCase = row.caseId ? loadCaseRecord(row.caseId) : null;
+      if (!artifact || !latest) {
+        return null;
+      }
+      return {
+        artifactId: row.artifactId,
+        artifactType: row.artifactType,
+        title: latest.metadata?.artifactTitle,
+        summary: latest.summary,
+        approvalState: latest.approvalState,
+        revisionNumber: latest.revisionNumber,
+        updatedAt: row.updatedAt,
+        assetId: row.assetId,
+        workOrderId: row.workOrderId,
+        partNumber: row.partNumber,
+        failureCode: row.failureCode,
+        taxonomyTags: row.taxonomyTags,
+        serviceTier: linkedCase?.requester?.serviceTier,
+        workflowMode: linkedCase?.input.workflow?.mode,
+        productOffering: linkedCase?.input.productOffering,
+        displayName: linkedCase?.requester?.displayName,
+        organization: linkedCase?.requester?.organization,
+        duplicateState: row.duplicateState,
+        caseId: row.caseId,
+      };
+    })
+    .filter((item): item is AdminArtifactItem => item !== null)
+    .filter((item) => includesFilter([item.title, item.summary, item.partNumber, item.failureCode, item.assetId, item.workOrderId, item.productOffering, item.displayName, item.organization, ...(item.taxonomyTags ?? [])], q))
+    .filter((item) => !filters.artifactType || item.artifactType === filters.artifactType)
+    .filter((item) => !filters.approvalState || item.approvalState === filters.approvalState)
+    .filter((item) => !filters.productOffering || item.productOffering === filters.productOffering)
+    .filter((item) => !filters.serviceTier || item.serviceTier === filters.serviceTier)
+    .filter((item) => !filters.partNumber || (item.partNumber ?? "").toLowerCase().includes(filters.partNumber.trim().toLowerCase()))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export async function fetchRedditReviewQueue(): Promise<AdminRedditReviewEnvelope> {
+  const baseUrl = process.env.CATEO_REDDIT_REVIEWER_URL?.trim()?.replace(/\/+$/, "");
+  const reviewKey = process.env.CATEO_REDDIT_REVIEW_KEY?.trim();
+  if (!baseUrl || !reviewKey) {
+    return { configured: false, reachable: false, items: [] };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${baseUrl}/api/replies`, {
+      headers: {
+        "X-Review-Key": reviewKey,
+      },
+      signal: controller.signal,
+    });
+    const payload = await response.json() as Array<{ reply_queue_id?: number; reddit_post_id?: string | null; subreddit?: string | null; title?: string | null; status?: string | null; confidence?: number | null; proposed_comment?: string | null }> | { detail?: string };
+    if (!response.ok || !Array.isArray(payload)) {
+      return {
+        configured: true,
+        reachable: false,
+        items: [],
+        error: Array.isArray(payload) ? `Reviewer service returned ${response.status}` : payload?.detail || `Reviewer service returned ${response.status}`,
+      };
+    }
+    return {
+      configured: true,
+      reachable: true,
+      items: payload.map((item) => ({
+        replyQueueId: item.reply_queue_id ?? 0,
+        redditPostId: item.reddit_post_id,
+        subreddit: item.subreddit,
+        title: item.title,
+        status: item.status,
+        confidence: item.confidence,
+        proposedComment: item.proposed_comment,
+      })),
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      reachable: false,
+      items: [],
+      error: error instanceof Error ? error.message : "Reviewer service unavailable",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function submitRedditReviewDecision(input: { replyQueueId: number; action: "approve" | "reject"; reviewerNotes?: string }): Promise<AdminRedditReviewDecisionResult> {
+  const baseUrl = process.env.CATEO_REDDIT_REVIEWER_URL?.trim()?.replace(/\/+$/, "");
+  const reviewKey = process.env.CATEO_REDDIT_REVIEW_KEY?.trim();
+  if (!baseUrl || !reviewKey) {
+    return { configured: false, reachable: false };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${baseUrl}/api/replies/decision`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Review-Key": reviewKey,
+      },
+      body: JSON.stringify({
+        reply_queue_id: input.replyQueueId,
+        action: input.action,
+        reviewer_notes: input.reviewerNotes?.trim() || undefined,
+      }),
+      signal: controller.signal,
+    });
+    const payload = await response.json() as { reply_queue_id?: number; review_status?: string; detail?: string };
+    if (!response.ok) {
+      return {
+        configured: true,
+        reachable: false,
+        error: payload?.detail || `Reviewer service returned ${response.status}`,
+      };
+    }
+    return {
+      configured: true,
+      reachable: true,
+      item: {
+        replyQueueId: payload.reply_queue_id ?? input.replyQueueId,
+        status: payload.review_status,
+      },
+    };
+  } catch (error) {
+    return {
+      configured: true,
+      reachable: false,
+      error: error instanceof Error ? error.message : "Reviewer service unavailable",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}

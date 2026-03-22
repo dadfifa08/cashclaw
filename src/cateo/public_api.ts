@@ -2,6 +2,7 @@ import http from "node:http";
 import type { CashClawConfig } from "../config.js";
 import { readRequestBody } from "../system/request_body.js";
 import { buildCommandCenterSnapshot } from "./metrics.js";
+import { fetchRedditReviewQueue, listAdminArtifacts, listAdminCases, listAdminConversations, listViewerCases, submitRedditReviewDecision } from "./admin_views.js";
 import {
   beginPublicUserTwoFactorSetup,
   CateoPublicAuthError,
@@ -274,6 +275,105 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
           owned: items.filter((item) => item.owned).length,
         },
       });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/cases`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      const filters = {
+        q: url.searchParams.get("q")?.trim() || undefined,
+        productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
+        releaseStatus: url.searchParams.get("releaseStatus")?.trim() || undefined,
+        workflowMode: url.searchParams.get("workflowMode")?.trim() || undefined,
+        partNumber: url.searchParams.get("partNumber")?.trim() || undefined,
+      };
+      const items = listViewerCases(viewer, filters);
+      json(res, {
+        ok: true,
+        session: activeSession,
+        items,
+        stats: {
+          total: items.length,
+          pendingReview: items.filter((item) => item.releaseStatus === "pending-engineer-review").length,
+          available: items.filter((item) => item.releaseStatus === "available").length,
+          clarificationRequired: items.filter((item) => item.releaseStatus === "clarification-required").length,
+          reviewedDocuments: items.filter((item) => item.workflowMode === "reviewed-document").length,
+        },
+      });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/cases`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const filters = {
+        q: url.searchParams.get("q")?.trim() || undefined,
+        productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
+        releaseStatus: url.searchParams.get("releaseStatus")?.trim() || undefined,
+        serviceTier: url.searchParams.get("serviceTier")?.trim() || undefined,
+        workflowMode: url.searchParams.get("workflowMode")?.trim() || undefined,
+        taskClass: url.searchParams.get("taskClass")?.trim() || undefined,
+        partNumber: url.searchParams.get("partNumber")?.trim() || undefined,
+      };
+      const items = listAdminCases(filters);
+      json(res, {
+        ok: true,
+        items,
+        stats: {
+          total: items.length,
+          pendingReview: items.filter((item) => item.releaseStatus === "pending-engineer-review").length,
+          available: items.filter((item) => item.releaseStatus === "available").length,
+          clarificationRequired: items.filter((item) => item.releaseStatus === "clarification-required").length,
+          reviewedDocuments: items.filter((item) => item.workflowMode === "reviewed-document").length,
+          enterprise: items.filter((item) => item.serviceTier === "enterprise").length,
+        },
+        session,
+      });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/conversations`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const filters = {
+        q: url.searchParams.get("q")?.trim() || undefined,
+        productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
+        releaseStatus: url.searchParams.get("releaseStatus")?.trim() || undefined,
+        serviceTier: url.searchParams.get("serviceTier")?.trim() || undefined,
+        saved: url.searchParams.get("saved")?.trim() || undefined,
+      };
+      const items = listAdminConversations(filters);
+      json(res, { ok: true, items, stats: { total: items.length, saved: items.filter((item) => item.saved).length, pending: items.filter((item) => item.pendingCount > 0).length }, session });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/artifacts`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const filters = {
+        q: url.searchParams.get("q")?.trim() || undefined,
+        artifactType: url.searchParams.get("artifactType")?.trim() || undefined,
+        approvalState: url.searchParams.get("approvalState")?.trim() || undefined,
+        productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
+        serviceTier: url.searchParams.get("serviceTier")?.trim() || undefined,
+        partNumber: url.searchParams.get("partNumber")?.trim() || undefined,
+      };
+      const items = listAdminArtifacts(filters);
+      json(res, { ok: true, items, stats: { total: items.length, approved: items.filter((item) => item.approvalState === "approved").length, reviewed: items.filter((item) => item.approvalState === "reviewed").length, draft: items.filter((item) => item.approvalState === "draft").length }, session });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reddit/reviews`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const reddit = await fetchRedditReviewQueue();
+      json(res, { ok: true, ...reddit, session });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reddit/reviews/decision`) {
+      if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; }
+      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      const body = parseJson<{ replyQueueId: number; action: "approve" | "reject"; reviewerNotes?: string }>(await readBody(req));
+      const result = await submitRedditReviewDecision(body);
+      if (!result.configured) { json(res, { error: "Reddit reviewer service is not configured" }, 503); return true; }
+      if (!result.reachable) { json(res, { error: result.error || "Reddit reviewer service is unavailable" }, 502); return true; }
+      json(res, { ok: true, ...result, queue: await fetchRedditReviewQueue(), session });
       return true;
     }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/overview`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } json(res, { ok: true, metrics: buildCommandCenterSnapshot(), users: listPublicUsers(config).slice(0, MAX_USERS), profiles: listPilotProfiles(config).slice(0, MAX_USERS), conversations: listConversationSummaries({ admin: true }).slice(0, MAX_CONVERSATIONS), session }); return true; }

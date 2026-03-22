@@ -127,6 +127,10 @@ export function inferCateoTaskClass(input: CateoAssistInput): CateoTaskClass {
     input.errorCode,
     input.partNumber,
     input.contextNotes,
+    input.workflow?.documentIntent,
+    input.workflow?.businessJustification,
+    input.workflow?.drjJustification,
+    ...(input.workflow?.complianceScope ?? []),
     input.symptomDescription,
     ...(input.observedConditions ?? []),
     ...(input.requestedArtifacts ?? []),
@@ -166,6 +170,10 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     input.errorCode,
     input.partNumber,
     input.contextNotes,
+    input.workflow?.documentIntent,
+    input.workflow?.businessJustification,
+    input.workflow?.drjJustification,
+    ...(input.workflow?.complianceScope ?? []),
     productLabel,
     matchedFailureCode?.label,
     matchedFailureCode?.description,
@@ -190,6 +198,12 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
 
   const contextSummary = uniqueStrings([
     productLabel ? `Requested deliverable: ${productLabel}.` : undefined,
+    input.workflow?.mode ? `Workflow mode: ${input.workflow.mode.replace(/-/g, " ")}.` : undefined,
+    input.workflow?.documentIntent ? `Requested document intent: ${input.workflow.documentIntent}.` : undefined,
+    input.workflow?.businessJustification ? `Business justification: ${input.workflow.businessJustification}.` : undefined,
+    input.workflow?.drjJustification ? `Decision rationale / justification: ${input.workflow.drjJustification}.` : undefined,
+    input.workflow?.riskTier ? `Declared risk tier: ${input.workflow.riskTier}.` : undefined,
+    input.workflow?.complianceScope?.length ? `Compliance scope: ${input.workflow.complianceScope.join(", ")}.` : undefined,
     input.partNumber ? `User supplied manufacturing part number: ${input.partNumber}.` : undefined,
     partResolution?.partNumber ? `Resolved manufacturing part number: ${partResolution.partNumber} (${partResolution.confidencePct}% confidence).` : undefined,
     partResolution?.partDescription ? `Resolved part description: ${partResolution.partDescription}.` : undefined,
@@ -234,3 +248,5 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     contextSummary,
   };
 }
+
+

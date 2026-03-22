@@ -161,6 +161,20 @@ export interface CateoPartCatalogEntry {
   storageLocation?: string;
 }
 
+export type CateoWorkflowMode = "chat" | "reviewed-document";
+export type CateoRiskTier = "low" | "medium" | "high" | "critical";
+
+export interface CateoWorkflowIntake {
+  mode?: CateoWorkflowMode;
+  requestedBy?: string;
+  documentIntent?: string;
+  businessJustification?: string;
+  drjJustification?: string;
+  complianceScope?: string[];
+  riskTier?: CateoRiskTier;
+  requiresAdminRelease?: boolean;
+}
+
 export interface CateoVerifiedSource {
   title: string;
   url: string;
@@ -233,6 +247,7 @@ export interface CateoAssistInput {
   productOffering?: CateoProductOffering;
   partNumber?: string;
   contextNotes?: string;
+  workflow?: CateoWorkflowIntake;
   symptomDescription: string;
   observedConditions?: string[];
   asset?: CateoAssetRegistryLink;
@@ -926,6 +941,7 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
 
 
 

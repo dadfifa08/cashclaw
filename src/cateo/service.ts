@@ -155,8 +155,23 @@ function uniqueStrings(values: Array<string | undefined | null>): string[] {
 
 function normalizeAssistInput(input: CateoAssistInput): CateoAssistInput {
   const symptomDescription = input.symptomDescription?.trim() || input.query?.trim() || input.title?.trim() || "No symptom description provided.";
+  const workflow = input.workflow
+    ? {
+        mode: input.workflow.mode,
+        requestedBy: input.workflow.requestedBy?.trim() || undefined,
+        documentIntent: input.workflow.documentIntent?.trim() || undefined,
+        businessJustification: input.workflow.businessJustification?.trim() || undefined,
+        drjJustification: input.workflow.drjJustification?.trim() || undefined,
+        complianceScope: input.workflow.complianceScope?.map((entry) => entry.trim()).filter(Boolean) ?? [],
+        riskTier: input.workflow.riskTier,
+        requiresAdminRelease: input.workflow.requiresAdminRelease,
+      }
+    : undefined;
   return {
     ...input,
+    partNumber: input.partNumber?.trim() || undefined,
+    contextNotes: input.contextNotes?.trim() || undefined,
+    workflow,
     symptomDescription,
   };
 }
@@ -237,6 +252,10 @@ function buildPromptPayload(input: CateoAssistInput, context: CateoContextBundle
       title: input.title,
       query: input.query,
       errorCode: input.errorCode,
+      productOffering: input.productOffering,
+      partNumber: input.partNumber,
+      contextNotes: input.contextNotes,
+      workflow: input.workflow,
       symptomDescription: input.symptomDescription,
       observedConditions: input.observedConditions ?? [],
       requestedArtifacts: route.requestedArtifacts,

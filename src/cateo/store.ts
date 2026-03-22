@@ -49,10 +49,24 @@ export interface CaseCatalogRow {
   runId: string;
   title: string;
   taskClass: string;
+  productOffering?: string;
+  workflowMode?: string;
+  partNumber?: string;
+  releaseStatus?: string;
+  confidence?: string;
+  serviceTier?: string;
+  requesterId?: string;
+  ownerUserId?: string;
+  profileId?: string;
+  displayName?: string;
+  organization?: string;
   assetId?: string;
   workOrderId?: string;
+  conversationId?: string;
+  requiresEngineerReview?: boolean;
   artifactIds: string[];
   interactionSummary?: string;
+  riskTier?: string;
   updatedAt: string;
 }
 
@@ -225,10 +239,24 @@ function upsertCaseCatalog(record: CateoCaseRecord): void {
     runId: record.runId,
     title: record.context.title,
     taskClass: record.context.taskClass,
+    productOffering: record.input.productOffering,
+    workflowMode: record.input.workflow?.mode,
+    partNumber: record.context.partResolution?.partNumber ?? record.input.partNumber,
+    releaseStatus: record.interaction?.releaseStatus,
+    confidence: record.interaction?.confidence,
+    serviceTier: record.requester?.serviceTier,
+    requesterId: record.requester?.requesterId,
+    ownerUserId: record.userId,
+    profileId: record.requester?.profileId,
+    displayName: record.requester?.displayName,
+    organization: record.requester?.organization,
     assetId: record.context.asset?.assetId,
     workOrderId: record.context.workOrder?.workOrderId,
+    conversationId: record.conversationId,
+    requiresEngineerReview: record.interaction?.requiresEngineerReview ?? record.requester?.requiresEngineerReview,
     artifactIds: record.artifacts,
     interactionSummary: record.interaction?.message,
+    riskTier: record.input.workflow?.riskTier,
     updatedAt: record.updatedAt,
   };
 
