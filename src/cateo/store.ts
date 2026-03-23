@@ -85,20 +85,52 @@ function getCateoDir(): string {
   return path.join(getConfigDir(), "cateo");
 }
 
+function ensureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+function cateoSubdir(name: string): string {
+  const dir = path.join(getCateoDir(), name);
+  ensureDir(dir);
+  return dir;
+}
+
+export function getCateoRootDir(): string {
+  const dir = getCateoDir();
+  ensureDir(dir);
+  return dir;
+}
+
+export function getCateoArtifactDir(): string {
+  return cateoSubdir("artifacts");
+}
+
+export function getCateoCaseDir(): string {
+  return cateoSubdir("cases");
+}
+
+export function getCateoProcedureDir(): string {
+  return cateoSubdir("procedures");
+}
+
+export function getCateoTemplateDir(): string {
+  return cateoSubdir("templates");
+}
+
+export function getCateoRawNotesDir(): string {
+  return cateoSubdir("raw_notes");
+}
+
 function getArtifactDir(): string {
-  return path.join(getCateoDir(), "artifacts");
+  return getCateoArtifactDir();
 }
 
 function getCaseDir(): string {
-  return path.join(getCateoDir(), "cases");
+  return getCateoCaseDir();
 }
 
 function getDatabaseDir(): string {
-  return path.join(getCateoDir(), "db");
-}
-
-function ensureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return cateoSubdir("db");
 }
 
 function artifactPath(artifactId: string): string {

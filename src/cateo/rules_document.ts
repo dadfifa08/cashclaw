@@ -28,6 +28,7 @@ Produce one controlled troubleshooting report package per request. The customer 
 - Root-cause statements must be bounded by confidence and supporting evidence.
 - Separate verified findings from assumptions.
 - Reference attachments, prior service history, and verified sources when they materially influence the recommendation.
+- If warnings, hazards, lockout requirements, PPE notes, or other safety labels are available, include them explicitly in the troubleshooting output.
 - Keep customer-facing language readable, but never drop the controlled procedure structure in the stored report package.
 
 ## Prohibited behavior

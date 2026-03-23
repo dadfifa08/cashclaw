@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getConfigDir } from "../config.js";
 import { writeProtectedJson } from "../security/secure_store.js";
+import { getCateoProcedureDir } from "./store.js";
 import type {
   CateoArtifactRecord,
   CateoCaseRecord,
@@ -77,6 +77,7 @@ export interface CateoTroubleshootingReportPackage {
   observedConditions: string[];
   assumptions: string[];
   evidenceSummary: string[];
+  warningsAndHazards: string[];
   diagnosticProcedure: Array<{
     stepId: string;
     action: string;
@@ -160,7 +161,7 @@ function buildFailurePaths(procedure: CateoTroubleshootingProcedure | null, reas
 }
 
 function reportDir(): string {
-  return path.join(getConfigDir(), "cateo", "report_packages");
+  return getCateoProcedureDir();
 }
 
 export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, artifacts: CateoArtifactRecord[]): CateoTroubleshootingReportPackage {
@@ -257,6 +258,11 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
       ...caseRecord.context.contextSummary,
       ...(reasoning?.evidenceRequests ?? []),
     ]),
+    warningsAndHazards: unique([
+      ...(procedure?.safetyPrecautions ?? []),
+      ...caseRecord.context.attachments.flatMap((attachment) => attachment.notes.filter((signal: string) => /warning|hazard|lockout|ppe|caution|danger/i.test(signal))),
+      ...caseRecord.context.contextSummary.filter((entry) => /warning|hazard|lockout|ppe|caution|danger/i.test(entry)),
+    ]),
     diagnosticProcedure: (procedure?.steps ?? []).map((step) => ({
       stepId: step.id,
       action: step.action,
@@ -327,3 +333,4 @@ export function persistTroubleshootingReportPackage(caseRecord: CateoCaseRecord,
   writeProtectedJson(reportPackage.indexing.jsonPath, reportPackage);
   return reportPackage;
 }
+

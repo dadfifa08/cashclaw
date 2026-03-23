@@ -93,6 +93,9 @@ export interface CateoQuotaSnapshot {
   completedRequests: number;
   failedRequests: number;
   remainingRequests: number;
+  monthlyReportLimit: number;
+  acceptedReportsThisMonth: number;
+  remainingReportsThisMonth: number;
   dailyInputTokenLimit: number;
   dailyOutputTokenLimit: number;
   dailyTotalTokenLimit: number;
@@ -172,6 +175,16 @@ function saveProfileStore(store: CateoProfileStore): void {
 
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function monthUtc(day: string = todayUtc()): string {
+  return day.slice(0, 7);
+}
+
+function monthlyReportLimitForTier(serviceTier: CateoServiceTier): number {
+  if (serviceTier === "reviewed") return 25;
+  if (serviceTier === "enterprise") return 120;
+  return 10;
 }
 
 function normalizeText(value: string | undefined, maxLength: number): string | undefined {
@@ -271,6 +284,10 @@ function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): 
   const pilot = getPilotConfig(config);
   const usage = normalizeUsageDay(record);
   const quota = effectiveQuotaForTier(pilot.quota, record.serviceTier);
+  const monthlyReportLimit = monthlyReportLimitForTier(record.serviceTier);
+  const acceptedReportsThisMonth = [usage, ...(record.usageHistory ?? [])]
+    .filter((entry) => monthUtc(entry.day) === monthUtc(usage.day))
+    .reduce((sum, entry) => sum + Math.max(0, entry.acceptedRequests), 0);
   const history = [usage, ...(record.usageHistory ?? [])]
     .map((entry) => toHistoryPoint(entry))
     .reduce<CateoQuotaHistoryPoint[]>((carry, current) => {
@@ -301,6 +318,9 @@ function toProfileSnapshot(config: CashClawConfig, record: CateoProfileRecord): 
       completedRequests: usage.completedRequests,
       failedRequests: usage.failedRequests,
       remainingRequests: Math.max(0, quota.dailyRequestLimit - usage.acceptedRequests),
+      monthlyReportLimit,
+      acceptedReportsThisMonth,
+      remainingReportsThisMonth: Math.max(0, monthlyReportLimit - acceptedReportsThisMonth),
       dailyInputTokenLimit: quota.dailyInputTokenLimit,
       dailyOutputTokenLimit: quota.dailyOutputTokenLimit,
       dailyTotalTokenLimit: quota.dailyTotalTokenLimit,
@@ -467,8 +487,16 @@ export function reservePilotQuota(
   const usage = record.usage;
   const quota = effectiveQuotaForTier(pilot.quota, record.serviceTier);
   const estimate = quota.enabled ? quota.reservationTokensPerJob : 0;
+  const currentMonth = monthUtc(usage.day);
+  const acceptedReportsThisMonth = [usage, ...(record.usageHistory ?? [])]
+    .filter((entry) => monthUtc(entry.day) == currentMonth)
+    .reduce((sum, entry) => sum + Math.max(0, entry.acceptedRequests), 0);
+  const monthlyReportLimit = monthlyReportLimitForTier(record.serviceTier);
   if (usage.pendingJobs >= quota.maxPendingJobsPerProfile) {
     throw new CateoPilotQuotaError("pending_limit_exceeded", `This pilot profile already has ${usage.pendingJobs} pending job(s).`, 429, currentSnapshot);
+  }
+  if (acceptedReportsThisMonth >= monthlyReportLimit) {
+    throw new CateoPilotQuotaError("monthly_report_limit_exceeded", `This profile has reached the monthly troubleshooting limit of ${monthlyReportLimit} reports.`, 429, currentSnapshot);
   }
   if (quota.enabled && usage.acceptedRequests >= quota.dailyRequestLimit) {
     throw new CateoPilotQuotaError("request_limit_exceeded", "This pilot profile has reached the daily request limit.", 429, currentSnapshot);

@@ -37,6 +37,13 @@ export interface CateoPartMasterRecord {
   description?: string;
   manufacturer?: string;
   partFamily?: string;
+  entityTypes: string[];
+  parentPartNumbers: string[];
+  childPartNumbers: string[];
+  assemblyPartNumbers: string[];
+  componentPartNumbers: string[];
+  materialClasses: string[];
+  specificationRefs: string[];
   aliases: string[];
   interchangeablePartNumbers: string[];
   componentTitles: string[];
@@ -139,6 +146,50 @@ function appendRelationTargets(targets: string[], relations: CateoArtifactRelati
   ]);
 }
 
+function inferEntityTypes(input: { displayTitle?: string; description?: string; taxonomyTags?: string[]; componentTitle?: string; requiredPartCount?: number; relationTargets?: string[] }): string[] {
+  const haystack = [
+    input.displayTitle,
+    input.description,
+    input.componentTitle,
+    ...(input.taxonomyTags ?? []),
+    ...(input.relationTargets ?? []),
+  ].filter(Boolean).join(" ").toLowerCase();
+  const entityTypes: string[] = [];
+  if (/assembly|subassembly|module|manifold|harness|kit/.test(haystack) || (input.requiredPartCount ?? 0) > 1) entityTypes.push("assembly");
+  if (/component|sensor|board|valve|motor|pump|switch|connector/.test(haystack) || Boolean(input.componentTitle)) entityTypes.push("component");
+  if (/material|alloy|polymer|resin|steel|aluminum|stainless|copper|ceramic|adhesive|lubricant/.test(haystack)) entityTypes.push("material");
+  if (/consumable|filter|sealant|grease|oil|solvent/.test(haystack)) entityTypes.push("consumable");
+  if (/software|firmware|configuration|recipe/.test(haystack)) entityTypes.push("software");
+  return unique(entityTypes.length > 0 ? entityTypes : ["part"]);
+}
+
+function inferMaterialClasses(input: { description?: string; taxonomyTags?: string[]; displayTitle?: string }): string[] {
+  const haystack = [input.displayTitle, input.description, ...(input.taxonomyTags ?? [])].filter(Boolean).join(" ").toLowerCase();
+  const mappings = [
+    ["stainless-steel", /stainless|316l|304/],
+    ["aluminum", /aluminum|aluminium/],
+    ["copper", /copper|brass|bronze/],
+    ["polymer", /polymer|plastic|ptfe|peek|pvc|polyethylene|polypropylene/],
+    ["ceramic", /ceramic|glass/],
+    ["elastomer", /rubber|silicone|viton|epdm/],
+    ["electronic", /pcb|board|semiconductor|silicon/],
+    ["fluid", /oil|grease|solvent|coolant|reagent/],
+  ] as const;
+  return mappings.filter(([, pattern]) => pattern.test(haystack)).map(([label]) => label);
+}
+
+function relatedPartNumbers(relations: CateoArtifactRelation[] | undefined, kinds: string[]): string[] {
+  return unique((relations ?? [])
+    .filter((relation) => relation.targetType === "part" && kinds.includes(relation.kind))
+    .map((relation) => relation.targetId));
+}
+
+function relatedDocumentRefs(relations: CateoArtifactRelation[] | undefined): string[] {
+  return unique((relations ?? [])
+    .filter((relation) => relation.targetType === "document")
+    .map((relation) => relation.targetId));
+}
+
 function emptyTaxonomySnapshot(): CateoControlledTaxonomySnapshot {
   return {
     version: PART_MASTER_VERSION,
@@ -223,6 +274,13 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
         description: metadata.parts?.primaryPartDescription ?? metadata.partDescription ?? undefined,
         manufacturer: metadata.asset?.manufacturer ?? undefined,
         partFamily: metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily,
+        entityTypes: [],
+        parentPartNumbers: [],
+        childPartNumbers: [],
+        assemblyPartNumbers: [],
+        componentPartNumbers: [],
+        materialClasses: [],
+        specificationRefs: [],
         aliases: [],
         interchangeablePartNumbers: [],
         componentTitles: [],
@@ -261,6 +319,19 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.description = current.description || metadata.parts?.primaryPartDescription || metadata.partDescription || undefined;
       current.manufacturer = current.manufacturer || metadata.asset?.manufacturer || undefined;
       current.partFamily = current.partFamily || metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily || undefined;
+      const relationTargets = appendRelationTargets([], metadata.relations);
+      const childPartNumbers = unique([
+        ...relatedPartNumbers(metadata.relations, ["requires-part"]),
+        ...(metadata.parts?.requiredPartLines ?? []).map((line) => line.partNumber),
+      ]);
+      const parentPartNumbers = relatedPartNumbers(metadata.relations, ["belongs-to-component", "installed-on"]);
+      current.entityTypes = unique([...current.entityTypes, ...inferEntityTypes({ displayTitle: current.displayTitle, description: current.description, taxonomyTags: metadata.taxonomyTags, componentTitle: metadata.componentTitle, requiredPartCount: metadata.parts?.requiredPartLines?.length, relationTargets })]);
+      current.parentPartNumbers = unique([...current.parentPartNumbers, ...parentPartNumbers]);
+      current.childPartNumbers = unique([...current.childPartNumbers, ...childPartNumbers]);
+      current.assemblyPartNumbers = unique([...current.assemblyPartNumbers, ...(current.entityTypes.includes("assembly") ? [current.canonicalPartNumber] : []), ...parentPartNumbers]);
+      current.componentPartNumbers = unique([...current.componentPartNumbers, ...(current.entityTypes.includes("component") ? [current.canonicalPartNumber] : []), ...childPartNumbers]);
+      current.materialClasses = unique([...current.materialClasses, ...inferMaterialClasses({ displayTitle: current.displayTitle, description: current.description, taxonomyTags: metadata.taxonomyTags })]);
+      current.specificationRefs = unique([...current.specificationRefs, ...relatedDocumentRefs(metadata.relations), ...(metadata.parts?.billOfMaterialsRefs ?? [])]);
       current.aliases = unique([
         ...current.aliases,
         ...partNumbers,
@@ -332,6 +403,13 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       description: record.context.partResolution?.partDescription ?? undefined,
       manufacturer: record.context.partResolution?.manufacturer ?? record.context.machine?.manufacturer ?? undefined,
       partFamily: undefined,
+      entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model }),
+      parentPartNumbers: [],
+      childPartNumbers: [],
+      assemblyPartNumbers: [],
+      componentPartNumbers: [],
+      materialClasses: inferMaterialClasses({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType].filter(Boolean) as string[] }),
+      specificationRefs: [],
       aliases: unique([resolvedPart, ...(record.context.partResolution?.aliases ?? [])]),
       interchangeablePartNumbers: [],
       componentTitles: [],
