@@ -204,6 +204,9 @@ export interface CateoVerifiedSource {
   url: string;
   domain?: string;
   reason?: string;
+  documentType?: string;
+  publisherType?: string;
+  summary?: string;
 }
 
 export interface CateoPartResolution {
@@ -218,6 +221,10 @@ export interface CateoPartResolution {
   searchQueries: string[];
   failureModes: string[];
   preventiveMaintenanceHints: string[];
+  hazardSignals: string[];
+  expectedValues: string[];
+  groundedFindings: string[];
+  referenceDocuments: string[];
   verifiedSources: CateoVerifiedSource[];
 }
 

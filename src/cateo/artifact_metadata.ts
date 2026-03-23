@@ -224,6 +224,7 @@ export function buildArtifactEnterpriseMetadata(args: {
   const webSourceRefs = (args.context.partResolution?.verifiedSources ?? []).map((source) => `${source.title} <${source.url}>`);
   const documentRefs = unique([
     ...args.context.attachments.filter((attachment) => attachment.kind === "document").map((attachment) => attachment.name),
+    ...(args.context.partResolution?.referenceDocuments ?? []),
     ...webSourceRefs,
   ]);
   const relations = buildRelations({
@@ -316,7 +317,14 @@ export function buildArtifactEnterpriseMetadata(args: {
     evidence: {
       attachmentIds: args.context.attachments.map((attachment) => attachment.attachmentId),
       attachmentNames: args.context.attachments.map((attachment) => attachment.name),
-      evidenceSummary: unique([...args.context.contextSummary, ...symptomSummary, ...(args.context.partResolution?.evidence ?? [])]),
+      evidenceSummary: unique([
+        ...args.context.contextSummary,
+        ...symptomSummary,
+        ...(args.context.partResolution?.evidence ?? []),
+        ...(args.context.partResolution?.groundedFindings ?? []),
+        ...(args.context.partResolution?.expectedValues ?? []).map((value) => `Expected value: ${value}`),
+        ...(args.context.partResolution?.hazardSignals ?? []).map((value) => `Hazard: ${value}`),
+      ]),
       serviceHistoryCount: args.context.serviceHistory.length,
       documentRefs,
       digitalTwinStatus: args.context.digitalTwin?.status,
@@ -337,7 +345,12 @@ export function buildArtifactEnterpriseMetadata(args: {
       analysisSignals: mediaSignals,
     },
     actions: {
-      recommendedActions: unique([...args.finalSynthesis.nextActions, ...args.reviewerDecision.requiredFollowUp, ...(args.context.partResolution?.preventiveMaintenanceHints ?? [])]),
+      recommendedActions: unique([
+        ...args.finalSynthesis.nextActions,
+        ...args.reviewerDecision.requiredFollowUp,
+        ...(args.context.partResolution?.preventiveMaintenanceHints ?? []),
+        ...(args.context.partResolution?.hazardSignals ?? []).map((value) => `Apply control: ${value}`),
+      ]),
       validationSteps,
       requiredParts,
       requiredTools,

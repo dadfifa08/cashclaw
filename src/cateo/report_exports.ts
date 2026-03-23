@@ -66,7 +66,8 @@ export interface CateoTroubleshootingReportPackage {
     manufacturer?: string;
     confidencePct?: number;
     aliases: string[];
-    verifiedSources: Array<{ title: string; url: string; reason?: string }>;
+    referenceDocuments: string[];
+    verifiedSources: Array<{ title: string; url: string; reason?: string; documentType?: string; publisherType?: string; summary?: string }>;
   };
   interaction: {
     message?: string;
@@ -78,6 +79,11 @@ export interface CateoTroubleshootingReportPackage {
   assumptions: string[];
   evidenceSummary: string[];
   warningsAndHazards: string[];
+  sourceGrounding: {
+    groundedFindings: string[];
+    expectedValues: string[];
+    referenceDocuments: string[];
+  };
   diagnosticProcedure: Array<{
     stepId: string;
     action: string;
@@ -232,10 +238,14 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
       manufacturer: caseRecord.context.partResolution?.manufacturer || caseRecord.context.machine?.manufacturer,
       confidencePct: caseRecord.context.partResolution?.confidencePct,
       aliases: caseRecord.context.partResolution?.aliases ?? [],
+      referenceDocuments: caseRecord.context.partResolution?.referenceDocuments ?? [],
       verifiedSources: (caseRecord.context.partResolution?.verifiedSources ?? []).map((source) => ({
         title: source.title,
         url: source.url,
         reason: source.reason,
+        documentType: source.documentType,
+        publisherType: source.publisherType,
+        summary: source.summary,
       })),
     },
     interaction: {
@@ -256,13 +266,20 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
     evidenceSummary: unique([
       ...(procedure?.evidenceSummary ?? []),
       ...caseRecord.context.contextSummary,
+      ...(caseRecord.context.partResolution?.groundedFindings ?? []),
       ...(reasoning?.evidenceRequests ?? []),
     ]),
     warningsAndHazards: unique([
       ...(procedure?.safetyPrecautions ?? []),
+      ...(caseRecord.context.partResolution?.hazardSignals ?? []),
       ...caseRecord.context.attachments.flatMap((attachment) => attachment.notes.filter((signal: string) => /warning|hazard|lockout|ppe|caution|danger/i.test(signal))),
       ...caseRecord.context.contextSummary.filter((entry) => /warning|hazard|lockout|ppe|caution|danger/i.test(entry)),
     ]),
+    sourceGrounding: {
+      groundedFindings: caseRecord.context.partResolution?.groundedFindings ?? [],
+      expectedValues: caseRecord.context.partResolution?.expectedValues ?? [],
+      referenceDocuments: caseRecord.context.partResolution?.referenceDocuments ?? [],
+    },
     diagnosticProcedure: (procedure?.steps ?? []).map((step) => ({
       stepId: step.id,
       action: step.action,
@@ -270,7 +287,10 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
       expectedResult: step.expectedResult,
       escalationTrigger: step.escalationTrigger,
     })),
-    expectedValues: buildExpectedValues(procedure, checklist),
+    expectedValues: unique([
+      ...(caseRecord.context.partResolution?.expectedValues ?? []),
+      ...buildExpectedValues(procedure, checklist),
+    ]),
     failurePaths: buildFailurePaths(procedure, reasoning),
     rootCause: {
       statement: reasoning?.rootCauseStatement || report?.summary || procedure?.objective || caseRecord.trace.finalSynthesis.rootCauseStatement,
@@ -305,7 +325,7 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
       ...(caseRecord.context.partResolution?.verifiedSources ?? []).map((source) => ({
         sourceType: "verified-source" as const,
         label: source.title,
-        detail: source.reason,
+        detail: [source.reason, source.summary, source.documentType, source.publisherType].filter(Boolean).join(' | ') || undefined,
         url: source.url,
       })),
       ...artifacts.map((artifact) => ({

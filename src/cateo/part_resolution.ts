@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import type { CashClawConfig } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import type { CateoAssistInput, CateoPartCatalogEntry, CateoPartResolution, CateoVerifiedSource } from "./types.js";
@@ -16,6 +15,9 @@ interface RawVerifiedSource {
   url?: string | null;
   domain?: string | null;
   reason?: string | null;
+  documentType?: string | null;
+  publisherType?: string | null;
+  summary?: string | null;
 }
 
 interface RawPartResolution {
@@ -30,6 +32,10 @@ interface RawPartResolution {
   searchQueries?: string[] | null;
   failureModes?: string[] | null;
   preventiveMaintenanceHints?: string[] | null;
+  hazardSignals?: string[] | null;
+  expectedValues?: string[] | null;
+  groundedFindings?: string[] | null;
+  referenceDocuments?: string[] | null;
   verifiedSources?: RawVerifiedSource[] | null;
 }
 
@@ -55,6 +61,9 @@ function normalizeSource(input: RawVerifiedSource | null | undefined): CateoVeri
     url,
     domain: input?.domain?.trim(),
     reason: input?.reason?.trim(),
+    documentType: input?.documentType?.trim(),
+    publisherType: input?.publisherType?.trim(),
+    summary: input?.summary?.trim(),
   };
 }
 
@@ -75,6 +84,10 @@ function normalizeResolution(raw: RawPartResolution, fallback: CateoPartResoluti
     searchQueries: unique([...(raw.searchQueries ?? []), ...fallback.searchQueries]).slice(0, 8),
     failureModes: unique([...(raw.failureModes ?? []), ...fallback.failureModes]).slice(0, 8),
     preventiveMaintenanceHints: unique([...(raw.preventiveMaintenanceHints ?? []), ...fallback.preventiveMaintenanceHints]).slice(0, 8),
+    hazardSignals: unique([...(raw.hazardSignals ?? []), ...fallback.hazardSignals]).slice(0, 10),
+    expectedValues: unique([...(raw.expectedValues ?? []), ...fallback.expectedValues]).slice(0, 10),
+    groundedFindings: unique([...(raw.groundedFindings ?? []), ...fallback.groundedFindings]).slice(0, 12),
+    referenceDocuments: unique([...(raw.referenceDocuments ?? []), ...fallback.referenceDocuments]).slice(0, 12),
     verifiedSources: verifiedSources.length > 0 ? verifiedSources : fallback.verifiedSources,
   };
 }
@@ -85,6 +98,9 @@ function collectPromptCorpus(input: CateoAssistInput): string {
     input.query,
     input.symptomDescription,
     input.errorCode,
+    input.partNumber,
+    input.issueType,
+    input.contextNotes,
     ...(input.observedConditions ?? []),
     input.asset?.assetId,
     input.asset?.assetType,
@@ -109,6 +125,10 @@ function candidateCounts(input: CateoAssistInput): Map<string, number> {
       `PN ${candidate}`,
     ].some((marker) => corpus.includes(marker)) ? 2 : 0;
     map.set(candidate, (map.get(candidate) ?? 0) + 1 + explicitContextBoost);
+  }
+  const explicitPartNumber = input.partNumber?.trim().toUpperCase();
+  if (explicitPartNumber) {
+    map.set(explicitPartNumber, (map.get(explicitPartNumber) ?? 0) + 6);
   }
   for (const part of input.partsCatalog ?? []) {
     const candidate = part.sku.trim().toUpperCase();
@@ -155,6 +175,10 @@ function heuristicResolution(input: CateoAssistInput): CateoPartResolution {
     ]),
     failureModes: [],
     preventiveMaintenanceHints: [],
+    hazardSignals: [],
+    expectedValues: [],
+    groundedFindings: [],
+    referenceDocuments: [],
     verifiedSources: [],
   };
 }
@@ -168,8 +192,9 @@ function buildPartSearchPrompt(input: CateoAssistInput, fallback: CateoPartResol
     "Identify the exact manufacturing part number involved in this engineering request.",
     "Use the provided prompt, attachment-derived observations, and web search results.",
     "Only return a high confidence part number when the evidence is strong. If confidence is below 80%, set needsClarification=true and ask one concise follow-up question.",
-    "Prefer manufacturer documentation, OEM pages, manuals, datasheets, and reputable distributor listings.",
-    "Do not fabricate sources or part numbers.",
+    "Prefer manufacturer documentation, OEM pages, manuals, datasheets, service bulletins, and reputable distributor listings.",
+    "Collect concrete hazard labels, expected values, diagnostic anchors, and reference document titles whenever the sources support them.",
+    "Do not fabricate sources, part numbers, warnings, or operating values.",
     "Request context:",
     JSON.stringify({
       title: input.title,
@@ -241,6 +266,10 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
                   searchQueries: { type: "array", items: { type: "string" } },
                   failureModes: { type: "array", items: { type: "string" } },
                   preventiveMaintenanceHints: { type: "array", items: { type: "string" } },
+                  hazardSignals: { type: "array", items: { type: "string" } },
+                  expectedValues: { type: "array", items: { type: "string" } },
+                  groundedFindings: { type: "array", items: { type: "string" } },
+                  referenceDocuments: { type: "array", items: { type: "string" } },
                   verifiedSources: {
                     type: "array",
                     items: {
@@ -251,8 +280,11 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
                         url: { type: "string" },
                         domain: { type: ["string", "null"] },
                         reason: { type: ["string", "null"] },
+                        documentType: { type: ["string", "null"] },
+                        publisherType: { type: ["string", "null"] },
+                        summary: { type: ["string", "null"] },
                       },
-                      required: ["title", "url", "domain", "reason"],
+                      required: ["title", "url", "domain", "reason", "documentType", "publisherType", "summary"],
                     },
                   },
                 },
@@ -268,6 +300,10 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
                   "searchQueries",
                   "failureModes",
                   "preventiveMaintenanceHints",
+                  "hazardSignals",
+                  "expectedValues",
+                  "groundedFindings",
+                  "referenceDocuments",
                   "verifiedSources"
                 ],
               },
@@ -279,7 +315,7 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
               content: [
                 {
                   type: "input_text",
-                  text: "You are Cateo's part-identification and web-research stage. Resolve the exact manufacturing part number, preferring manufacturer and OEM sources. Use only the evidence you can support. If confidence is below 80 percent, ask a single clarifying follow-up question."
+                  text: "You are Cateo's part-identification and web-research stage. Resolve the exact manufacturing part number, preferring manufacturer, OEM, service-manual, and datasheet sources. Return only evidence-backed findings. If confidence is below 80 percent, ask a single clarifying follow-up question. Capture hazards, expected values, reference documents, and concise grounded findings when the sources support them."
                 }
               ]
             },
@@ -321,6 +357,8 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
           partNumber: normalized.partNumber,
           confidencePct: normalized.confidencePct,
           sourceCount: normalized.verifiedSources.length,
+          hazardCount: normalized.hazardSignals.length,
+          expectedValueCount: normalized.expectedValues.length,
         },
       });
       return normalized;
@@ -339,6 +377,140 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
   }
 
   return fallback;
+}
+
+async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssistInput, resolved: CateoPartResolution, requestId?: string): Promise<CateoPartResolution> {
+  if (!resolved.partNumber || resolved.verifiedSources.length > 0) {
+    return resolved;
+  }
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${config.llm.apiKey}`,
+  };
+
+  const prompt = [
+    `The manufacturing part number has already been resolved as ${resolved.partNumber}.`,
+    resolved.manufacturer ? `Manufacturer: ${resolved.manufacturer}.` : "",
+    resolved.partDescription ? `Part description: ${resolved.partDescription}.` : "",
+    `Original issue: ${input.symptomDescription}`,
+    input.issueType ? `Issue type: ${input.issueType}.` : "",
+    input.businessType ? `Business type: ${input.businessType}.` : "",
+    "Find 1 to 4 reliable sources that directly support the identified part, preferring manufacturer/OEM manuals, datasheets, service bulletins, and reputable technical distributors.",
+    "Return hazards, expected values, grounded findings, and reference document titles only when the sources support them.",
+    "Do not change the part number. Do not return empty verifiedSources unless the web search genuinely failed.",
+  ].filter(Boolean).join("\n\n");
+
+  for (const model of SEARCH_MODEL_CANDIDATES) {
+    try {
+      const response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          tools: [{ type: "web_search_preview" }],
+          max_output_tokens: 1200,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "cateo_part_source_backfill",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  partDescription: { type: ["string", "null"] },
+                  manufacturer: { type: ["string", "null"] },
+                  failureModes: { type: "array", items: { type: "string" } },
+                  preventiveMaintenanceHints: { type: "array", items: { type: "string" } },
+                  hazardSignals: { type: "array", items: { type: "string" } },
+                  expectedValues: { type: "array", items: { type: "string" } },
+                  groundedFindings: { type: "array", items: { type: "string" } },
+                  referenceDocuments: { type: "array", items: { type: "string" } },
+                  verifiedSources: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        title: { type: "string" },
+                        url: { type: "string" },
+                        domain: { type: ["string", "null"] },
+                        reason: { type: ["string", "null"] },
+                        documentType: { type: ["string", "null"] },
+                        publisherType: { type: ["string", "null"] },
+                        summary: { type: ["string", "null"] },
+                      },
+                      required: ["title", "url", "domain", "reason", "documentType", "publisherType", "summary"],
+                    },
+                  },
+                },
+                required: ["partDescription", "manufacturer", "failureModes", "preventiveMaintenanceHints", "hazardSignals", "expectedValues", "groundedFindings", "referenceDocuments", "verifiedSources"],
+              },
+            },
+          },
+          input: [
+            {
+              role: "system",
+              content: [{ type: "input_text", text: "You are Cateo's source-backfill stage. Keep the resolved part number fixed, gather only reliable sources, and return source-backed hazards, expected values, and concise grounded findings." }],
+            },
+            {
+              role: "user",
+              content: [{ type: "input_text", text: prompt }],
+            },
+          ],
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`OpenAI source backfill failed for ${model}: ${response.status} ${await response.text()}`);
+      }
+
+      const payload = await response.json() as Record<string, unknown>;
+      const outputText = extractOutputText(payload);
+      if (!outputText) {
+        throw new Error(`OpenAI source backfill returned no structured output for ${model}`);
+      }
+
+      const parsed = JSON.parse(outputText) as RawPartResolution;
+      const merged = normalizeResolution({
+        ...parsed,
+        partNumber: resolved.partNumber,
+        confidencePct: resolved.confidencePct,
+        needsClarification: resolved.needsClarification,
+        clarifyingQuestion: resolved.clarifyingQuestion ?? null,
+        evidence: [...(resolved.evidence ?? []), ...(parsed.evidence ?? [])],
+        aliases: [...(resolved.aliases ?? []), ...(parsed.aliases ?? [])],
+        searchQueries: [...(resolved.searchQueries ?? [])],
+      }, resolved);
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_part_resolution",
+        action: "source_backfill",
+        outcome: merged.verifiedSources.length > 0 ? "success" : "warn",
+        severity: merged.verifiedSources.length > 0 ? "info" : "warn",
+        message: merged.verifiedSources.length > 0
+          ? `Cateo backfilled ${merged.verifiedSources.length} verified source(s) for ${merged.partNumber}.`
+          : `Cateo could not backfill verified sources for ${merged.partNumber}.`,
+        requestId,
+        metadata: { model, partNumber: merged.partNumber, sourceCount: merged.verifiedSources.length },
+      });
+      return merged;
+    } catch (error) {
+      appendAuditEvent({
+        actor: "runtime",
+        category: "cateo_part_resolution",
+        action: "source_backfill",
+        outcome: "failed",
+        severity: "warn",
+        message: error instanceof Error ? error.message : "OpenAI source backfill failed",
+        requestId,
+        metadata: { model, partNumber: resolved.partNumber },
+      });
+    }
+  }
+
+  return resolved;
 }
 
 export async function resolveCateoPart(config: CashClawConfig, input: CateoAssistInput, requestId?: string): Promise<CateoPartResolution> {
@@ -361,7 +533,10 @@ export async function resolveCateoPart(config: CashClawConfig, input: CateoAssis
     return fallback;
   }
 
-  const resolved = await searchWithOpenAI(config, input, fallback, requestId);
+  let resolved = await searchWithOpenAI(config, input, fallback, requestId);
+  if (resolved.partNumber && resolved.verifiedSources.length === 0) {
+    resolved = await backfillVerifiedSources(config, input, resolved, requestId);
+  }
   const catalog = pickCatalogMatch(input, resolved.partNumber);
   if (catalog) {
     return normalizeResolution({
@@ -369,6 +544,8 @@ export async function resolveCateoPart(config: CashClawConfig, input: CateoAssis
       partDescription: resolved.partDescription || catalog.description,
       aliases: unique([...(resolved.aliases ?? []), catalog.sku]),
       evidence: unique([...(resolved.evidence ?? []), `Matched the resolved part number to internal catalog entry ${catalog.sku}.`]),
+      groundedFindings: unique([...(resolved.groundedFindings ?? []), `Internal parts catalog confirms ${catalog.sku} as a valid local identifier.`]),
+      referenceDocuments: unique([...(resolved.referenceDocuments ?? []), `Internal catalog entry ${catalog.sku}`]),
       confidencePct: Math.max(resolved.confidencePct, 88),
       needsClarification: false,
       clarifyingQuestion: null,

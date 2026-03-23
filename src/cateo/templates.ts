@@ -1,7 +1,7 @@
 import type { CateoArtifactType, CateoInstructionTemplate, CateoTaskClass } from "./types.js";
 import { loadTroubleshootingRulesDocument } from "./rules_document.js";
 
-const TEMPLATE_VERSION = "1.1.0";
+const TEMPLATE_VERSION = "1.2.0";
 
 function uniqueArtifacts(values: CateoArtifactType[]): CateoArtifactType[] {
   return [...new Set(values)];
@@ -13,9 +13,9 @@ function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifac
     version: TEMPLATE_VERSION,
     taskClass,
     responseBehavior: [
-      "Stay grounded in provided evidence, prior artifacts, and known machine context before using general reasoning.",
+      "Stay grounded in provided evidence, prior artifacts, known machine context, and verified external references before using general reasoning.",
       "Produce engineering-grade structured content that can be stored as a controlled artifact.",
-      "Prefer deterministic steps, explicit assumptions, and bounded conclusions over conversational filler.",
+      "Prefer deterministic steps, explicit assumptions, bounded conclusions, and cited source-backed details over conversational filler.",
     ],
     terminology: [
       "Use subsystem, interface, input, output, control logic, failure mode, acceptance criteria, and verification language.",
@@ -23,12 +23,13 @@ function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifac
     ],
     fieldExpectations: [
       "Include a concrete problem definition, system context, observed conditions, assumptions, and ranked hypotheses.",
-      "Include recommended actions, validation procedures, risk implications, and provenance-ready references.",
-      "Do not leave confidence, risk, or follow-up actions implicit.",
+      "Include recommended actions, validation procedures, risk implications, provenance-ready references, and explicit hazards when available.",
+      "Use manufacturer, OEM, manual, datasheet, or other verified references when they materially improve specificity.",
+      "Do not leave confidence, risk, expected values, or follow-up actions implicit.",
     ],
     outputConstraints: [
       "Return schema-compatible JSON only for the stage contract.",
-      "Avoid unsupported claims, hidden leaps, or vague release-to-service recommendations.",
+      "Avoid unsupported claims, hidden leaps, vague release-to-service recommendations, or generic filler detached from the evidence.",
       "Keep the output suitable for audit logging, revision history, and downstream analytics.",
     ],
     requiredArtifacts: uniqueArtifacts(requiredArtifacts),

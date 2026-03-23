@@ -310,6 +310,7 @@ function fallbackLeadPlan(route: CateoRoutingDecision, context: CateoContextBund
     ]),
     partsConsiderations: uniqueStrings([
       context.suggestedParts.length > 0 ? `Known candidate parts: ${context.suggestedParts.map((entry) => entry.sku).join(", ")}.` : "No confident part mapping is available yet.",
+      context.partResolution?.referenceDocuments?.length ? `Source document anchors: ${context.partResolution.referenceDocuments.slice(0, 4).join(", ")}.` : "No verified external document anchors are available yet.",
     ]),
   };
 }
@@ -328,6 +329,7 @@ function fallbackCritique(context: CateoContextBundle): CateoChallengerCritique 
     evidenceGaps: uniqueStrings([
       context.digitalTwin ? "Need calibrated dimensional evidence and reference-state confirmation." : "Need calibrated measurements, not only narrative symptoms.",
       context.serviceHistory.length === 0 ? "Need at least one recent maintenance or work-order history entry." : "Need confirmation that previous corrective actions actually resolved prior events.",
+      context.partResolution?.verifiedSources?.length ? "Cross-check the draft against the verified manufacturer/manual source set before release." : "No verified external source set is available, so generic engineering assumptions must be kept explicit.",
     ]),
     recommendedAdjustments: [
       "Add an explicit verification step that distinguishes root cause from symptomatic alarms.",
@@ -1681,6 +1683,7 @@ export async function generateCateoArtifacts(
       "You are Cateo's builder model for structured engineering artifacts.",
       "Return JSON only.",
       "Obey the instruction template and produce schema-ready artifacts. Invalid or incomplete drafts will be rejected and retried.",
+      "When verified source findings, expected values, document references, or hazard labels are present, weave them into the procedure, warnings, and verification steps instead of producing generic advice.",
       "Instruction template:",
       templatePayload,
       "Request and context payload:",
@@ -1693,7 +1696,7 @@ export async function generateCateoArtifacts(
       stage: "builder",
       llm: runtime.structure!,
       modelInfo: runtime.meta.structure!,
-      systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. No prose outside JSON.",
+      systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
       userPrompt: builderPrompt,
       fallback: {
         packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
@@ -1769,7 +1772,7 @@ export async function generateCateoArtifacts(
         stage: "builder",
         llm: runtime.structure!,
         modelInfo: runtime.meta.structure!,
-        systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. No prose outside JSON.",
+        systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
         userPrompt: builderRetryPrompt,
         fallback: {
           packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
@@ -1850,6 +1853,7 @@ export async function generateCateoArtifacts(
       "You are Cateo's reviewer model for technical accuracy, completeness, and compliance.",
       "Return JSON only.",
       "Evaluate blind spots, unsupported claims, measurable criteria, and whether the package should remain draft or advance to reviewed.",
+      "Explicitly check whether verified source findings, expected values, reference documents, and hazard labels were actually used where relevant.",
       "Instruction template:",
       templatePayload,
       "Request and context payload:",
@@ -1866,7 +1870,7 @@ export async function generateCateoArtifacts(
       stage: "reviewer",
       llm: runtime.challenger!,
       modelInfo: runtime.meta.challenger!,
-      systemPrompt: "Return a compact JSON object with keys alternateHypotheses, blindSpots, missingAssumptions, evidenceGaps, recommendedAdjustments, and reviewDecision. reviewDecision must include overallStatus, technicalAccuracy, completeness, compliance, findings, approvedArtifactTypes, approvalState, confidence, summary, and requiredFollowUp. No prose outside JSON.",
+      systemPrompt: "Return a compact JSON object with keys alternateHypotheses, blindSpots, missingAssumptions, evidenceGaps, recommendedAdjustments, and reviewDecision. reviewDecision must include overallStatus, technicalAccuracy, completeness, compliance, findings, approvedArtifactTypes, approvalState, confidence, summary, and requiredFollowUp. Flag drafts that ignored grounded source evidence or omitted supported hazards/expected values. No prose outside JSON.",
       userPrompt: reviewerPrompt,
       fallback: {
         ...provisionalCritique,
