@@ -1,9 +1,10 @@
 import { listConversationSummaries, loadConversationRecord } from "./conversations.js";
 import { buildCateoApprovalMatrix, type CateoApprovalMatrix } from "./approval_matrix.js";
 import { getCateoControlledTaxonomy, getCateoPartMasterRecord, listCateoPartMasterRecords, type CateoControlledTaxonomySnapshot, type CateoPartMasterRecord } from "./part_master.js";
-import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows } from "./store.js";
+import { persistTroubleshootingReportPackage } from "./report_exports.js";
+import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord } from "./store.js";
 import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
-import { deriveCaseReviewWorkflow } from "./review_workflow.js";
+import { deriveCaseReviewWorkflow, syncCaseReviewPackageFiles } from "./review_workflow.js";
 
 export interface CateoAdminViewer {
   requesterId?: string;
@@ -596,12 +597,36 @@ function buildArtifactTimeline(record: CateoArtifactRecord): AdminTimelineItem[]
     }));
 }
 
+function hydrateCaseReviewWorkflow(record: CateoCaseRecord, relatedArtifacts: CateoArtifactRecord[]): CateoCaseRecord {
+  const workflow = deriveCaseReviewWorkflow(record, relatedArtifacts);
+  if (!workflow) return record;
+
+  let changed = false;
+  if (!record.reviewWorkflow) {
+    record.reviewWorkflow = workflow;
+    changed = true;
+  }
+
+  const missingPackageFiles = !record.reviewWorkflow.packageFiles?.generatedWord || !record.reviewWorkflow.packageFiles?.generatedPdf;
+  if (missingPackageFiles && relatedArtifacts.length > 0) {
+    const reportPackage = persistTroubleshootingReportPackage(record, relatedArtifacts);
+    syncCaseReviewPackageFiles(record, reportPackage.documentControl.files);
+    changed = true;
+  }
+
+  if (changed) {
+    saveCaseRecord(record);
+  }
+  return record;
+}
+
 export function loadAdminCaseDetail(caseId: string): AdminCaseDetail | null {
-  const record = loadCaseRecord(caseId);
+  let record = loadCaseRecord(caseId);
   if (!record) return null;
   const relatedArtifacts = record.artifacts
     .map((artifactId) => loadArtifactRecord(artifactId))
     .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+  record = hydrateCaseReviewWorkflow(record, relatedArtifacts);
   const item = toAdminCaseItem(record);
   return {
     item,
