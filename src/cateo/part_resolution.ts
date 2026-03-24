@@ -3,7 +3,8 @@ import { appendAuditEvent } from "../security/audit.js";
 import type { CateoAssistInput, CateoPartCatalogEntry, CateoPartResolution, CateoVerifiedSource } from "./types.js";
 
 const PART_NUMBER_PATTERN = /\b[A-Z0-9]{2,}(?:[-_/][A-Z0-9]{2,})+[A-Z0-9-_/]*\b/g;
-const SOURCE_LIMIT = 8;
+const SOURCE_LIMIT = 12;
+const SEARCH_QUERY_LIMIT = 10;
 const SEARCH_MODEL_CANDIDATES = [
   process.env.CATEO_PART_SEARCH_MODEL?.trim(),
   "gpt-4o-mini-search-preview",
@@ -81,7 +82,7 @@ function normalizeResolution(raw: RawPartResolution, fallback: CateoPartResoluti
     clarifyingQuestion: raw.clarifyingQuestion?.trim() || (needsClarification ? fallback.clarifyingQuestion : undefined),
     evidence: unique([...(raw.evidence ?? []), ...fallback.evidence]),
     aliases: unique([...(raw.aliases ?? []), ...fallback.aliases]),
-    searchQueries: unique([...(raw.searchQueries ?? []), ...fallback.searchQueries]).slice(0, 8),
+    searchQueries: unique([...(raw.searchQueries ?? []), ...fallback.searchQueries]).slice(0, SEARCH_QUERY_LIMIT),
     failureModes: unique([...(raw.failureModes ?? []), ...fallback.failureModes]).slice(0, 8),
     preventiveMaintenanceHints: unique([...(raw.preventiveMaintenanceHints ?? []), ...fallback.preventiveMaintenanceHints]).slice(0, 8),
     hazardSignals: unique([...(raw.hazardSignals ?? []), ...fallback.hazardSignals]).slice(0, 10),
@@ -183,6 +184,44 @@ function heuristicResolution(input: CateoAssistInput): CateoPartResolution {
   };
 }
 
+function buildSearchQueryHints(input: CateoAssistInput, fallback: CateoPartResolution): string[] {
+  const manufacturer = input.machine?.manufacturer?.trim() || fallback.manufacturer?.trim();
+  const model = input.machine?.model?.trim();
+  const assetType = input.asset?.assetType?.trim();
+  const issueType = input.issueType?.trim();
+  const errorCode = input.errorCode?.trim();
+  const symptom = input.symptomDescription?.trim();
+  const title = input.title?.trim();
+  const partNumber = fallback.partNumber?.trim();
+
+  return unique([
+    ...(fallback.searchQueries ?? []),
+    partNumber && manufacturer ? `${manufacturer} ${partNumber} manual` : undefined,
+    partNumber && manufacturer ? `${manufacturer} ${partNumber} datasheet` : undefined,
+    partNumber && manufacturer ? `${manufacturer} ${partNumber} service bulletin` : undefined,
+    partNumber && manufacturer ? `${manufacturer} ${partNumber} troubleshooting` : undefined,
+    partNumber && model ? `${partNumber} ${model}` : undefined,
+    partNumber && errorCode ? `${partNumber} ${errorCode}` : undefined,
+    partNumber && issueType ? `${partNumber} ${issueType}` : undefined,
+    manufacturer && model && issueType ? `${manufacturer} ${model} ${issueType}` : undefined,
+    manufacturer && assetType && issueType ? `${manufacturer} ${assetType} ${issueType}` : undefined,
+    manufacturer && errorCode ? `${manufacturer} ${errorCode}` : undefined,
+    manufacturer && symptom ? `${manufacturer} ${symptom}` : undefined,
+    title && manufacturer ? `${manufacturer} ${title}` : undefined,
+  ]).slice(0, SEARCH_QUERY_LIMIT);
+}
+
+function needsSourceBackfill(resolved: CateoPartResolution): boolean {
+  if (!resolved.partNumber) {
+    return false;
+  }
+  return resolved.verifiedSources.length < 4
+    || resolved.referenceDocuments.length < 3
+    || resolved.groundedFindings.length < 4
+    || resolved.expectedValues.length < 2
+    || resolved.hazardSignals.length < 2;
+}
+
 function canUseOpenAIWebSearch(config: CashClawConfig): boolean {
   return config.llm.provider === "openai" && Boolean(config.llm.apiKey);
 }
@@ -192,8 +231,9 @@ function buildPartSearchPrompt(input: CateoAssistInput, fallback: CateoPartResol
     "Identify the exact manufacturing part number involved in this engineering request.",
     "Use the provided prompt, attachment-derived observations, and web search results.",
     "Only return a high confidence part number when the evidence is strong. If confidence is below 80%, set needsClarification=true and ask one concise follow-up question.",
-    "Prefer manufacturer documentation, OEM pages, manuals, datasheets, service bulletins, and reputable distributor listings.",
-    "Collect concrete hazard labels, expected values, diagnostic anchors, and reference document titles whenever the sources support them.",
+    "Prefer manufacturer documentation, OEM pages, manuals, datasheets, service bulletins, standards, and reputable technical distributor listings.",
+    "Use the searchQueryHints to widen coverage and try to return 3 to 6 reliable verified sources when the web evidence supports them.",
+    "Collect concrete hazard labels, expected values, diagnostic anchors, related manuals, and reference document titles whenever the sources support them.",
     "Do not fabricate sources, part numbers, warnings, or operating values.",
     "Request context:",
     JSON.stringify({
@@ -207,6 +247,7 @@ function buildPartSearchPrompt(input: CateoAssistInput, fallback: CateoPartResol
       workOrder: input.workOrder,
       attachmentNames: (input.attachments ?? []).map((attachment) => ({ name: attachment.name, note: attachment.note, kind: attachment.kind, mimeType: attachment.mimeType })),
       knownCatalogEntries: (input.partsCatalog ?? []).slice(0, 12),
+      searchQueryHints: buildSearchQueryHints(input, fallback),
       heuristicFallback: fallback,
     }, null, 2),
   ].join("\n\n");
@@ -245,7 +286,7 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
         body: JSON.stringify({
           model,
           tools: [{ type: "web_search_preview" }],
-          max_output_tokens: 1400,
+          max_output_tokens: 1800,
           text: {
             format: {
               type: "json_schema",
@@ -315,7 +356,7 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
               content: [
                 {
                   type: "input_text",
-                  text: "You are Cateo's part-identification and web-research stage. Resolve the exact manufacturing part number, preferring manufacturer, OEM, service-manual, and datasheet sources. Return only evidence-backed findings. If confidence is below 80 percent, ask a single clarifying follow-up question. Capture hazards, expected values, reference documents, and concise grounded findings when the sources support them."
+                  text: "You are Cateo's part-identification and web-research stage. Resolve the exact manufacturing part number, preferring manufacturer, OEM, service-manual, datasheet, standards, and service-bulletin sources. Return only evidence-backed findings. If confidence is below 80 percent, ask a single clarifying follow-up question. Use the provided searchQueryHints, gather 3 to 6 reliable sources when possible, and capture hazards, expected values, reference documents, and concise grounded findings when the sources support them."
                 }
               ]
             },
@@ -380,7 +421,7 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
 }
 
 async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssistInput, resolved: CateoPartResolution, requestId?: string): Promise<CateoPartResolution> {
-  if (!resolved.partNumber || resolved.verifiedSources.length > 0) {
+  if (!resolved.partNumber) {
     return resolved;
   }
 
@@ -396,9 +437,10 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
     `Original issue: ${input.symptomDescription}`,
     input.issueType ? `Issue type: ${input.issueType}.` : "",
     input.businessType ? `Business type: ${input.businessType}.` : "",
-    "Find 1 to 4 reliable sources that directly support the identified part, preferring manufacturer/OEM manuals, datasheets, service bulletins, and reputable technical distributors.",
+    `Search query hints: ${buildSearchQueryHints(input, resolved).join(" | ") || "none"}.`,
+    "Find 3 to 6 reliable sources that directly support the identified part, preferring manufacturer/OEM manuals, datasheets, service bulletins, standards, and reputable technical distributors.",
     "Return hazards, expected values, grounded findings, and reference document titles only when the sources support them.",
-    "Do not change the part number. Do not return empty verifiedSources unless the web search genuinely failed.",
+    "Do not change the part number. Keep sources diverse and do not return empty verifiedSources unless the web search genuinely failed.",
   ].filter(Boolean).join("\n\n");
 
   for (const model of SEARCH_MODEL_CANDIDATES) {
@@ -409,7 +451,7 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
         body: JSON.stringify({
           model,
           tools: [{ type: "web_search_preview" }],
-          max_output_tokens: 1200,
+          max_output_tokens: 1500,
           text: {
             format: {
               type: "json_schema",
@@ -452,7 +494,7 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
           input: [
             {
               role: "system",
-              content: [{ type: "input_text", text: "You are Cateo's source-backfill stage. Keep the resolved part number fixed, gather only reliable sources, and return source-backed hazards, expected values, and concise grounded findings." }],
+              content: [{ type: "input_text", text: "You are Cateo's source-backfill stage. Keep the resolved part number fixed, gather 3 to 6 reliable sources when possible, and return source-backed hazards, expected values, reference documents, and concise grounded findings." }],
             },
             {
               role: "user",
@@ -534,7 +576,7 @@ export async function resolveCateoPart(config: CashClawConfig, input: CateoAssis
   }
 
   let resolved = await searchWithOpenAI(config, input, fallback, requestId);
-  if (resolved.partNumber && resolved.verifiedSources.length === 0) {
+  if (needsSourceBackfill(resolved)) {
     resolved = await backfillVerifiedSources(config, input, resolved, requestId);
   }
   const catalog = pickCatalogMatch(input, resolved.partNumber);

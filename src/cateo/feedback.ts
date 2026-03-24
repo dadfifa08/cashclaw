@@ -67,6 +67,9 @@ export function submitProcedureFeedback(input: {
   userId?: string;
   rating: CateoProcedureFeedbackRating;
   comments: string;
+  userAction?: "accept" | "reject";
+  requestReevaluation?: boolean;
+  reevaluationConversationId?: string;
   businessType?: string;
   systemName?: string;
   partNumber?: string;
@@ -87,6 +90,10 @@ export function submitProcedureFeedback(input: {
     status: "pending-review",
     rating: input.rating,
     comments: normalizeComments(input.comments),
+    userAction: input.userAction,
+    requestReevaluation: input.requestReevaluation,
+    reevaluationQueuedAt: input.requestReevaluation ? now : undefined,
+    reevaluationConversationId: input.requestReevaluation ? input.reevaluationConversationId || input.conversationId : undefined,
     businessType: input.businessType as CateoProcedureFeedbackRecord["businessType"],
     systemName: input.systemName?.trim() || undefined,
     partNumber: input.partNumber?.trim() || undefined,
@@ -97,6 +104,8 @@ export function submitProcedureFeedback(input: {
       input.systemName,
       input.partNumber,
       input.issueType,
+      input.userAction,
+      input.requestReevaluation ? "reevaluation-requested" : undefined,
     ]),
   };
 

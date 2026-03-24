@@ -1173,6 +1173,10 @@ export interface CateoProcedureFeedbackRecord {
   updatedAt: string;
   status: CateoProcedureFeedbackStatus;
   rating: CateoProcedureFeedbackRating;
+  userAction?: "accept" | "reject";
+  requestReevaluation?: boolean;
+  reevaluationQueuedAt?: string;
+  reevaluationConversationId?: string;
   comments: string;
   businessType?: CateoBusinessType;
   systemName?: string;

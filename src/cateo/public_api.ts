@@ -165,8 +165,8 @@ function buildConversationState(conversation: NonNullable<ReturnType<typeof load
   const latestAssistantMessage = [...conversation.messages].reverse().find((message) => message.role === "assistant");
   const reportPayload = loadConversationTroubleshootingReportPackage(conversation.conversationId, viewer);
   const releaseStatus = caseRecord?.interaction?.releaseStatus;
-  const reportAvailable = Boolean(reportPayload?.reportPackage && releaseStatus === "available");
   const pending = Boolean(latestAssistantMessage && (latestAssistantMessage.status === "queued" || latestAssistantMessage.status === "running"));
+  const reportAvailable = Boolean(reportPayload?.reportPackage && releaseStatus === "available" && !pending);
   const clarificationRequired = releaseStatus === "clarification-required";
   const canRespond = !pending && !reportAvailable && (clarificationRequired || latestAssistantMessage?.status === "failed");
   return {
@@ -729,8 +729,9 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
       if (!caseRecord) { json(res, { error: "No completed troubleshooting case is available for feedback." }, 404); return true; }
       if (req.method === "GET") { json(res, { ok: true, items: listProcedureFeedbackForConversation(conversationId), session }); return true; }
       if (req.method !== "POST") { json(res, { error: "GET or POST only" }, 405); return true; }
-      const body = parseJson<{ rating: import("./types.js").CateoProcedureFeedbackRating; comments: string }>(await readBody(req));
-      const item = submitProcedureFeedback({ conversationId, caseId: caseRecord.caseId, artifactIds: caseRecord.artifacts, requesterId: viewer.requesterId, profileId: viewer.profileId, userId: viewer.userId, rating: body.rating, comments: body.comments, businessType: caseRecord.input.businessType, systemName: caseRecord.context.machine?.model || caseRecord.context.asset?.assetType || caseRecord.context.asset?.assetId, partNumber: caseRecord.context.partResolution?.partNumber || caseRecord.input.partNumber, issueType: caseRecord.context.issueType }, requestId);
+      const body = parseJson<{ rating: import("./types.js").CateoProcedureFeedbackRating; comments?: string; userAction?: "accept" | "reject"; requestReevaluation?: boolean }>(await readBody(req));
+      const comments = body.comments?.trim() || (body.userAction === "accept" ? "Requester accepted the released troubleshooting output." : body.userAction === "reject" ? "Requester rejected the released troubleshooting output and requested a fresh revision." : "Requester submitted procedure feedback.");
+      const item = submitProcedureFeedback({ conversationId, caseId: caseRecord.caseId, artifactIds: caseRecord.artifacts, requesterId: viewer.requesterId, profileId: viewer.profileId, userId: viewer.userId, rating: body.rating, comments, userAction: body.userAction, requestReevaluation: body.requestReevaluation, reevaluationConversationId: conversationId, businessType: caseRecord.input.businessType, systemName: caseRecord.context.machine?.model || caseRecord.context.asset?.assetType || caseRecord.context.asset?.assetId, partNumber: caseRecord.context.partResolution?.partNumber || caseRecord.input.partNumber, issueType: caseRecord.context.issueType }, requestId);
       json(res, { ok: true, item, items: listProcedureFeedbackForConversation(conversationId), session });
       return true;
     }
