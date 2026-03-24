@@ -1169,6 +1169,8 @@ export interface CateoProcedureFeedbackRecord {
   requesterId?: string;
   profileId?: string;
   userId?: string;
+  submitterName?: string;
+  submitterUsername?: string;
   submittedAt: string;
   updatedAt: string;
   status: CateoProcedureFeedbackStatus;

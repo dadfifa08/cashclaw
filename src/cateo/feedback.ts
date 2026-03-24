@@ -65,6 +65,8 @@ export function submitProcedureFeedback(input: {
   requesterId?: string;
   profileId?: string;
   userId?: string;
+  submitterName?: string;
+  submitterUsername?: string;
   rating: CateoProcedureFeedbackRating;
   comments: string;
   userAction?: "accept" | "reject";
@@ -85,6 +87,8 @@ export function submitProcedureFeedback(input: {
     requesterId: input.requesterId,
     profileId: input.profileId,
     userId: input.userId,
+    submitterName: input.submitterName?.trim() || undefined,
+    submitterUsername: input.submitterUsername?.trim() || undefined,
     submittedAt: now,
     updatedAt: now,
     status: "pending-review",
@@ -142,6 +146,8 @@ function buildDecisionNote(record: CateoProcedureFeedbackRecord, note: string | 
     record.partNumber ? `part=${record.partNumber}` : undefined,
     record.issueType ? `issue=${record.issueType}` : undefined,
     record.businessType ? `business=${record.businessType}` : undefined,
+    record.submitterName ? `submitter=${record.submitterName}` : undefined,
+    record.submitterUsername ? `username=${record.submitterUsername}` : undefined,
     `comments=${record.comments}`,
   ].filter(Boolean).join(" | ");
   return note?.trim() ? `${note.trim()} | ${details}` : details;
