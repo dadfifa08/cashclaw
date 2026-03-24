@@ -10,6 +10,7 @@ import { getSchemaRef, validateArtifactContent } from "./schemas.js";
 import { evaluateArtifactPackageRules, summarizeRuleOutcomes } from "./rules.js";
 import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, loadCaseRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
 import { persistTroubleshootingReportPackage } from "./report_exports.js";
+import { ensureCaseReviewWorkflow, syncCaseReviewPackageFiles } from "./review_workflow.js";
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
@@ -1903,7 +1904,7 @@ export async function generateCateoArtifacts(
     const ruleSummary = summarizeRuleOutcomes(ruleResults);
     const ruleMessages = ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => `${entry.ruleId}: ${entry.message}`);
     const escalatedByRules = ruleResults.some((entry) => entry.outcome === "escalate");
-    const requiresEngineerReview = Boolean(requester?.requiresEngineerReview);
+    const requiresEngineerReview = Boolean(requester?.requiresEngineerReview || sanitizedInput.workflow?.mode === "reviewed-document");
 
     validationAttempts.push({
       stage: "reviewer",
@@ -2282,7 +2283,7 @@ export async function generateCateoArtifacts(
     }));
 
     const artifactIds = [...new Set(artifacts.map((artifact) => artifact.artifactId))];
-    const caseRecord = {
+    const caseRecord: CateoCaseRecord = {
       caseId: context.caseId,
       runId,
       createdAt: nowIso,
@@ -2298,8 +2299,11 @@ export async function generateCateoArtifacts(
       trace,
     };
 
+    ensureCaseReviewWorkflow(caseRecord, artifacts);
+
     try {
-      persistTroubleshootingReportPackage(caseRecord, artifacts);
+      const reportPackage = persistTroubleshootingReportPackage(caseRecord, artifacts);
+      syncCaseReviewPackageFiles(caseRecord, reportPackage.documentControl.files);
     } catch (reportError) {
       appendAuditEvent({
         actor: "runtime",

@@ -3,6 +3,7 @@ import { buildCateoApprovalMatrix, type CateoApprovalMatrix } from "./approval_m
 import { getCateoControlledTaxonomy, getCateoPartMasterRecord, listCateoPartMasterRecords, type CateoControlledTaxonomySnapshot, type CateoPartMasterRecord } from "./part_master.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows } from "./store.js";
 import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
+import { deriveCaseReviewWorkflow } from "./review_workflow.js";
 
 export interface CateoAdminViewer {
   requesterId?: string;
@@ -143,7 +144,11 @@ function hasViewerAccess(record: CateoCaseRecord, viewer: CateoAdminViewer): boo
 function buildQualityGates(record: CateoCaseRecord): QualityGateItem[] {
   const reviewerDecision = record.trace.reviewerDecision;
   const releaseStatus = record.interaction?.releaseStatus;
-  return [
+  const artifacts = record.artifacts
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+  const workflow = deriveCaseReviewWorkflow(record, artifacts);
+  const gates: QualityGateItem[] = [
     {
       gateId: "intake",
       label: "Structured intake",
@@ -162,25 +167,47 @@ function buildQualityGates(record: CateoCaseRecord): QualityGateItem[] {
       status: reviewerDecision?.overallStatus === "needs-revision" ? "blocked" : reviewerDecision ? "complete" : "pending",
       note: reviewerDecision?.summary ?? "Awaiting reviewer stage output.",
     },
-    {
-      gateId: "admin-review",
-      label: "Admin quality release",
-      status: releaseStatus === "available" ? "complete" : releaseStatus === "clarification-required" ? "blocked" : "pending",
-      note: releaseStatus === "available"
-        ? "Released after controlled sign-off."
-        : releaseStatus === "pending-engineer-review"
-          ? "Queued for admin password-backed sign-off."
-          : releaseStatus === "clarification-required"
-            ? "Blocked pending additional customer clarification."
-            : "Awaiting release decision.",
-    },
-    {
-      gateId: "customer-release",
-      label: "Customer release",
-      status: releaseStatus === "available" ? "complete" : "pending",
-      note: releaseStatus === "available" ? "Visible in the customer workspace." : "Not yet released to the customer.",
-    },
   ];
+
+  if (workflow) {
+    gates.push({
+      gateId: "technical-review",
+      label: "Technical review",
+      status: workflow.stage === "technical-review" ? "pending" : "complete",
+      note: workflow.technical.status === "redlined"
+        ? workflow.technical.note || "Technical reviewer added redlines and forwarded the package to quality."
+        : workflow.stage === "technical-review"
+          ? "Waiting for the technical reviewer to approve or redline the package."
+          : workflow.technical.note || "Technical review completed and the package is ready for quality.",
+    });
+    gates.push({
+      gateId: "quality-release",
+      label: "Quality release",
+      status: workflow.stage === "released" ? "complete" : workflow.stage === "quality-review" ? "pending" : "blocked",
+      note: workflow.stage === "released"
+        ? workflow.quality.note || "Quality reviewer released the final package."
+        : workflow.stage === "quality-review"
+          ? "Ready for quality or admin release."
+          : "Blocked until technical review completes.",
+    });
+  }
+
+  gates.push({
+    gateId: "customer-release",
+    label: "Customer release",
+    status: releaseStatus === "available" ? "complete" : releaseStatus === "clarification-required" ? "blocked" : workflow?.stage === "technical-review" ? "blocked" : "pending",
+    note: releaseStatus === "available"
+      ? "Visible in the customer workspace."
+      : releaseStatus === "clarification-required"
+        ? "Blocked pending additional customer clarification."
+        : workflow?.stage === "quality-review"
+          ? "Awaiting the quality release decision."
+          : workflow?.stage === "technical-review"
+            ? "Not available until technical review completes."
+            : "Awaiting release decision.",
+  });
+
+  return gates;
 }
 
 function toAdminCaseItem(record: CateoCaseRecord): AdminCaseItem {

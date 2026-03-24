@@ -1,4 +1,6 @@
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import type { CashClawConfig } from "../config.js";
 import { readRequestBody } from "../system/request_body.js";
 import { buildCommandCenterSnapshot } from "./metrics.js";
@@ -39,9 +41,10 @@ import { toggleProcedureFavorite } from "./favorites.js";
 import { listProcedureLibrary, loadProcedureLibraryDetail } from "./plm.js";
 import { signOffCateoArtifact } from "./service.js";
 import { persistTroubleshootingReportPackage } from "./report_exports.js";
+import { buildStoredReviewFile, buildTechnicalRedlineRtf, deriveCaseReviewWorkflow, ensureCaseReviewWorkflow, hasQualityReviewerRole, hasReviewDeskAccessRoles, hasTechnicalReviewerRole, reviewLaneForRoles, syncCaseReviewPackageFiles } from "./review_workflow.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord } from "./store.js";
 import { listPilotProfiles, updatePilotProfileAdmin } from "./profiles.js";
-import type { CateoAssistInput, CateoAssistResult, CateoCaseRecord } from "./types.js";
+import type { CateoArtifactRecord, CateoAssistInput, CateoAssistResult, CateoCaseRecord } from "./types.js";
 
 export const CATEO_SITE_PUBLIC_PREFIX = "/internal/cateo/site";
 const USER_SESSION_HEADER = "x-cateo-user-session";
@@ -81,10 +84,15 @@ async function readBody(req: http.IncomingMessage) { return readRequestBody(req,
 function parseJson<T>(raw: string) { try { return JSON.parse(raw) as T; } catch { throw new Error("Invalid JSON"); } }
 function userSessionId(req: http.IncomingMessage) { const raw = req.headers[USER_SESSION_HEADER]; return (Array.isArray(raw) ? raw[0] : raw)?.trim() || undefined; }
 function isAdmin(session: Awaited<ReturnType<typeof getSession>>) { return Boolean(session?.user.roles.includes("admin")); }
+function rolesFor(session: Awaited<ReturnType<typeof getSession>>) { return session?.user.roles ?? []; }
+function isTechnicalReviewer(session: Awaited<ReturnType<typeof getSession>>) { return hasTechnicalReviewerRole(rolesFor(session)); }
+function isQualityReviewer(session: Awaited<ReturnType<typeof getSession>>) { return hasQualityReviewerRole(rolesFor(session)); }
+function hasReviewDeskAccess(session: Awaited<ReturnType<typeof getSession>>) { return hasReviewDeskAccessRoles(rolesFor(session)); }
+function reviewLaneForSession(session: Awaited<ReturnType<typeof getSession>>) { return reviewLaneForRoles(rolesFor(session)); }
 function requestUrl(req: http.IncomingMessage) { return new URL(req.url ?? "/", "http://127.0.0.1"); }
 async function getSession(config: CashClawConfig | null, req: http.IncomingMessage, requesterId: string | null, requestId: string) { return config ? getPublicSession(config, userSessionId(req), requesterId ?? undefined, requestId) : null; }
 function trimPreview(text: string | undefined, max = 160) { const normalized = text?.replace(/\s+/g, " ").trim(); if (!normalized) return undefined; return normalized.length <= max ? normalized : `${normalized.slice(0, Math.max(0, max - 3)).trimEnd()}...`; }
-function maskPendingEngineerReviewResult(result: CateoAssistResult): CateoAssistResult { return { ...result, interaction: { ...result.interaction, message: "Cateo assembled the requested engineering package and sent it to the engineer review bucket. It will be released to the customer profile after password-backed admin sign-off.", highlights: ["The requested artifact package was generated and fully logged.", "A human engineer review is required before customer release."], nextActions: ["Wait for engineer sign-off before downloading or acting on the final released package."], releaseStatus: "pending-engineer-review", requiresEngineerReview: true } }; }
+function maskPendingEngineerReviewResult(result: CateoAssistResult): CateoAssistResult { return { ...result, interaction: { ...result.interaction, message: "Cateo assembled the requested engineering package and sent it to the technical review bucket. It will move to quality release after the first reviewer finishes the package review.", highlights: ["The requested artifact package was generated and fully logged.", "A technical reviewer must approve or redline the package before customer release."], nextActions: ["Wait for technical review and final quality release before downloading or acting on the final package."], releaseStatus: "pending-engineer-review", requiresEngineerReview: true } }; }
 async function syncConversationJobs(conversationId: string, requesterId: string | null) { const record = loadConversationRecord(conversationId); if (!record) return null; if (!requesterId) return record; for (const message of record.messages.filter((entry) => entry.role === "assistant" && entry.jobId && (entry.status === "queued" || entry.status === "running"))) { const jobId = message.jobId; if (!jobId) continue; const job = getAssistJob(jobId, requesterId); if (!job) continue; const known = message.checkpoints.length; for (const checkpoint of job.checkpoints.slice(known)) { updateConversationCheckpoint({ conversationId, assistantMessageId: message.messageId, checkpoint }); } if (job.status === "completed" && job.result) { const result = job.result.interaction.requiresEngineerReview ? maskPendingEngineerReviewResult(job.result) : job.result; completeConversationTurn({ conversationId, assistantMessageId: message.messageId, result }); } else if (job.status === "failed") { failConversationTurn({ conversationId, assistantMessageId: message.messageId, error: job.error || "Cateo could not complete that request." }); } } return loadConversationRecord(conversationId); }
 function requireSession(config: CashClawConfig, req: http.IncomingMessage, requesterId: string | null, requestId: string) { const session = getPublicSession(config, userSessionId(req), requesterId ?? undefined, requestId); if (!session) throw new CateoPublicAuthError("AUTH_REQUIRED", "Login required.", 401); return session; }
 function canAccess(conversation: NonNullable<ReturnType<typeof loadConversationRecord>>, viewer: { requesterId?: string; userId?: string; admin?: boolean }) { if (viewer.admin) return true; if (viewer.userId) return conversation.ownerUserId === viewer.userId || (!conversation.ownerUserId && viewer.requesterId && conversation.requesterId === viewer.requesterId); return Boolean(viewer.requesterId && conversation.requesterId === viewer.requesterId); }
@@ -268,20 +276,37 @@ function loadConversationCaseDetail(conversationId: string, viewer: { requesterI
     })),
   };
 }
-function buildAdminReviewItems(): AdminReviewItem[] {
+function loadCaseArtifacts(caseRecord: CateoCaseRecord): CateoArtifactRecord[] {
+  return caseRecord.artifacts
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+}
+
+function reviewActor(session: NonNullable<Awaited<ReturnType<typeof getSession>>>) {
+  return {
+    userId: session.user.userId,
+    displayName: session.user.displayName || session.user.email || session.user.username || session.user.userId,
+  };
+}
+
+function refreshReviewPackage(caseRecord: CateoCaseRecord, artifacts: CateoArtifactRecord[]) {
+  const reportPackage = persistTroubleshootingReportPackage(caseRecord, artifacts);
+  syncCaseReviewPackageFiles(caseRecord, reportPackage.documentControl.files);
+  return reportPackage;
+}
+
+function buildAdminReviewItems(lane: "technical-review" | "quality-review"): AdminReviewItem[] {
   return listCaseCatalogRows()
     .map((row) => loadCaseRecord(row.caseId))
     .filter((record): record is CateoCaseRecord => Boolean(record))
     .map<AdminReviewItem | null>((record) => {
       const interaction = record.interaction;
       if (!interaction) return null;
-      const artifacts = record.artifacts
-        .map((artifactId) => loadArtifactRecord(artifactId))
-        .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact));
+      const artifacts = loadCaseArtifacts(record);
+      const workflow = deriveCaseReviewWorkflow(record, artifacts);
+      if (!workflow || workflow.stage !== lane) return null;
       const draftArtifacts = artifacts.filter((artifact) => artifact.revisions.at(-1)?.approvalState === "draft");
       const approvedArtifacts = artifacts.filter((artifact) => artifact.revisions.at(-1)?.approvalState === "approved");
-      const pending = interaction.releaseStatus === "pending-engineer-review" || draftArtifacts.length > 0;
-      if (!pending) return null;
       return {
         caseId: record.caseId,
         title: record.context.title,
@@ -311,11 +336,37 @@ function buildAdminReviewItems(): AdminReviewItem[] {
     .filter((item): item is AdminReviewItem => item !== null)
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
-function releaseReviewedCase(caseRecord: CateoCaseRecord, actor: string, note: string | undefined, requestId: string): { caseRecord: CateoCaseRecord; releasedArtifactIds: string[] } {
+
+function releaseReviewedCase(caseRecord: CateoCaseRecord, actor: { userId: string; displayName: string }, note: string | undefined, requestId: string): { caseRecord: CateoCaseRecord; releasedArtifactIds: string[] } {
   const interaction = caseRecord.interaction;
   if (!interaction) {
     throw new Error(`Case ${caseRecord.caseId} does not have a releasable interaction payload.`);
   }
+
+  const existingArtifacts = loadCaseArtifacts(caseRecord);
+  const workflow = deriveCaseReviewWorkflow(caseRecord, existingArtifacts);
+  if (workflow) {
+    if (workflow.stage === "technical-review" || workflow.technical.status === "pending") {
+      throw new Error("Technical review must complete before quality release.");
+    }
+    caseRecord.reviewWorkflow = {
+      ...workflow,
+      stage: "released",
+      technical: {
+        ...workflow.technical,
+        status: workflow.technical.status,
+      },
+      quality: {
+        ...workflow.quality,
+        status: "released",
+        reviewerUserId: actor.userId,
+        reviewerDisplayName: actor.displayName,
+        note: note?.trim() || workflow.quality.note,
+        decidedAt: new Date().toISOString(),
+      },
+    };
+  }
+
   const releasedArtifactIds: string[] = [];
   for (const artifactId of caseRecord.artifacts) {
     const artifact = loadArtifactRecord(artifactId);
@@ -323,37 +374,129 @@ function releaseReviewedCase(caseRecord: CateoCaseRecord, actor: string, note: s
     if (!artifact || !latest || latest.approvalState === "approved") continue;
     signOffCateoArtifact({
       artifactId,
-      actor,
-      role: "admin-approver",
-      meaning: "Engineer review and controlled customer release",
+      actor: actor.displayName,
+      role: "quality-reviewer",
+      meaning: "Quality release and controlled customer publication",
       state: "approved",
       note: note?.trim() || `Approved for customer release for case ${caseRecord.caseId}`,
     }, { requestId });
     releasedArtifactIds.push(artifactId);
   }
+
   caseRecord.interaction = { ...interaction, releaseStatus: "available", requiresEngineerReview: false };
   caseRecord.updatedAt = new Date().toISOString();
+  const refreshedArtifacts = loadCaseArtifacts(caseRecord);
+  if (caseRecord.reviewWorkflow) {
+    refreshReviewPackage(caseRecord, refreshedArtifacts);
+  }
   saveCaseRecord(caseRecord);
+
   if (caseRecord.conversationId) {
     const conversation = loadConversationRecord(caseRecord.conversationId);
     if (conversation) {
       const assistant = [...conversation.messages].reverse().find((message) => message.role === "assistant" && message.caseId === caseRecord.caseId);
       if (assistant) {
-        assistant.text = interaction.message;
-        assistant.highlights = interaction.highlights;
-        assistant.nextActions = interaction.nextActions;
-        assistant.confidence = interaction.confidence;
-        assistant.artifactCount = interaction.artifactCount;
+        assistant.text = caseRecord.interaction.message;
+        assistant.highlights = caseRecord.interaction.highlights;
+        assistant.nextActions = caseRecord.interaction.nextActions;
+        assistant.confidence = caseRecord.interaction.confidence;
+        assistant.artifactCount = caseRecord.interaction.artifactCount;
         assistant.error = undefined;
         assistant.status = "completed";
         assistant.updatedAt = Date.now();
         conversation.updatedAt = assistant.updatedAt;
-        conversation.lastMessagePreview = trimPreview(interaction.message, 160);
+        conversation.lastMessagePreview = trimPreview(caseRecord.interaction.message, 160);
         saveConversationRecord(conversation);
       }
     }
   }
+
   return { caseRecord, releasedArtifactIds };
+}
+
+function submitTechnicalReviewDecision(caseRecord: CateoCaseRecord, actor: { userId: string; displayName: string }, action: "approve" | "redline", note: string | undefined, requestId: string): { caseRecord: CateoCaseRecord } {
+  const interaction = caseRecord.interaction;
+  if (!interaction) {
+    throw new Error(`Case ${caseRecord.caseId} does not have a reviewable interaction payload.`);
+  }
+
+  const trimmedNote = note?.trim() || undefined;
+  if (action === "redline" && !trimmedNote) {
+    throw new Error("Enter technical review notes before sending redlines to quality.");
+  }
+
+  const workflow = ensureCaseReviewWorkflow(caseRecord, loadCaseArtifacts(caseRecord));
+  if (!workflow) {
+    throw new Error("This case is not in the controlled review workflow.");
+  }
+  if (workflow.stage !== "technical-review") {
+    throw new Error("This case is not waiting for technical review.");
+  }
+
+  const reviewedArtifacts = loadCaseArtifacts(caseRecord).map((artifact) => {
+    const latest = artifact.revisions.at(-1);
+    if (!latest || latest.approvalState === "reviewed" || latest.approvalState === "approved") {
+      return artifact;
+    }
+    return signOffCateoArtifact({
+      artifactId: artifact.artifactId,
+      actor: actor.displayName,
+      role: "technical-reviewer",
+      meaning: action === "redline" ? "Technical review added redlines for quality review" : "Technical review approved package for quality review",
+      state: "reviewed",
+      note: trimmedNote || `Technical review completed for case ${caseRecord.caseId}`,
+    }, { requestId });
+  });
+
+  const decidedAt = new Date().toISOString();
+  caseRecord.reviewWorkflow = {
+    ...workflow,
+    stage: "quality-review",
+    technical: {
+      ...workflow.technical,
+      status: action === "redline" ? "redlined" : "approved",
+      reviewerUserId: actor.userId,
+      reviewerDisplayName: actor.displayName,
+      note: trimmedNote,
+      decidedAt,
+      redlineFile: action === "redline" ? workflow.technical.redlineFile : undefined,
+    },
+    quality: {
+      ...workflow.quality,
+      status: "pending",
+    },
+  };
+  caseRecord.interaction = { ...interaction, releaseStatus: "pending-engineer-review", requiresEngineerReview: true };
+  caseRecord.updatedAt = decidedAt;
+
+  let reportPackage = refreshReviewPackage(caseRecord, reviewedArtifacts);
+  if (action === "redline" && trimmedNote) {
+    const reportFolder = path.dirname(reportPackage.indexing.jsonPath);
+    const fileName = `${caseRecord.caseId}-technical-redline.rtf`;
+    const redlineFile = buildStoredReviewFile({
+      kind: "technical-redline",
+      folderPath: reportPackage.indexing.folderPath,
+      fileName,
+      mimeType: "application/rtf",
+      uploadedAt: decidedAt,
+      uploadedBy: actor.displayName,
+    });
+    fs.writeFileSync(path.join(reportFolder, fileName), buildTechnicalRedlineRtf({
+      title: caseRecord.context.title,
+      caseId: caseRecord.caseId,
+      partNumber: caseRecord.context.partResolution?.partNumber || caseRecord.input.partNumber,
+      reviewer: actor.displayName,
+      decidedAt,
+      note: trimmedNote,
+      artifactIds: reviewedArtifacts.map((artifact) => artifact.artifactId),
+    }), "utf8");
+    caseRecord.reviewWorkflow.technical.redlineFile = redlineFile;
+    reportPackage = refreshReviewPackage(caseRecord, reviewedArtifacts);
+  }
+
+  syncCaseReviewPackageFiles(caseRecord, reportPackage.documentControl.files);
+  saveCaseRecord(caseRecord);
+  return { caseRecord };
 }
 export async function handleCateoSitePublicApi(args: { pathname: string; req: http.IncomingMessage; res: http.ServerResponse; config: CashClawConfig | null; requestId: string; requesterId: string | null }): Promise<boolean> {
   const { pathname, req, res, config, requestId, requesterId } = args;
@@ -482,7 +625,7 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
     }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/cases`) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
-      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      if (!hasReviewDeskAccess(session)) { json(res, { error: "Review access required" }, 403); return true; }
       const filters = {
         q: url.searchParams.get("q")?.trim() || undefined,
         productOffering: url.searchParams.get("productOffering")?.trim() || undefined,
@@ -492,7 +635,16 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
         taskClass: url.searchParams.get("taskClass")?.trim() || undefined,
         partNumber: url.searchParams.get("partNumber")?.trim() || undefined,
       };
-      const items = listAdminCases(filters);
+      let items = listAdminCases(filters);
+      const lane = reviewLaneForSession(session);
+      if (!isAdmin(session) && lane) {
+        items = items.filter((item) => {
+          const record = loadCaseRecord(item.caseId);
+          if (!record) return false;
+          const workflow = deriveCaseReviewWorkflow(record, loadCaseArtifacts(record));
+          return workflow?.stage === lane;
+        });
+      }
       json(res, {
         ok: true,
         items,
@@ -507,8 +659,7 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
         session,
       });
       return true;
-    }
-    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/conversations`) {
+    }    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/conversations`) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
       if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
       const filters = {
@@ -636,9 +787,38 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
       return true;
     }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/overview`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } json(res, { ok: true, metrics: buildCommandCenterSnapshot(), users: listPublicUsers(config).slice(0, MAX_USERS), deletedUsers: listDeletedPublicUsers(config).slice(0, MAX_USERS), profiles: listPilotProfiles(config).slice(0, MAX_USERS), conversations: listConversationSummaries({ admin: true }).slice(0, MAX_CONVERSATIONS), session }); return true; }
-    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const items = buildAdminReviewItems(); json(res, { ok: true, items, stats: { pendingCases: items.length, pendingArtifacts: items.reduce((sum, item) => sum + item.draftArtifactCount, 0), enterpriseCases: items.filter((item) => item.serviceTier === "enterprise").length, reviewedTierCases: items.filter((item) => item.serviceTier === "reviewed").length }, session }); return true; }
-    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews/release`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const activeSession = requireSession(config, req, requesterId, requestId); const body = parseJson<{ caseId: string; password: string; otpCode?: string; note?: string }>(await readBody(req)); reauthorizePublicUser(config, activeSession.user.userId, { password: body.password, otpCode: body.otpCode }, requestId); const caseRecord = loadCaseRecord(body.caseId); if (!caseRecord) { json(res, { error: "Case not found" }, 404); return true; } const actor = activeSession.user.displayName || activeSession.user.email || activeSession.user.username || activeSession.user.userId; const released = releaseReviewedCase(caseRecord, actor, body.note, requestId); json(res, { ok: true, caseId: released.caseRecord.caseId, releaseStatus: released.caseRecord.interaction?.releaseStatus, releasedArtifactIds: released.releasedArtifactIds, pending: buildAdminReviewItems(), session: activeSession }); return true; }
-    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/feedback`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const items = listProcedureFeedback("pending-review"); json(res, { ok: true, items, stats: { pending: items.length, approved: listProcedureFeedback("approved").length, rejected: listProcedureFeedback("rejected").length }, session }); return true; }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews`) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      if (!hasReviewDeskAccess(session)) { json(res, { error: "Review access required" }, 403); return true; }
+      const lane = reviewLaneForSession(session);
+      if (!lane) { json(res, { error: "Review access required" }, 403); return true; }
+      const items = buildAdminReviewItems(lane);
+      json(res, { ok: true, items, stats: { pendingCases: items.length, pendingArtifacts: items.reduce((sum, item) => sum + item.draftArtifactCount, 0), enterpriseCases: items.filter((item) => item.serviceTier === "enterprise").length, reviewedTierCases: items.filter((item) => item.serviceTier === "reviewed").length }, session });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews/technical-decision`) {
+      if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      if (!isTechnicalReviewer(activeSession)) { json(res, { error: "Technical reviewer access required" }, 403); return true; }
+      const body = parseJson<{ caseId: string; action: "approve" | "redline"; note?: string }>(await readBody(req));
+      const caseRecord = loadCaseRecord(body.caseId);
+      if (!caseRecord) { json(res, { error: "Case not found" }, 404); return true; }
+      const decision = submitTechnicalReviewDecision(caseRecord, reviewActor(activeSession), body.action, body.note, requestId);
+      json(res, { ok: true, caseId: decision.caseRecord.caseId, reviewWorkflow: decision.caseRecord.reviewWorkflow, pending: buildAdminReviewItems("technical-review"), session: activeSession });
+      return true;
+    }
+    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/reviews/release`) {
+      if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; }
+      const activeSession = requireSession(config, req, requesterId, requestId);
+      if (!isQualityReviewer(activeSession)) { json(res, { error: "Quality reviewer access required" }, 403); return true; }
+      const body = parseJson<{ caseId: string; password: string; otpCode?: string; note?: string }>(await readBody(req));
+      reauthorizePublicUser(config, activeSession.user.userId, { password: body.password, otpCode: body.otpCode }, requestId);
+      const caseRecord = loadCaseRecord(body.caseId);
+      if (!caseRecord) { json(res, { error: "Case not found" }, 404); return true; }
+      const released = releaseReviewedCase(caseRecord, reviewActor(activeSession), body.note, requestId);
+      json(res, { ok: true, caseId: released.caseRecord.caseId, releaseStatus: released.caseRecord.interaction?.releaseStatus, releasedArtifactIds: released.releasedArtifactIds, pending: buildAdminReviewItems("quality-review"), session: activeSession });
+      return true;
+    }    if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/feedback`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const items = listProcedureFeedback("pending-review"); json(res, { ok: true, items, stats: { pending: items.length, approved: listProcedureFeedback("approved").length, rejected: listProcedureFeedback("rejected").length }, session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/feedback/decision`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const activeSession = requireSession(config, req, requesterId, requestId); const body = parseJson<{ feedbackId: string; action: "approve" | "reject"; note?: string }>(await readBody(req)); const actor = activeSession.user.displayName || activeSession.user.email || activeSession.user.username || activeSession.user.userId; const item = reviewProcedureFeedback({ feedbackId: body.feedbackId, action: body.action, actor, note: body.note }, requestId); json(res, { ok: true, item, items: listProcedureFeedback("pending-review"), session: activeSession }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/profiles`) { if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } json(res, { ok: true, items: listPilotProfiles(config), session }); return true; }
     if (pathname === `${CATEO_SITE_PUBLIC_PREFIX}/admin/profiles/update`) { if (req.method !== "POST") { json(res, { error: "POST only" }, 405); return true; } if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; } const body = parseJson<{ profileId: string; status?: "active" | "suspended"; serviceTier?: "free" | "reviewed" | "enterprise"; reviewedOutputs?: boolean; artifactDownloadAccess?: boolean; displayName?: string; organization?: string }>(await readBody(req)); const profile = updatePilotProfileAdmin(config, body.profileId, body, requestId); json(res, { ok: true, profile, session }); return true; }
@@ -656,7 +836,7 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
     const adminCaseMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/cases\/([^/]+)$/);
     if (adminCaseMatch) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
-      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      if (!hasReviewDeskAccess(session)) { json(res, { error: "Review access required" }, 403); return true; }
       const detail = loadAdminCaseDetail(decodeURIComponent(adminCaseMatch[1]));
       if (!detail) { json(res, { error: "Case not found" }, 404); return true; }
       json(res, { ok: true, detail, session });
@@ -665,13 +845,12 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
     const adminArtifactMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/artifacts\/([^/]+)$/);
     if (adminArtifactMatch) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
-      if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
+      if (!hasReviewDeskAccess(session)) { json(res, { error: "Review access required" }, 403); return true; }
       const detail = loadAdminArtifactDetail(decodeURIComponent(adminArtifactMatch[1]));
       if (!detail) { json(res, { error: "Artifact not found" }, 404); return true; }
       json(res, { ok: true, detail, session });
       return true;
-    }
-    const adminPartMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/parts\/([^/]+)$/);
+    }    const adminPartMatch = pathname.match(/^\/internal\/cateo\/site\/admin\/parts\/([^/]+)$/);
     if (adminPartMatch) {
       if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
       if (!isAdmin(session)) { json(res, { error: "Admin access required" }, 403); return true; }
@@ -759,6 +938,10 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
   }
   return false;
 }
+
+
+
+
 
 
 
