@@ -189,6 +189,84 @@ function buildConversationState(conversation: NonNullable<ReturnType<typeof load
     updatedAt: caseRecord?.updatedAt ?? (conversation.updatedAt ? new Date(conversation.updatedAt).toISOString() : undefined),
   };
 }
+function buildConversationFollowUpContext(conversation: NonNullable<ReturnType<typeof loadConversationRecord>>, viewer: { requesterId?: string; userId?: string; profileId?: string; admin?: boolean }) {
+  const caseRecord = latestConversationCase(conversation);
+  const artifacts = (caseRecord?.artifacts ?? [])
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact))
+    .filter((artifact) => artifactVisible(artifact, viewer));
+  return {
+    conversationId: conversation.conversationId,
+    caseId: caseRecord?.caseId,
+    title: caseRecord?.context.title ?? conversation.title,
+    input: caseRecord?.input ?? null,
+    contextSummary: caseRecord?.context.contextSummary ?? [],
+    clarifyingQuestion: caseRecord?.interaction?.clarifyingQuestion,
+    latestResponse: caseRecord?.interaction?.message,
+    preserved: {
+      partNumber: caseRecord?.context.partResolution?.partNumber ?? caseRecord?.input.partNumber,
+      businessType: caseRecord?.input.businessType ?? caseRecord?.context.businessType,
+      issueType: caseRecord?.context.issueType ?? caseRecord?.input.issueType ?? caseRecord?.input.errorCode,
+      assetId: caseRecord?.context.asset?.assetId,
+      assetType: caseRecord?.context.asset?.assetType,
+      machineModel: caseRecord?.context.machine?.model,
+      manufacturer: caseRecord?.context.machine?.manufacturer,
+      serialNumber: caseRecord?.context.machine?.serialNumber,
+      workOrderId: caseRecord?.context.workOrder?.workOrderId,
+      geography: caseRecord?.context.machine?.geography ?? caseRecord?.context.asset?.geography,
+      responseDetail: caseRecord?.input.responseDetail,
+    },
+    artifactPreviews: caseRecord?.interaction?.artifactPreviews ?? artifacts.map((artifact) => {
+      const revision = artifact.revisions.at(-1);
+      return {
+        artifactId: artifact.artifactId,
+        artifactType: artifact.artifactType,
+        title: revision?.metadata?.artifactTitle || revision?.summary || artifact.artifactType,
+        summary: revision?.summary || artifact.artifactType,
+        approvalState: revision?.approvalState || 'draft',
+        revisionNumber: revision?.revisionNumber || 1,
+      };
+    }),
+  };
+}
+function loadConversationCaseDetail(conversationId: string, viewer: { requesterId?: string; userId?: string; profileId?: string; admin?: boolean }) {
+  const conversation = loadConversationRecord(conversationId);
+  if (!conversation || !canAccess(conversation, viewer)) return null;
+  const caseRecord = latestConversationCase(conversation);
+  if (!caseRecord) return null;
+  const artifacts = caseRecord.artifacts
+    .map((artifactId) => loadArtifactRecord(artifactId))
+    .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact))
+    .filter((artifact) => artifactVisible(artifact, viewer));
+  return {
+    conversationId: conversation.conversationId,
+    conversationTitle: conversation.title,
+    caseId: caseRecord.caseId,
+    title: caseRecord.context.title,
+    releaseStatus: caseRecord.interaction?.releaseStatus,
+    interaction: caseRecord.interaction,
+    request: {
+      productOffering: caseRecord.input.productOffering,
+      businessType: caseRecord.input.businessType ?? caseRecord.context.businessType,
+      issueType: caseRecord.context.issueType ?? caseRecord.input.issueType ?? caseRecord.input.errorCode,
+      partNumber: caseRecord.context.partResolution?.partNumber ?? caseRecord.input.partNumber,
+      assetId: caseRecord.context.asset?.assetId,
+      assetType: caseRecord.context.asset?.assetType,
+      machineModel: caseRecord.context.machine?.model,
+      manufacturer: caseRecord.context.machine?.manufacturer,
+      serialNumber: caseRecord.context.machine?.serialNumber,
+      workOrderId: caseRecord.context.workOrder?.workOrderId,
+      updatedAt: caseRecord.updatedAt,
+    },
+    contextSummary: caseRecord.context.contextSummary,
+    observedConditions: caseRecord.context.observedConditions,
+    artifacts: artifacts.map((artifact) => ({
+      projection: toArtifactProjection(artifact, viewer),
+      latestContent: artifact.revisions.at(-1)?.content,
+      latestMetadata: artifact.revisions.at(-1)?.metadata,
+    })),
+  };
+}
 function buildAdminReviewItems(): AdminReviewItem[] {
   return listCaseCatalogRows()
     .map((row) => loadCaseRecord(row.caseId))
@@ -615,6 +693,22 @@ export async function handleCateoSitePublicApi(args: { pathname: string; req: ht
       const conversation = await syncConversationJobs(decodeURIComponent(conversationStateMatch[1]), requesterId);
       if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; }
       json(res, { ok: true, state: buildConversationState(conversation, viewer), session });
+      return true;
+    }
+    const conversationFollowUpMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/follow-up-context$/);
+    if (conversationFollowUpMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      const conversation = await syncConversationJobs(decodeURIComponent(conversationFollowUpMatch[1]), requesterId);
+      if (!conversation || !canAccess(conversation, viewer)) { json(res, { error: "Conversation not found" }, 404); return true; }
+      json(res, { ok: true, followUp: buildConversationFollowUpContext(conversation, viewer), session });
+      return true;
+    }
+    const conversationCaseMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/case$/);
+    if (conversationCaseMatch) {
+      if (req.method !== "GET") { json(res, { error: "GET only" }, 405); return true; }
+      const detail = loadConversationCaseDetail(decodeURIComponent(conversationCaseMatch[1]), viewer);
+      if (!detail) { json(res, { error: "Case detail not found" }, 404); return true; }
+      json(res, { ok: true, detail, session });
       return true;
     }
     const conversationReportMatch = pathname.match(/^\/internal\/cateo\/site\/conversations\/([^/]+)\/report$/);

@@ -1097,7 +1097,7 @@ export async function findMatchingValidatedProcedure(
     });
 
   const artifacts: CateoArtifactRecord[] = relatedArtifacts.length > 0 ? relatedArtifacts : [best.artifact];
-  const interaction = renderCateoInteraction(artifacts);
+  const interaction = renderCateoInteraction(artifacts, { detailLevel: sanitizedInput.responseDetail });
   interaction.message = `Cateo found an existing validated troubleshooting procedure for ${context.partResolution?.partNumber}. Returning the current controlled version immediately.
 
 ${interaction.message}`;
@@ -2232,7 +2232,7 @@ export async function generateCateoArtifacts(
     artifactCount: artifacts.length,
   }));
 
-    const interaction = renderCateoInteraction(artifacts);
+    const interaction = renderCateoInteraction(artifacts, { detailLevel: sanitizedInput.responseDetail });
     if (requiresEngineerReview) {
       interaction.releaseStatus = "pending-engineer-review";
       interaction.requiresEngineerReview = true;

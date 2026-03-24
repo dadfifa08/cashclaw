@@ -49,6 +49,9 @@ interface PublicChatResponse {
     releaseStatus?: string;
     requiresEngineerReview?: boolean;
     clarifyingQuestion?: string;
+    detailLevel?: "concise" | "balanced" | "detailed";
+    sections?: Array<{ sectionId: string; title: string; tone: "info" | "caution" | "success"; items: string[] }>;
+    artifactPreviews?: Array<{ artifactId: string; artifactType: string; title: string; summary: string; approvalState: string; revisionNumber: number }>;
   };
   artifacts: PublicChatArtifactSummary[];
 }
@@ -224,6 +227,9 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
       releaseStatus: result.interaction.releaseStatus,
       requiresEngineerReview: result.interaction.requiresEngineerReview,
       clarifyingQuestion: result.interaction.clarifyingQuestion,
+      detailLevel: result.interaction.detailLevel,
+      sections: result.interaction.sections,
+      artifactPreviews: result.interaction.artifactPreviews,
     }
     : undefined;
 

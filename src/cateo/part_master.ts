@@ -146,7 +146,7 @@ function appendRelationTargets(targets: string[], relations: CateoArtifactRelati
   ]);
 }
 
-function inferEntityTypes(input: { displayTitle?: string; description?: string; taxonomyTags?: string[]; componentTitle?: string; requiredPartCount?: number; relationTargets?: string[] }): string[] {
+function inferEntityTypes(input: { displayTitle?: string; description?: string; taxonomyTags?: string[]; componentTitle?: string; requiredPartCount?: number; relationTargets?: string[]; objectCategory?: string }): string[] {
   const haystack = [
     input.displayTitle,
     input.description,
@@ -154,7 +154,7 @@ function inferEntityTypes(input: { displayTitle?: string; description?: string; 
     ...(input.taxonomyTags ?? []),
     ...(input.relationTargets ?? []),
   ].filter(Boolean).join(" ").toLowerCase();
-  const entityTypes: string[] = [];
+  const entityTypes: string[] = input.objectCategory ? [input.objectCategory] : [];
   if (/assembly|subassembly|module|manifold|harness|kit/.test(haystack) || (input.requiredPartCount ?? 0) > 1) entityTypes.push("assembly");
   if (/component|sensor|board|valve|motor|pump|switch|connector/.test(haystack) || Boolean(input.componentTitle)) entityTypes.push("component");
   if (/material|alloy|polymer|resin|steel|aluminum|stainless|copper|ceramic|adhesive|lubricant/.test(haystack)) entityTypes.push("material");
@@ -321,11 +321,11 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.partFamily = current.partFamily || metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily || undefined;
       const relationTargets = appendRelationTargets([], metadata.relations);
       const childPartNumbers = unique([
-        ...relatedPartNumbers(metadata.relations, ["requires-part"]),
+        ...relatedPartNumbers(metadata.relations, ["requires-part", "has-child"]),
         ...(metadata.parts?.requiredPartLines ?? []).map((line) => line.partNumber),
       ]);
-      const parentPartNumbers = relatedPartNumbers(metadata.relations, ["belongs-to-component", "installed-on"]);
-      current.entityTypes = unique([...current.entityTypes, ...inferEntityTypes({ displayTitle: current.displayTitle, description: current.description, taxonomyTags: metadata.taxonomyTags, componentTitle: metadata.componentTitle, requiredPartCount: metadata.parts?.requiredPartLines?.length, relationTargets })]);
+      const parentPartNumbers = relatedPartNumbers(metadata.relations, ["belongs-to-component", "has-parent"]);
+      current.entityTypes = unique([...current.entityTypes, ...inferEntityTypes({ displayTitle: current.displayTitle, description: current.description, taxonomyTags: metadata.taxonomyTags, componentTitle: metadata.componentTitle, requiredPartCount: metadata.parts?.requiredPartLines?.length, relationTargets, objectCategory: metadata.objectMetadata?.objectCategory })]);
       current.parentPartNumbers = unique([...current.parentPartNumbers, ...parentPartNumbers]);
       current.childPartNumbers = unique([...current.childPartNumbers, ...childPartNumbers]);
       current.assemblyPartNumbers = unique([...current.assemblyPartNumbers, ...(current.entityTypes.includes("assembly") ? [current.canonicalPartNumber] : []), ...parentPartNumbers]);
@@ -403,7 +403,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       description: record.context.partResolution?.partDescription ?? undefined,
       manufacturer: record.context.partResolution?.manufacturer ?? record.context.machine?.manufacturer ?? undefined,
       partFamily: undefined,
-      entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model }),
+      entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model, objectCategory: record.context.partResolution?.partNumber?.toLowerCase().includes("ln") ? "ln" : undefined }),
       parentPartNumbers: [],
       childPartNumbers: [],
       assemblyPartNumbers: [],

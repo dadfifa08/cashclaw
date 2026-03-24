@@ -17,7 +17,7 @@ const LOCK_MS = 15 * 60 * 1000;
 const LIMIT = 6;
 const throttle = new Map<string, { failures: number[]; lockedUntil?: number }>();
 
-export type CateoPublicUserRole = "user" | "admin";
+export type CateoPublicUserRole = "user" | "admin" | "technical-reviewer" | "quality-reviewer";
 
 interface UserSecurityRec {
   passwordChangedAt?: string;
@@ -132,7 +132,7 @@ function defaultSecurity(): UserSecurityRec { return { twoFactor: { enabled: fal
 function defaultPreferences(record?: Partial<UserRec>): UserPreferencesRec { return { timezone: undefined, responseDetail: "balanced", emailUpdates: Boolean(record?.email) }; }
 function normalizePreferences(record: UserRec): UserPreferencesRec { const fallback = defaultPreferences(record); const current = record.preferences ?? {}; return { timezone: trim(current.timezone), responseDetail: current.responseDetail === "concise" || current.responseDetail === "detailed" ? current.responseDetail : fallback.responseDetail, emailUpdates: typeof current.emailUpdates === "boolean" ? current.emailUpdates : fallback.emailUpdates }; }
 function normalizeSecurity(security: UserRec["security"] | undefined): UserSecurityRec { const twoFactor = security?.twoFactor; return { passwordChangedAt: trim(security?.passwordChangedAt), twoFactor: { enabled: Boolean(twoFactor?.enabled), secret: trim(twoFactor?.secret), pendingSecret: trim(twoFactor?.pendingSecret), recoveryCodeHashes: Array.isArray(twoFactor?.recoveryCodeHashes) ? twoFactor.recoveryCodeHashes.filter((value): value is string => typeof value === "string" && value.trim().length > 0) : [], enabledAt: trim(twoFactor?.enabledAt), lastVerifiedAt: trim(twoFactor?.lastVerifiedAt) } }; }
-function normalizeUserRecord(record: UserRec): UserRec { const roles: CateoPublicUserRole[] = Array.isArray(record.roles) && record.roles.length > 0 ? Array.from(new Set(record.roles.filter((role): role is CateoPublicUserRole => role === "user" || role === "admin"))) : ["user"]; const requesterIds = Array.isArray(record.requesterIds) ? [...new Set(record.requesterIds.map((value) => trim(value)).filter((value): value is string => Boolean(value)))] : []; return { ...record, status: record.status === "suspended" ? "suspended" : "active", authSource: record.authSource === "operator" ? "operator" : "local", displayName: trim(record.displayName) || trim(record.username) || trim(record.email) || "Cateo user", organization: trim(record.organization), roles, requesterIds, security: normalizeSecurity(record.security), preferences: normalizePreferences(record) }; }
+function normalizeUserRecord(record: UserRec): UserRec { const roles: CateoPublicUserRole[] = Array.isArray(record.roles) && record.roles.length > 0 ? Array.from(new Set(record.roles.filter((role): role is CateoPublicUserRole => role === "user" || role === "admin" || role === "technical-reviewer" || role === "quality-reviewer"))) : ["user"]; const requesterIds = Array.isArray(record.requesterIds) ? [...new Set(record.requesterIds.map((value) => trim(value)).filter((value): value is string => Boolean(value)))] : []; return { ...record, status: record.status === "suspended" ? "suspended" : "active", authSource: record.authSource === "operator" ? "operator" : "local", displayName: trim(record.displayName) || trim(record.username) || trim(record.email) || "Cateo user", organization: trim(record.organization), roles, requesterIds, security: normalizeSecurity(record.security), preferences: normalizePreferences(record) }; }
 function normalizeUserFile(file: UserFile): UserFile { return { version: file.version || USER_DB, updatedAt: file.updatedAt || new Date(0).toISOString(), users: (file.users ?? []).map((entry) => normalizeUserRecord(entry)) }; }
 function createSession(config: CashClawConfig, record: UserRec, requesterId?: string, requestId?: string): CateoPublicSessionSnapshot { const store = loadSessions(); const expiresAt = new Date(Date.now() + Math.max(1, getPilotConfig(config).sessionTtlDays) * 24 * 60 * 60 * 1000).toISOString(); const sessionId = crypto.randomBytes(36).toString("base64url"); const session: SessionRec = { sessionId, userId: record.userId, requesterId, createdAt: nowIso(), updatedAt: nowIso(), expiresAt }; const sessions = store.sessions.filter((entry) => entry.expiresAt > nowIso() && entry.userId !== record.userId).slice(-40); sessions.push(session); saveSessions({ version: SESSION_DB, updatedAt: nowIso(), sessions }); appendAuditEvent({ actor: "server", category: "public_auth", action: "session_create", outcome: "success", message: `Created public session for ${record.userId}`, requestId, metadata: { userId: record.userId, requesterId } }); return { sessionId, expiresAt, user: userSnapshot(config, record) }; }
 function passwordStrengthErrors(password: string, tokens: string[]): string[] { const errors: string[] = []; const normalized = password.trim(); if (normalized.length < 14) errors.push("Use at least 14 characters."); if (!/[a-z]/.test(normalized)) errors.push("Add a lowercase letter."); if (!/[A-Z]/.test(normalized)) errors.push("Add an uppercase letter."); if (!/\d/.test(normalized)) errors.push("Add a number."); if (!/[^A-Za-z0-9]/.test(normalized)) errors.push("Add a symbol."); if (/\s/.test(normalized)) errors.push("Avoid spaces."); if (/(.)\1\1/.test(normalized)) errors.push("Avoid repeated character runs."); for (const token of tokens.map((entry) => entry.toLowerCase()).filter((entry) => entry.length >= 4)) { if (normalized.toLowerCase().includes(token)) { errors.push("Do not include your email, username, or display name in the password."); break; } } return errors; }
@@ -147,7 +147,33 @@ export function loginPublicUser(config: CashClawConfig, input: { identifier: str
     return completeLogin(local);
   }
   const operator = authenticateOperator(identifier, password);
-  if (operator && operator.role === "admin") { const admin = local ?? { userId: crypto.randomUUID(), createdAt: nowIso(), updatedAt: nowIso(), lastLoginAt: nowIso(), status: "active", authSource: "operator", username: normalizeUsername(identifier) || identifier, displayName: identifier, roles: ["user", "admin"], requesterIds: [], security: defaultSecurity(), preferences: defaultPreferences() } as UserRec; admin.updatedAt = nowIso(); admin.lastLoginAt = nowIso(); admin.roles = ["user", "admin"]; admin.security = admin.security ?? defaultSecurity(); admin.preferences = admin.preferences ?? defaultPreferences(); touchRequester(admin, input.requesterId); admin.profileId = profileIdFor(config, admin, input.requesterId, requestId); return completeLogin(admin); }
+  if (operator && (operator.role === "admin" || operator.role === "reviewer")) {
+    const roles: CateoPublicUserRole[] = operator.role === "admin"
+      ? ["user", "admin", "quality-reviewer"]
+      : ["user", "technical-reviewer"];
+    const operatorUser = local ?? {
+      userId: crypto.randomUUID(),
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      lastLoginAt: nowIso(),
+      status: "active",
+      authSource: "operator",
+      username: normalizeUsername(identifier) || identifier,
+      displayName: identifier,
+      roles,
+      requesterIds: [],
+      security: defaultSecurity(),
+      preferences: defaultPreferences(),
+    } as UserRec;
+    operatorUser.updatedAt = nowIso();
+    operatorUser.lastLoginAt = nowIso();
+    operatorUser.roles = roles;
+    operatorUser.security = operatorUser.security ?? defaultSecurity();
+    operatorUser.preferences = operatorUser.preferences ?? defaultPreferences();
+    touchRequester(operatorUser, input.requesterId);
+    operatorUser.profileId = profileIdFor(config, operatorUser, input.requesterId, requestId);
+    return completeLogin(operatorUser);
+  }
   failedLogin(identifier, input.requesterId); appendAuditEvent({ actor: "server", category: "public_auth", action: "login", outcome: "failed", severity: "warn", message: "Public login failed", requestId, metadata: { identifier, requesterId: input.requesterId } }); throw new CateoPublicAuthError("LOGIN_INVALID", "That login was not accepted.", 401); }
 
 export function getPublicSession(config: CashClawConfig, sessionId?: string, requesterId?: string, requestId?: string): CateoPublicSessionSnapshot | null { const id = trim(sessionId); if (!id) return null; const sessions = loadSessions(); const active = sessions.sessions.find((entry) => entry.sessionId === id); if (!active || active.expiresAt <= nowIso()) return null; if (requesterId && active.requesterId && active.requesterId !== requesterId) { appendAuditEvent({ actor: "server", category: "public_auth", action: "session_mismatch", outcome: "denied", severity: "warn", message: "Rejected public session because the requester identity changed", requestId, metadata: { requesterId, storedRequesterId: active.requesterId } }); return null; } const store = loadUsers(); const user = store.users.find((entry) => entry.userId === active.userId && entry.status === "active"); if (!user) return null; touchRequester(user, requesterId); user.profileId = profileIdFor(config, user, requesterId, requestId); saveUser(config, store, user); active.updatedAt = nowIso(); if (requesterId) active.requesterId = requesterId; saveSessions({ version: SESSION_DB, updatedAt: nowIso(), sessions: [...sessions.sessions.filter((entry) => entry.sessionId !== id && entry.expiresAt > nowIso()), active] }); return { sessionId: active.sessionId, expiresAt: active.expiresAt, user: userSnapshot(config, user) }; }

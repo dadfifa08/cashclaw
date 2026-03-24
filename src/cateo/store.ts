@@ -403,7 +403,7 @@ export function createRevision(params: {
     diffFromPrevious: current ? buildJsonDiff(current.content, params.content) : [],
     signoffs: params.signoffs ?? current?.signoffs ?? [],
     provenance: params.provenance,
-    metadata: params.metadata,
+    metadata: params.metadata ?? current?.metadata,
     content: params.content,
   };
 
@@ -448,7 +448,7 @@ export function findSimilarArtifacts(params: {
   limit?: number;
   minScore?: number;
 }): SimilarArtifactMatch[] {
-  const rows = listArtifactCatalogRows().filter((row) => row.artifactType === params.artifactType && row.lifecycleState !== "retired");
+  const rows = listArtifactCatalogRows().filter((row) => row.artifactType === params.artifactType && row.lifecycleState !== "obsolete" && row.lifecycleState !== "superseded");
   const vectorMatches = searchVectorIndex({
     text: [params.artifactType, params.text, params.assetId, params.workOrderId].filter(Boolean).join("\n"),
     kind: "artifact",

@@ -548,7 +548,7 @@ export function upsertCashClawArtifactsForTask(args: {
     artifacts.push(saveArtifactRecord(record));
   }
 
-  const interaction = renderCateoInteraction(artifacts);
+  const interaction = renderCateoInteraction(artifacts, { detailLevel: input.responseDetail });
   saveCaseRecord({
     caseId,
     runId,

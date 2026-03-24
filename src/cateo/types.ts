@@ -59,6 +59,89 @@ export type CateoApprovalState = "draft" | "reviewed" | "approved";
 export type CateoConfidence = "low" | "medium" | "high";
 export type CateoRiskLevel = "low" | "medium" | "high" | "critical";
 export type CateoAttachmentKind = "image" | "video" | "document";
+export type CateoResponseDetail = "concise" | "balanced" | "detailed";
+export type CateoObjectCategory =
+  | "assembly"
+  | "sub-assembly"
+  | "part"
+  | "consumable"
+  | "ln"
+  | "software"
+  | "tool"
+  | "document"
+  | "knowledge-asset"
+  | "other";
+export type CateoDocumentType =
+  | "manual"
+  | "procedure"
+  | "drawing"
+  | "training-material"
+  | "report"
+  | "checklist"
+  | "parts-list"
+  | "datasheet"
+  | "specification"
+  | "knowledge-asset"
+  | "other";
+export type CateoLifecycleState = "draft" | "released" | "obsolete" | "superseded";
+
+export interface CateoExternalSystemLinks {
+  cmsIds: string[];
+  n7Ids: string[];
+  crmIds: string[];
+  erpIds: string[];
+}
+
+export interface CateoEffectivitySerialRange {
+  serialStart?: string;
+  serialEnd?: string;
+  note?: string;
+}
+
+export interface CateoEffectivitySoftwareRange {
+  product?: string;
+  minVersion?: string;
+  maxVersion?: string;
+  note?: string;
+}
+
+export interface CateoApplicabilityEffectivity {
+  serialRanges: CateoEffectivitySerialRange[];
+  softwareVersions: CateoEffectivitySoftwareRange[];
+  geographies: string[];
+  locationPaths: string[];
+  assetIds: string[];
+  applicabilityNotes: string[];
+}
+
+export interface CateoObjectMetadata {
+  persistentObjectId: string;
+  masterRecordId: string;
+  objectCategory: CateoObjectCategory;
+  bomNodeId?: string;
+  hierarchyPath: string[];
+  parentObjectIds: string[];
+  childObjectIds: string[];
+  lineNumberRef?: string;
+}
+
+export interface CateoConfigurationFingerprint {
+  fingerprint: string;
+  source: string[];
+}
+
+export interface CateoChangeHistoryEntry {
+  changeId: string;
+  changedAt: string;
+  actor: string;
+  action: string;
+  summary: string;
+  relatedCaseId?: string;
+  relatedArtifactId?: string;
+  revisionId?: string;
+  revisionNumber?: number;
+  note?: string;
+}
 
 export interface CateoSkillActivation {
   id: string;
@@ -136,6 +219,8 @@ export interface CateoMachineMetadata {
   locationHierarchy?: string[];
   operatingHours?: number;
   environment?: string;
+  geography?: string;
+  externalSystemIds?: CateoExternalSystemLinks;
 }
 
 export interface CateoAssetRegistryLink {
@@ -144,6 +229,8 @@ export interface CateoAssetRegistryLink {
   model?: string;
   configuration?: Record<string, string>;
   locationHierarchy?: string[];
+  geography?: string;
+  externalSystemIds?: CateoExternalSystemLinks;
 }
 
 export interface CateoWorkOrderLink {
@@ -154,6 +241,7 @@ export interface CateoWorkOrderLink {
   productOffering?: CateoProductOffering;
   partNumber?: string;
   contextNotes?: string;
+  externalSystemIds?: CateoExternalSystemLinks;
 }
 
 export interface CateoServiceHistoryEntry {
@@ -280,6 +368,7 @@ export interface CateoAssistInput {
   productOffering?: CateoProductOffering;
   partNumber?: string;
   contextNotes?: string;
+  responseDetail?: CateoResponseDetail;
   workflow?: CateoWorkflowIntake;
   symptomDescription: string;
   observedConditions?: string[];
@@ -468,7 +557,7 @@ export interface CateoArtifactSchemaRef {
 }
 
 export type CateoArtifactDuplicateState = "canonical" | "duplicate" | "merged-source";
-export type CateoArtifactRelationTarget = "artifact" | "asset" | "work-order" | "part" | "component" | "failure-mode" | "document" | "conversation" | "case";
+export type CateoArtifactRelationTarget = "artifact" | "asset" | "work-order" | "part" | "component" | "failure-mode" | "document" | "conversation" | "case" | "external-record" | "software-version" | "geography";
 export type CateoArtifactRelationStrength = "exact" | "high" | "medium" | "low";
 export type CateoArtifactRelationSource = "ingested" | "inferred" | "merged" | "operator";
 
@@ -485,7 +574,24 @@ export interface CateoPartReferenceLine {
 
 export interface CateoArtifactRelation {
   relationId: string;
-  kind: "references" | "duplicate-of" | "derived-from" | "installed-on" | "linked-to-work-order" | "requires-part" | "documents" | "tracks-failure-mode" | "belongs-to-component" | "linked-to-conversation" | "linked-to-case";
+  kind:
+    | "references"
+    | "duplicate-of"
+    | "derived-from"
+    | "installed-on"
+    | "linked-to-work-order"
+    | "requires-part"
+    | "depends-on"
+    | "documents"
+    | "documented-in"
+    | "tracks-failure-mode"
+    | "belongs-to-component"
+    | "has-parent"
+    | "has-child"
+    | "superseded-by"
+    | "linked-to-conversation"
+    | "linked-to-case"
+    | "linked-to-external-record";
   targetType: CateoArtifactRelationTarget;
   targetId: string;
   label?: string;
@@ -516,7 +622,9 @@ export interface CateoArtifactEnterpriseMetadata {
   approvalState: CateoApprovalState;
   confidence: CateoConfidence;
   riskLevel: CateoRiskLevel;
-  lifecycleState: "active" | "superseded" | "retired";
+  lifecycleState: CateoLifecycleState;
+  documentType?: CateoDocumentType;
+  objectMetadata: CateoObjectMetadata;
   taxonomyTags: string[];
   componentTitle?: string;
   partNumber?: string;
@@ -597,6 +705,10 @@ export interface CateoArtifactEnterpriseMetadata {
     followUpActions: string[];
   };
   relations: CateoArtifactRelation[];
+  effectivity: CateoApplicabilityEffectivity;
+  configurationFingerprint?: CateoConfigurationFingerprint;
+  externalSystemIds: CateoExternalSystemLinks;
+  changeHistory: CateoChangeHistoryEntry[];
   traceability: {
     caseId: string;
     runId: string;
@@ -669,6 +781,47 @@ export interface CateoElectronicSignoff {
   signedAt: string;
 }
 
+export type CateoReviewWorkflowStage = "technical-review" | "quality-review" | "released";
+export type CateoTechnicalReviewStatus = "pending" | "approved" | "redlined";
+export type CateoQualityReviewStatus = "pending" | "released";
+export type CateoStoredReviewFileKind = "generated-word" | "generated-pdf" | "technical-redline";
+
+export interface CateoStoredReviewFile {
+  kind: CateoStoredReviewFileKind;
+  fileName: string;
+  relativePath: string;
+  mimeType?: string;
+  uploadedAt: string;
+  uploadedBy: string;
+}
+
+export interface CateoTechnicalReviewRecord {
+  status: CateoTechnicalReviewStatus;
+  reviewerUserId?: string;
+  reviewerDisplayName?: string;
+  note?: string;
+  decidedAt?: string;
+  redlineFile?: CateoStoredReviewFile;
+}
+
+export interface CateoQualityReviewRecord {
+  status: CateoQualityReviewStatus;
+  reviewerUserId?: string;
+  reviewerDisplayName?: string;
+  note?: string;
+  decidedAt?: string;
+}
+
+export interface CateoCaseReviewWorkflow {
+  stage: CateoReviewWorkflowStage;
+  packageFiles: {
+    generatedWord?: CateoStoredReviewFile;
+    generatedPdf?: CateoStoredReviewFile;
+  };
+  technical: CateoTechnicalReviewRecord;
+  quality: CateoQualityReviewRecord;
+}
+
 export interface CateoArtifactRevision {
   revisionId: string;
   revisionNumber: number;
@@ -718,6 +871,7 @@ export interface CateoCaseRecord {
   userId?: string;
   usage?: CateoUsageSummary;
   trace: CateoReasoningTrace;
+  reviewWorkflow?: CateoCaseReviewWorkflow;
 }
 
 export interface CateoRoutingDecision {
@@ -908,6 +1062,23 @@ export interface CateoArtifactPersistAction {
   matchScore?: number;
 }
 export type CateoInteractionReleaseStatus = "available" | "clarification-required" | "pending-engineer-review";
+export type CateoInteractionSectionTone = "info" | "caution" | "success";
+
+export interface CateoInteractionSection {
+  sectionId: string;
+  title: string;
+  tone: CateoInteractionSectionTone;
+  items: string[];
+}
+
+export interface CateoInteractionArtifactPreview {
+  artifactId: string;
+  artifactType: CateoArtifactType;
+  title: string;
+  summary: string;
+  approvalState: CateoApprovalState;
+  revisionNumber: number;
+}
 
 export interface CateoInteractionProjection {
   message: string;
@@ -917,6 +1088,9 @@ export interface CateoInteractionProjection {
   artifactCount: number;
   artifactLabels: string[];
   conversationTitle?: string;
+  detailLevel?: CateoResponseDetail;
+  sections?: CateoInteractionSection[];
+  artifactPreviews?: CateoInteractionArtifactPreview[];
   clarifyingQuestion?: string;
   releaseStatus: CateoInteractionReleaseStatus;
   requiresEngineerReview?: boolean;

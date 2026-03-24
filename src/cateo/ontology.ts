@@ -6,7 +6,7 @@ import type { CateoArtifactRecord, CateoArtifactRelation, CateoCaseRecord } from
 const ONTOLOGY_DB_VERSION = "cateo-ontology-db-v1";
 
 export interface CateoOntologyEntityRow {
-  entityType: "artifact" | "asset" | "work-order" | "part" | "component" | "failure-mode" | "document" | "conversation" | "case";
+  entityType: "artifact" | "asset" | "work-order" | "part" | "component" | "failure-mode" | "document" | "conversation" | "case" | "external-record" | "software-version" | "geography";
   entityId: string;
   title: string;
   labels: string[];

@@ -97,7 +97,7 @@ function duplicateGroups(): CateoDuplicateGroup[] {
   const records = listArtifactCatalogRows()
     .map((row) => loadArtifactRecord(row.artifactId))
     .filter((record): record is CateoArtifactRecord => Boolean(record))
-    .filter((record) => record.duplicateState !== "duplicate" && record.revisions.at(-1)?.metadata?.lifecycleState !== "retired");
+    .filter((record) => record.duplicateState !== "duplicate" && record.revisions.at(-1)?.metadata?.lifecycleState !== "obsolete" && record.revisions.at(-1)?.metadata?.lifecycleState !== "superseded");
 
   const groups = new Map<string, CateoArtifactRecord[]>();
   for (const record of records) {
@@ -150,7 +150,19 @@ function mergeDuplicateContent(canonical: CateoArtifactRecord, duplicates: Cateo
   const provenance = revision?.provenance;
   const metadata = revision?.metadata ? structuredClone(revision.metadata) : undefined;
   if (metadata) {
-    metadata.lifecycleState = "active";
+    metadata.lifecycleState = "released";
+    metadata.changeHistory = [
+      ...(metadata.changeHistory ?? []),
+      {
+        changeId: crypto.randomUUID(),
+        changedAt: new Date().toISOString(),
+        actor,
+        action: "canonicalized-duplicates",
+        summary: `Canonicalized duplicate artifacts into ${canonical.artifactId}`,
+        relatedCaseId: canonical.caseId,
+        relatedArtifactId: canonical.artifactId,
+      },
+    ];
     metadata.relations = metadata.relations ?? [];
     metadata.documentControl = metadata.documentControl ?? {
       recordClass: `${canonical.artifactType}.legacy`,
@@ -234,6 +246,18 @@ export function reconcileArtifactDuplicates(actor = "cateo-maintenance", request
       if (revision?.metadata) {
         ensureMetadataDefaults(duplicate);
         revision.metadata.lifecycleState = "superseded";
+        revision.metadata.changeHistory = [
+          ...(revision.metadata.changeHistory ?? []),
+          {
+            changeId: crypto.randomUUID(),
+            changedAt: new Date().toISOString(),
+            actor,
+            action: "superseded",
+            summary: `Superseded by canonical artifact ${canonicalAfterMerge.artifactId}`,
+            relatedCaseId: duplicate.caseId,
+            relatedArtifactId: duplicate.artifactId,
+          },
+        ];
         revision.metadata.documentControl.supersededByArtifactId = canonicalAfterMerge.artifactId;
         revision.metadata.documentControl.changeReason = `Superseded by canonical artifact ${canonicalAfterMerge.artifactId} during duplicate reconciliation.`;
         revision.metadata.documentControl.relatedArtifactIds = unique([...(revision.metadata.documentControl.relatedArtifactIds ?? []), canonicalAfterMerge.artifactId]);
