@@ -206,26 +206,16 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
     return undefined;
   }
 
-  const reviewPending = Boolean(result.interaction?.requiresEngineerReview);
   const summary = result.summary?.trim() || result.interaction?.message || "Cateo prepared a controlled engineering response package.";
   const interaction = result.interaction
     ? {
-      message: reviewPending
-        ? "Cateo assembled the requested engineering package and sent it to the engineer review bucket. It will be released to the customer profile after password-backed admin sign-off."
-        : result.interaction.message,
-      highlights: reviewPending
-        ? [
-          "The requested artifact package was generated and fully logged.",
-          "A human engineer review is required before customer release.",
-        ]
-        : result.interaction.highlights ?? [],
-      nextActions: reviewPending
-        ? ["Wait for engineer sign-off before downloading or acting on the final released package."]
-        : result.interaction.nextActions ?? [],
+      message: result.interaction.message,
+      highlights: result.interaction.highlights ?? [],
+      nextActions: result.interaction.nextActions ?? [],
       confidence: result.interaction.confidence ?? "medium",
       artifactCount: result.interaction.artifactCount ?? result.artifacts.length,
-      releaseStatus: result.interaction.releaseStatus,
-      requiresEngineerReview: result.interaction.requiresEngineerReview,
+      releaseStatus: result.interaction.releaseStatus === "clarification-required" ? "clarification-required" : "available",
+      requiresEngineerReview: false,
       clarifyingQuestion: result.interaction.clarifyingQuestion,
       detailLevel: result.interaction.detailLevel,
       sections: result.interaction.sections,
@@ -235,7 +225,7 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
 
   return {
     message: interaction?.message ?? summary,
-    summary: reviewPending ? "Cateo generated the report package and queued engineer review before release." : summary,
+    summary,
     highlights: interaction?.highlights ?? [],
     nextActions: interaction?.nextActions ?? [],
     confidence: interaction?.confidence ?? "medium",
@@ -249,7 +239,6 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
     })),
   };
 }
-
 function toPublicJob(job: AssistJobSnapshot): PublicQueueJob {
   return {
     jobId: job.jobId,
@@ -586,14 +575,14 @@ export async function startCateoSiteBridge(
                   displayName: reservation.profile.displayName,
                   organization: reservation.profile.organization,
                   serviceTier: reservation.profile.serviceTier,
-                  requiresEngineerReview: reservation.profile.reviewedOutputs,
+                  requiresEngineerReview: false,
                 },
               });
               if (immediate) {
                 const job = submitCompletedAssistJob(body, immediate, requesterId, requestId, {
                   profile: reservation.profile,
                   quotaReservationId: reservation.reservationId,
-                  requiresEngineerReview: reservation.profile.reviewedOutputs,
+                  requiresEngineerReview: false,
                   statusDetail: "Validated troubleshooting procedure returned immediately from the internal catalog.",
                 });
                 settlePilotQuota(config, reservation.profile.profileId, reservation.reservationId, { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, "completed", requestId);
@@ -708,6 +697,8 @@ export async function startCateoSiteBridge(
 
   return server;
 }
+
+
 
 
 

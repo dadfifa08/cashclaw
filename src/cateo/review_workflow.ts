@@ -51,8 +51,6 @@ export function caseRequiresControlledReview(record: CateoCaseRecord): boolean {
   return Boolean(
     record.reviewWorkflow
     || record.interaction?.requiresEngineerReview
-    || record.requester?.requiresEngineerReview
-    || record.input.workflow?.mode === "reviewed-document"
     || record.interaction?.releaseStatus === "pending-engineer-review",
   );
 }
@@ -210,3 +208,4 @@ export function reviewLaneForRoles(roles: string[] | undefined): "technical-revi
   }
   return null;
 }
+

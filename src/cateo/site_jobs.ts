@@ -523,7 +523,7 @@ export function submitCompletedAssistJob(
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
     profileServiceTier: options?.profile?.serviceTier,
-    requiresEngineerReview: options?.requiresEngineerReview ?? options?.profile?.reviewedOutputs ?? false,
+    requiresEngineerReview: options?.requiresEngineerReview ?? false,
   };
 
   jobs.set(jobId, record);
@@ -572,7 +572,7 @@ export function submitAssistJob(
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
     profileServiceTier: options?.profile?.serviceTier,
-    requiresEngineerReview: options?.requiresEngineerReview ?? options?.profile?.reviewedOutputs ?? false,
+    requiresEngineerReview: options?.requiresEngineerReview ?? false,
   };
 
   jobs.set(jobId, record);
@@ -648,6 +648,7 @@ export function subscribeAssistJob(jobId: string, requesterId: string, listener:
     }
   };
 }
+
 
 
 

@@ -1904,7 +1904,7 @@ export async function generateCateoArtifacts(
     const ruleSummary = summarizeRuleOutcomes(ruleResults);
     const ruleMessages = ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => `${entry.ruleId}: ${entry.message}`);
     const escalatedByRules = ruleResults.some((entry) => entry.outcome === "escalate");
-    const requiresEngineerReview = Boolean(requester?.requiresEngineerReview || sanitizedInput.workflow?.mode === "reviewed-document");
+    const requiresEngineerReview = false;
 
     validationAttempts.push({
       stage: "reviewer",
@@ -2478,6 +2478,7 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
 
 
 
