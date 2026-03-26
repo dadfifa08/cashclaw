@@ -4,6 +4,7 @@ import { getCateoControlledTaxonomy, getCateoPartMasterRecord, listCateoPartMast
 import { persistTroubleshootingReportPackage } from "./report_exports.js";
 import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord } from "./store.js";
 import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
+import { deriveDeepMetadataFromArtifactMetadata, toProjectedChangeHistory, toProjectedConfigurationFingerprint, toProjectedEffectivityRules, toProjectedExternalSystemLinks, toProjectedObjectMetadata, toProjectedRelationships } from "./cplm_projection.js";
 import { deriveCaseReviewWorkflow, syncCaseReviewPackageFiles } from "./review_workflow.js";
 
 export interface CateoAdminViewer {
@@ -97,6 +98,13 @@ export interface AdminArtifactItem {
   organization?: string;
   duplicateState?: string;
   caseId: string;
+  documentType?: string;
+  lifecycleState?: string;
+  persistentObjectId?: string;
+  objectMetadata?: ReturnType<typeof toProjectedObjectMetadata>;
+  effectivity?: ReturnType<typeof toProjectedEffectivityRules>;
+  relationships?: ReturnType<typeof toProjectedRelationships>;
+  externalSystemLinks?: ReturnType<typeof toProjectedExternalSystemLinks>;
 }
 
 export interface AdminRedditReviewItem {
@@ -375,10 +383,36 @@ export function listAdminArtifacts(filters: Record<string, string | undefined> =
         organization: linkedCase?.requester?.organization,
         duplicateState: row.duplicateState,
         caseId: row.caseId,
+        documentType: latest.metadata?.documentType,
+        lifecycleState: latest.metadata?.lifecycleState,
+        persistentObjectId: latest.metadata?.objectMetadata?.persistentObjectId,
+        objectMetadata: toProjectedObjectMetadata(latest.metadata),
+        effectivity: toProjectedEffectivityRules(latest.metadata?.effectivity),
+        relationships: toProjectedRelationships(latest.metadata?.relations),
+        externalSystemLinks: toProjectedExternalSystemLinks(latest.metadata?.externalSystemIds),
       };
     })
     .filter((item): item is AdminArtifactItem => item !== null)
-    .filter((item) => includesFilter([item.title, item.summary, item.partNumber, item.businessType, item.issueType, item.failureCode, item.assetId, item.workOrderId, item.productOffering, item.displayName, item.organization, ...(item.taxonomyTags ?? [])], q))
+    .filter((item) => includesFilter([
+      item.title,
+      item.summary,
+      item.partNumber,
+      item.businessType,
+      item.issueType,
+      item.failureCode,
+      item.assetId,
+      item.workOrderId,
+      item.productOffering,
+      item.displayName,
+      item.organization,
+      item.documentType,
+      item.lifecycleState,
+      item.persistentObjectId,
+      JSON.stringify(item.objectMetadata ?? {}),
+      JSON.stringify(item.relationships ?? []),
+      JSON.stringify(item.externalSystemLinks ?? []),
+      ...(item.taxonomyTags ?? []),
+    ], q))
     .filter((item) => !filters.artifactType || item.artifactType === filters.artifactType)
     .filter((item) => !filters.approvalState || item.approvalState === filters.approvalState)
     .filter((item) => !filters.productOffering || item.productOffering === filters.productOffering)
@@ -514,6 +548,13 @@ function toAdminArtifactItemFromRecord(artifact: CateoArtifactRecord, linkedCase
     organization: linkedCase?.requester?.organization,
     duplicateState: artifact.duplicateState,
     caseId: artifact.caseId,
+    documentType: latest.metadata?.documentType,
+    lifecycleState: latest.metadata?.lifecycleState,
+    persistentObjectId: latest.metadata?.objectMetadata?.persistentObjectId,
+    objectMetadata: toProjectedObjectMetadata(latest.metadata),
+    effectivity: toProjectedEffectivityRules(latest.metadata?.effectivity),
+    relationships: toProjectedRelationships(latest.metadata?.relations),
+    externalSystemLinks: toProjectedExternalSystemLinks(latest.metadata?.externalSystemIds),
   };
 }
 

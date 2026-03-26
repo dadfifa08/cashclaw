@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import { appendAuditEvent } from "../security/audit.js";
 import { validateArtifactContent } from "./schemas.js";
 import { createRevision, listArtifactCatalogRows, listCaseCatalogRows, loadArtifactRecord, loadCaseRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
+import { persistTroubleshootingReportPackage } from "./report_exports.js";
+import { syncCaseReviewPackageFiles } from "./review_workflow.js";
 import type { CateoArtifactContent, CateoArtifactRecord, CateoArtifactRelation } from "./types.js";
 
 export interface CateoDuplicateGroup {
@@ -304,4 +306,147 @@ export function reconcileArtifactDuplicates(actor = "cateo-maintenance", request
 
 export function listArtifactDuplicateGroups(): CateoDuplicateGroup[] {
   return duplicateGroups();
+}
+export interface CateoLegacyReleaseSweepResult {
+  releasedCaseIds: string[];
+  releasedArtifactIds: string[];
+}
+
+export function releaseHeldTroubleshootingCases(actor = "cateo-release-migration", requestId?: string): CateoLegacyReleaseSweepResult {
+  const releasedCaseIds: string[] = [];
+  const releasedArtifactIds: string[] = [];
+
+  for (const row of listCaseCatalogRows()) {
+    const record = loadCaseRecord(row.caseId);
+    if (!record || record.context.taskClass !== "troubleshooting" || !record.interaction) {
+      continue;
+    }
+
+    const workflowStage = record.reviewWorkflow?.stage;
+    const needsRelease = record.interaction.releaseStatus === "pending-engineer-review"
+      || workflowStage === "technical-review"
+      || workflowStage === "quality-review";
+    if (!needsRelease) {
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    const refreshedArtifacts = record.artifacts
+      .map((artifactId) => loadArtifactRecord(artifactId))
+      .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact))
+      .map((artifact) => {
+        const latest = artifact.revisions.at(-1);
+        if (!latest) {
+          return artifact;
+        }
+        if (latest.approvalState === "approved") {
+          return artifact;
+        }
+        const metadata = latest.metadata ? structuredClone(latest.metadata) : undefined;
+        if (metadata) {
+          metadata.approvalState = "approved";
+          metadata.lifecycleState = "released";
+          metadata.changeHistory = [
+            ...(metadata.changeHistory ?? []),
+            {
+              changeId: crypto.randomUUID(),
+              changedAt: now,
+              actor,
+              action: "legacy-review-retired",
+              summary: `Released artifact after retiring legacy review workflow for case ${record.caseId}`,
+              relatedCaseId: record.caseId,
+              relatedArtifactId: artifact.artifactId,
+              note: requestId ? `Request ${requestId}` : "Legacy review workflow retired.",
+            },
+          ];
+          metadata.documentControl = metadata.documentControl ?? {
+            recordClass: `${artifact.artifactType}.legacy`,
+            retentionClass: "long-term-engineering-record",
+            confidentiality: "internal",
+            electronicSignoffRequired: true,
+            relatedArtifactIds: [],
+            regulatoryContexts: [],
+          };
+          metadata.documentControl.changeReason = "Legacy technical and quality review gates were retired and the artifact was promoted to released state.";
+        }
+
+        const signoffAt = now;
+        const updated = createRevision({
+          record: artifact,
+          createdBy: actor,
+          summary: `Released after legacy review workflow retirement for case ${record.caseId}`,
+          approvalState: "approved",
+          content: latest.content,
+          note: "Cateo retired the legacy manual review workflow and promoted this troubleshooting artifact to released state.",
+          signoffs: [...latest.signoffs, {
+            actor,
+            role: "system-release",
+            meaning: "Legacy review retirement release",
+            state: "approved",
+            signedAt: signoffAt,
+          }],
+          provenance: {
+            ...latest.provenance,
+            requestId,
+            createdAt: signoffAt,
+            createdBy: actor,
+          },
+          metadata,
+        });
+        releasedArtifactIds.push(updated.artifactId);
+        return updated;
+      });
+
+    record.interaction = {
+      ...record.interaction,
+      releaseStatus: "available",
+      requiresEngineerReview: false,
+    };
+    if (record.reviewWorkflow) {
+      record.reviewWorkflow = {
+        ...record.reviewWorkflow,
+        stage: "released",
+        technical: {
+          ...record.reviewWorkflow.technical,
+          status: "approved",
+          reviewerDisplayName: record.reviewWorkflow.technical.reviewerDisplayName || actor,
+          decidedAt: record.reviewWorkflow.technical.decidedAt || now,
+          note: record.reviewWorkflow.technical.note || "Legacy technical review lane retired and promoted to released state.",
+        },
+        quality: {
+          ...record.reviewWorkflow.quality,
+          status: "released",
+          reviewerDisplayName: record.reviewWorkflow.quality.reviewerDisplayName || actor,
+          decidedAt: record.reviewWorkflow.quality.decidedAt || now,
+          note: record.reviewWorkflow.quality.note || "Legacy quality review lane retired and promoted to released state.",
+        },
+      };
+    }
+    if (refreshedArtifacts.length > 0) {
+      const reportPackage = persistTroubleshootingReportPackage(record, refreshedArtifacts);
+      syncCaseReviewPackageFiles(record, reportPackage.documentControl.files);
+    }
+    record.updatedAt = now;
+    saveCaseRecord(record);
+    releasedCaseIds.push(record.caseId);
+
+    appendAuditEvent({
+      actor: "system",
+      category: "cateo_release",
+      action: "legacy_review_retire",
+      outcome: "success",
+      message: `Released legacy held troubleshooting case ${record.caseId}`,
+      requestId,
+      metadata: {
+        releasedBy: actor,
+        caseId: record.caseId,
+        artifactIds: refreshedArtifacts.map((artifact) => artifact.artifactId),
+      },
+    });
+  }
+
+  return {
+    releasedCaseIds: unique(releasedCaseIds),
+    releasedArtifactIds: unique(releasedArtifactIds),
+  };
 }

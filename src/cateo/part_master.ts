@@ -2,8 +2,9 @@ import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
 import type { CateoArtifactRecord, CateoArtifactRelation, CateoCaseRecord, CateoProductOffering, CateoRiskTier, CateoTaskClass } from "./types.js";
+import { deriveDeepMetadataFromArtifactMetadata, mergeProjectedDeepMetadata, toProjectedChangeHistory, toProjectedConfigurationFingerprint, toProjectedEffectivityRules, toProjectedExternalSystemLinks, toProjectedObjectMetadata, toProjectedRelationships } from "./cplm_projection.js";
 
-const PART_MASTER_VERSION = "cateo-part-master-v1";
+const PART_MASTER_VERSION = "cateo-part-master-v2";
 
 export interface CateoTaxonomyValuePoint {
   label: string;
@@ -37,6 +38,8 @@ export interface CateoPartMasterRecord {
   description?: string;
   manufacturer?: string;
   partFamily?: string;
+  lifecycleState?: string;
+  persistentObjectId?: string;
   entityTypes: string[];
   parentPartNumbers: string[];
   childPartNumbers: string[];
@@ -49,6 +52,7 @@ export interface CateoPartMasterRecord {
   componentTitles: string[];
   taxonomyTags: string[];
   productOfferings: CateoProductOffering[];
+  documentTypes?: string[];
   taskClasses: CateoTaskClass[];
   failureCodes: string[];
   failureModes: string[];
@@ -58,6 +62,14 @@ export interface CateoPartMasterRecord {
   artifactIds: string[];
   caseIds: string[];
   relationTargets: string[];
+  objectMetadata?: ReturnType<typeof toProjectedObjectMetadata>;
+  effectivity?: ReturnType<typeof toProjectedEffectivityRules>;
+  relationships?: ReturnType<typeof toProjectedRelationships>;
+  bomEdges?: Array<{ parentPartNumber?: string; childPartNumber?: string; quantity?: number; effectivityLabel?: string }>;
+  changeHistory?: ReturnType<typeof toProjectedChangeHistory>;
+  configurationFingerprint?: ReturnType<typeof toProjectedConfigurationFingerprint>;
+  externalSystemLinks?: ReturnType<typeof toProjectedExternalSystemLinks>;
+  deepMetadata?: Record<string, unknown>;
   approvalStates: Record<string, number>;
   riskTiers: CateoRiskTier[];
   lastSeenAt: string;
@@ -105,6 +117,18 @@ function partMasterPath(): string {
 
 function unique(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
+}
+
+function uniqueObjects<T>(values: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const value of values) {
+    const key = JSON.stringify(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
 }
 
 function normalizePartNumber(value: string | undefined | null): string | null {
@@ -190,6 +214,73 @@ function relatedDocumentRefs(relations: CateoArtifactRelation[] | undefined): st
     .map((relation) => relation.targetId));
 }
 
+function mergeProjectedObjectMetadata(
+  current: ReturnType<typeof toProjectedObjectMetadata>,
+  incoming: ReturnType<typeof toProjectedObjectMetadata>,
+): ReturnType<typeof toProjectedObjectMetadata> {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  return {
+    category: current.category ?? incoming.category,
+    categoryLabel: current.categoryLabel ?? incoming.categoryLabel,
+    persistentObjectId: current.persistentObjectId ?? incoming.persistentObjectId,
+    lifecycleState: current.lifecycleState ?? incoming.lifecycleState,
+    documentType: current.documentType ?? incoming.documentType,
+    controlledVocabulary: unique([...(current.controlledVocabulary ?? []), ...(incoming.controlledVocabulary ?? [])]),
+  };
+}
+
+function mergeProjectedConfigurationFingerprint(
+  current: ReturnType<typeof toProjectedConfigurationFingerprint>,
+  incoming: ReturnType<typeof toProjectedConfigurationFingerprint>,
+): ReturnType<typeof toProjectedConfigurationFingerprint> {
+  if (!current) return incoming;
+  if (!incoming) return current;
+  return {
+    fingerprintId: current.fingerprintId ?? incoming.fingerprintId,
+    serialNumber: current.serialNumber ?? incoming.serialNumber,
+    softwareVersions: unique([...(current.softwareVersions ?? []), ...(incoming.softwareVersions ?? [])]),
+    geography: current.geography ?? incoming.geography,
+    assetId: current.assetId ?? incoming.assetId,
+    summary: current.summary ?? incoming.summary,
+    hash: current.hash ?? incoming.hash,
+  };
+}
+
+function summarizeEffectivityLabel(effectivity: ReturnType<typeof toProjectedEffectivityRules>): string | undefined {
+  const tokens = effectivity.flatMap((rule) => [
+    ...(rule.serialRanges ?? []),
+    ...(rule.softwareVersions ?? []),
+    ...(rule.geographies ?? []),
+    ...(rule.notes ?? []),
+  ]);
+  const summary = unique(tokens).join(" | ");
+  return summary || undefined;
+}
+
+function buildBomEdges(metadata: NonNullable<CateoArtifactRecord["revisions"][number]["metadata"]>, currentPartNumber: string): Array<{ parentPartNumber?: string; childPartNumber?: string; quantity?: number; effectivityLabel?: string }> {
+  const effectivity = toProjectedEffectivityRules(metadata.effectivity);
+  const effectivityLabel = summarizeEffectivityLabel(effectivity);
+  const parentPartNumber = metadata.parts?.primaryPartNumber ?? metadata.partNumber ?? currentPartNumber;
+  const lineEdges = (metadata.parts?.requiredPartLines ?? []).map((line) => ({
+    parentPartNumber,
+    childPartNumber: line.partNumber,
+    quantity: undefined,
+    effectivityLabel,
+  }));
+  const relationEdges = (metadata.relations ?? []).flatMap((relation) => {
+    if (relation.targetType !== "part") return [];
+    if (relation.kind === "has-child" || relation.kind === "requires-part") {
+      return [{ parentPartNumber, childPartNumber: relation.targetId, quantity: undefined, effectivityLabel }];
+    }
+    if (relation.kind === "has-parent" || relation.kind === "belongs-to-component") {
+      return [{ parentPartNumber: relation.targetId, childPartNumber: currentPartNumber, quantity: undefined, effectivityLabel }];
+    }
+    return [];
+  });
+  return uniqueObjects([...lineEdges, ...relationEdges]);
+}
+
 function emptyTaxonomySnapshot(): CateoControlledTaxonomySnapshot {
   return {
     version: PART_MASTER_VERSION,
@@ -267,13 +358,24 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
     for (const rawPartNumber of partNumbers) {
       const normalizedPart = normalizePartNumber(rawPartNumber);
       if (!normalizedPart) continue;
+      const partNumberDisplay = displayPartNumber(rawPartNumber) ?? normalizedPart;
+      const projectedObjectMetadata = toProjectedObjectMetadata(metadata);
+      const projectedEffectivity = toProjectedEffectivityRules(metadata.effectivity);
+      const projectedRelationships = toProjectedRelationships(metadata.relations);
+      const projectedChangeHistory = toProjectedChangeHistory(metadata.changeHistory);
+      const projectedConfigurationFingerprint = toProjectedConfigurationFingerprint(metadata);
+      const projectedExternalSystemLinks = toProjectedExternalSystemLinks(metadata.externalSystemIds);
+      const projectedDeepMetadata = deriveDeepMetadataFromArtifactMetadata(metadata);
+      const projectedBomEdges = buildBomEdges(metadata, partNumberDisplay);
       const current = partMap.get(normalizedPart) ?? {
-        canonicalPartNumber: displayPartNumber(rawPartNumber) ?? normalizedPart,
+        canonicalPartNumber: partNumberDisplay,
         normalizedPartNumber: normalizedPart,
         displayTitle: metadata.parts?.primaryPartDescription ?? metadata.partDescription ?? metadata.artifactTitle ?? normalizedPart,
         description: metadata.parts?.primaryPartDescription ?? metadata.partDescription ?? undefined,
         manufacturer: metadata.asset?.manufacturer ?? undefined,
         partFamily: metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily,
+        lifecycleState: metadata.lifecycleState,
+        persistentObjectId: metadata.objectMetadata?.persistentObjectId,
         entityTypes: [],
         parentPartNumbers: [],
         childPartNumbers: [],
@@ -286,6 +388,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
         componentTitles: [],
         taxonomyTags: [],
         productOfferings: [],
+        documentTypes: metadata.documentType ? [metadata.documentType] : [],
         taskClasses: [],
         failureCodes: [],
         failureModes: [],
@@ -295,6 +398,14 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
         artifactIds: [],
         caseIds: [],
         relationTargets: [],
+        objectMetadata: projectedObjectMetadata,
+        effectivity: projectedEffectivity,
+        relationships: projectedRelationships,
+        bomEdges: projectedBomEdges,
+        changeHistory: projectedChangeHistory,
+        configurationFingerprint: projectedConfigurationFingerprint,
+        externalSystemLinks: projectedExternalSystemLinks,
+        deepMetadata: projectedDeepMetadata,
         approvalStates: {},
         riskTiers: [],
         lastSeenAt: artifact.updatedAt,
@@ -319,6 +430,11 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.description = current.description || metadata.parts?.primaryPartDescription || metadata.partDescription || undefined;
       current.manufacturer = current.manufacturer || metadata.asset?.manufacturer || undefined;
       current.partFamily = current.partFamily || metadata.parts?.requiredPartLines?.find((line) => normalizePartNumber(line.partNumber) === normalizedPart)?.partFamily || undefined;
+      current.lifecycleState = current.lifecycleState || metadata.lifecycleState;
+      current.persistentObjectId = current.persistentObjectId || metadata.objectMetadata?.persistentObjectId;
+      current.objectMetadata = mergeProjectedObjectMetadata(current.objectMetadata, projectedObjectMetadata);
+      current.configurationFingerprint = mergeProjectedConfigurationFingerprint(current.configurationFingerprint, projectedConfigurationFingerprint);
+      current.deepMetadata = mergeProjectedDeepMetadata(current.deepMetadata, projectedDeepMetadata);
       const relationTargets = appendRelationTargets([], metadata.relations);
       const childPartNumbers = unique([
         ...relatedPartNumbers(metadata.relations, ["requires-part", "has-child"]),
@@ -346,6 +462,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.componentTitles = unique([...current.componentTitles, metadata.componentTitle]);
       current.taxonomyTags = unique([...current.taxonomyTags, ...(metadata.taxonomyTags ?? [])]);
       current.productOfferings = unique([...current.productOfferings, linkedCase?.input.productOffering]) as CateoProductOffering[];
+      current.documentTypes = unique([...(current.documentTypes ?? []), metadata.documentType]);
       current.taskClasses = unique([...current.taskClasses, linkedCase?.context.taskClass, metadata.taskClass]) as CateoTaskClass[];
       current.failureCodes = unique([...current.failureCodes, metadata.classification?.failureCode, linkedCase?.context.failureCode?.code]);
       current.failureModes = unique([...current.failureModes, metadata.classification?.failureMode, metadata.classification?.failureLabel]);
@@ -355,6 +472,11 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.artifactIds = unique([...current.artifactIds, artifact.artifactId]);
       current.caseIds = unique([...current.caseIds, artifact.caseId]);
       current.relationTargets = appendRelationTargets(current.relationTargets, metadata.relations);
+      current.effectivity = uniqueObjects([...(current.effectivity ?? []), ...projectedEffectivity]);
+      current.relationships = uniqueObjects([...(current.relationships ?? []), ...projectedRelationships]);
+      current.bomEdges = uniqueObjects([...(current.bomEdges ?? []), ...projectedBomEdges]);
+      current.changeHistory = uniqueObjects([...(current.changeHistory ?? []), ...projectedChangeHistory]);
+      current.externalSystemLinks = uniqueObjects([...(current.externalSystemLinks ?? []), ...projectedExternalSystemLinks]);
       current.riskTiers = unique([...current.riskTiers, linkedCase?.input.workflow?.riskTier]) as CateoRiskTier[];
       current.approvalStates[latest.approvalState] = (current.approvalStates[latest.approvalState] ?? 0) + 1;
       current.lastSeenAt = current.lastSeenAt > artifact.updatedAt ? current.lastSeenAt : artifact.updatedAt;
@@ -403,6 +525,8 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       description: record.context.partResolution?.partDescription ?? undefined,
       manufacturer: record.context.partResolution?.manufacturer ?? record.context.machine?.manufacturer ?? undefined,
       partFamily: undefined,
+      lifecycleState: undefined,
+      persistentObjectId: undefined,
       entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model, objectCategory: record.context.partResolution?.partNumber?.toLowerCase().includes("ln") ? "ln" : undefined }),
       parentPartNumbers: [],
       childPartNumbers: [],
@@ -415,6 +539,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       componentTitles: [],
       taxonomyTags: [],
       productOfferings: unique([record.input.productOffering]) as CateoProductOffering[],
+      documentTypes: [],
       taskClasses: unique([record.context.taskClass]) as CateoTaskClass[],
       failureCodes: unique([record.context.failureCode?.code]),
       failureModes: unique(record.context.partResolution?.failureModes ?? []),
@@ -424,6 +549,14 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       artifactIds: unique(record.artifacts),
       caseIds: [record.caseId],
       relationTargets: [],
+      objectMetadata: undefined,
+      effectivity: [],
+      relationships: [],
+      bomEdges: [],
+      changeHistory: [],
+      configurationFingerprint: undefined,
+      externalSystemLinks: [],
+      deepMetadata: undefined,
       approvalStates: {},
       riskTiers: unique([record.input.workflow?.riskTier]) as CateoRiskTier[],
       lastSeenAt: record.updatedAt,
@@ -505,8 +638,12 @@ export function listCateoPartMasterRecords(filters: CateoPartMasterFilters = {})
         componentTitles: part.componentTitles,
         organizations: part.organizations,
         productOfferings: part.productOfferings,
+        documentTypes: part.documentTypes,
         failureCodes: part.failureCodes,
         failureModes: part.failureModes,
+        relationships: part.relationships,
+        externalSystemLinks: part.externalSystemLinks,
+        deepMetadata: part.deepMetadata,
       }).toLowerCase();
       if (q && !haystack.includes(q)) return false;
       if (manufacturer && !(part.manufacturer ?? "").toLowerCase().includes(manufacturer)) return false;

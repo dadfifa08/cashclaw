@@ -738,6 +738,7 @@ export interface CateoArtifactEnterpriseMetadata {
     activeAdapterIds: string[];
   };
   documentControl: CateoDocumentControlMetadata;
+  deepMetadata?: Record<string, unknown>;
   marketplace?: {
     source: "cashclaw" | "cateo-public";
     taskId?: string;

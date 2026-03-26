@@ -31,6 +31,7 @@ import type {
   CateoSkillActivation,
   CateoTroubleshootingProcedure,
 } from "./types.js";
+import { deriveDeepMetadataFromArtifactMetadata } from "./cplm_projection.js";
 
 const unique = (values: Array<string | undefined | null>) => [
   ...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))),
