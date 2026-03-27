@@ -436,7 +436,7 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
     resolved.partDescription ? `Part description: ${resolved.partDescription}.` : "",
     `Original issue: ${input.symptomDescription}`,
     input.issueType ? `Issue type: ${input.issueType}.` : "",
-    input.businessType ? `Business type: ${input.businessType}.` : "",
+    input.businessType ? `Operating domain: ${input.businessType}.` : "",
     `Search query hints: ${buildSearchQueryHints(input, resolved).join(" | ") || "none"}.`,
     "Find 3 to 6 reliable sources that directly support the identified part, preferring manufacturer/OEM manuals, datasheets, service bulletins, standards, and reputable technical distributors.",
     "Return hazards, expected values, grounded findings, and reference document titles only when the sources support them.",
@@ -595,4 +595,5 @@ export async function resolveCateoPart(config: CashClawConfig, input: CateoAssis
   }
   return resolved;
 }
+
 

@@ -364,6 +364,7 @@ export interface CateoAssistInput {
   query?: string;
   errorCode?: string;
   issueType?: string;
+  faultArea?: string;
   businessType?: CateoBusinessType;
   productOffering?: CateoProductOffering;
   partNumber?: string;
@@ -433,6 +434,7 @@ export interface CateoContextBundle {
   title: string;
   taskClass: CateoTaskClass;
   issueType?: string;
+  faultArea?: string;
   businessType?: CateoBusinessType;
   asset: CateoAssetRegistryLink | null;
   machine: CateoMachineMetadata | null;
@@ -619,6 +621,7 @@ export interface CateoArtifactEnterpriseMetadata {
   artifactSummary: string;
   taskClass: CateoTaskClass;
   businessType?: CateoBusinessType;
+  faultArea?: string;
   approvalState: CateoApprovalState;
   confidence: CateoConfidence;
   riskLevel: CateoRiskLevel;
@@ -647,6 +650,7 @@ export interface CateoArtifactEnterpriseMetadata {
     failureCode?: string;
     failureLabel?: string;
     failureMode?: string;
+    faultArea?: string;
     symptomSummary: string[];
     rootCause?: string;
     riskStatement?: string;
@@ -1205,6 +1209,8 @@ export interface CateoSignoffRequest {
   state: CateoApprovalState;
   note?: string;
 }
+
+
 
 
 

@@ -13,7 +13,7 @@ import type {
 } from "./types.js";
 import { deriveConversationTitleFromArtifacts } from "./artifact_metadata.js";
 
-const RENDERER_VERSION = "cateo-renderer-v3";
+const RENDERER_VERSION = "cateo-renderer-v4";
 const unique = (values: Array<string | undefined | null>) => [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
 const latest = (record: CateoArtifactRecord) => record.revisions[record.revisions.length - 1];
 
@@ -81,14 +81,14 @@ function buildSections(args: {
     args.procedure?.objective,
   ]).slice(0, 4);
   if (assessment.length > 0) {
-    sections.push({ sectionId: "assessment", title: "Engineering assessment", tone: "info", items: assessment });
+    sections.push({ sectionId: "assessment", title: "Current engineering read", tone: "info", items: assessment });
   }
 
   const verification = args.procedure?.steps?.length
     ? args.procedure.steps.slice(0, 4).map((step, index) => `${index + 1}. ${step.action} Expected: ${step.expectedResult}.`)
     : args.checklist?.checklist?.slice(0, 4).map((item, index) => `${index + 1}. ${item.check} Pass: ${item.passCriteria}.`) ?? [];
   if (verification.length > 0) {
-    sections.push({ sectionId: "verification", title: "Controlled verification path", tone: "info", items: verification });
+    sections.push({ sectionId: "verification", title: "Troubleshooting path", tone: "info", items: verification });
   }
 
   const releaseCriteria = unique([
@@ -96,7 +96,7 @@ function buildSections(args: {
     ...(args.checklist?.completionCriteria ?? []),
   ]).slice(0, 5);
   if (releaseCriteria.length > 0) {
-    sections.push({ sectionId: "release-criteria", title: "Release criteria", tone: "success", items: releaseCriteria });
+    sections.push({ sectionId: "release-criteria", title: "Validation and release", tone: "success", items: releaseCriteria });
   }
 
   const materials = unique([
@@ -251,3 +251,4 @@ export function renderArtifactSearchText(record: CateoArtifactRecord) {
   const revision = latest(record);
   return [label(record.artifactType), revision.summary, JSON.stringify(revision.metadata ?? {}), JSON.stringify(revision.content), record.assetId, record.workOrderId].filter(Boolean).join("\n");
 }
+

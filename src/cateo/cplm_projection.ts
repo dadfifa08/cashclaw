@@ -240,9 +240,7 @@ export function toProjectedExternalSystemLinks(externalSystemIds: CateoExternalS
 
 export function deriveDeepMetadataFromArtifactMetadata(metadata: CateoArtifactEnterpriseMetadata | undefined): Record<string, unknown> | undefined {
   if (!metadata) return undefined;
-  if (metadata.deepMetadata && Object.keys(metadata.deepMetadata).length > 0) {
-    return metadata.deepMetadata;
-  }
+  const existingDeepMetadata = metadata.deepMetadata && Object.keys(metadata.deepMetadata).length > 0 ? metadata.deepMetadata : undefined;
 
   const configuration = metadata.asset?.configuration ?? {};
   const relatedArtifacts = (metadata.relations ?? [])
@@ -315,6 +313,7 @@ export function deriveDeepMetadataFromArtifactMetadata(metadata: CateoArtifactEn
       damageType: metadata.classification?.symptomSummary?.filter((entry) => /damage|crack|burn|deform|leak/i.test(entry)),
       contaminationStatus: metadata.classification?.symptomSummary?.filter((entry) => /contamin|debris|residue/i.test(entry)),
       noiseVibrationHeatObservations: metadata.classification?.symptomSummary?.filter((entry) => /noise|vibration|heat|hot/i.test(entry)),
+      faultArea: metadata.faultArea ?? metadata.classification?.faultArea,
       errorCodeAlarmCode: unique([metadata.classification?.failureCode, metadata.classification?.failureLabel]),
       faultFrequency: metadata.maintenance?.serviceHistorySummaries?.length ? `Observed across ${metadata.maintenance.serviceHistorySummaries.length} service events` : undefined,
       intermittentVsConstant: metadata.taxonomy?.operatingState,
@@ -403,7 +402,7 @@ export function deriveDeepMetadataFromArtifactMetadata(metadata: CateoArtifactEn
     },
   } satisfies Record<string, unknown>;
 
-  return pruneValue(deepMetadata) as Record<string, unknown> | undefined;
+  return pruneValue(mergeProjectedDeepMetadata(existingDeepMetadata, deepMetadata)) as Record<string, unknown> | undefined;
 }
 
 function mergeValue(existing: unknown, incoming: unknown): unknown {
@@ -427,3 +426,6 @@ export function mergeProjectedDeepMetadata(existing: Record<string, unknown> | u
   if (!incoming) return existing;
   return mergeValue(existing, incoming) as Record<string, unknown>;
 }
+
+
+

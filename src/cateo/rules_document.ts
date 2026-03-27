@@ -2,22 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 
-const DEFAULT_RULES_DOCUMENT = `# Cateo V0 Troubleshooting Output Rules
+const DEFAULT_RULES_DOCUMENT = `# Cateo V1 Troubleshooting Output Rules
 
 ## Objective
 Produce one controlled troubleshooting report package per request. The customer sees a concise conversational answer, but the underlying procedure must remain engineering-grade, deterministic where possible, and reusable as a dataset artifact.
 
 ## Required report sections
 1. Document control
-2. Problem definition
-3. System and part identification
-4. Observed conditions and evidence summary
-5. Assumptions and constraints
-6. Step-by-step diagnostics
-7. Expected values, pass criteria, and failure paths
-8. Probable root cause and confidence
-9. Corrective actions and verification steps
-10. Preventive maintenance or recurrence controls
+2. Transparency and AI-generation notice
+3. Problem definition and fault area
+4. System, part, and operating-domain identification
+5. Prework, hazards, and readiness checks
+6. Observed conditions and grounded evidence summary
+7. Numbered troubleshooting steps with rationale and expected results
+8. Expected values, pass criteria, escalation triggers, and failure paths
+9. Probable root cause and confidence
+10. Validation steps, release criteria, and recurrence controls
 11. Parts, tools, and references
 
 ## Output rules
@@ -25,6 +25,7 @@ Produce one controlled troubleshooting report package per request. The customer 
 - Use explicit values, ranges, thresholds, or pass-fail criteria whenever the evidence supports them.
 - If the manufacturer part number is uncertain, ask a clarifying question instead of inventing the identity.
 - Every step must include why the step matters and what result is expected.
+- When evidence supports it, include prework, required tools, required parts, fault-area framing, and explicit validation steps in customer-facing language.
 - Root-cause statements must be bounded by confidence and supporting evidence.
 - Separate verified findings from assumptions.
 - Reference attachments, prior service history, and verified sources when they materially influence the recommendation.

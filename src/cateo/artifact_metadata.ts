@@ -628,7 +628,7 @@ export function buildArtifactEnterpriseMetadata(args: {
         ...requiredTools,
         ...(args.activeSkills ?? []).map((skill) => skill.id),
       ]),
-      recurringSignals: unique([...args.context.serviceHistory.map((entry) => entry.failureCode), ...args.context.observedConditions, ...(args.context.partResolution?.failureModes ?? [])]),
+      recurringSignals: unique([...args.context.serviceHistory.map((entry) => entry.failureCode), args.context.faultArea, ...args.context.observedConditions, ...(args.context.partResolution?.failureModes ?? [])]),
       estimatedRevisionCount: 1,
     },
     governance: {

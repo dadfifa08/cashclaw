@@ -202,8 +202,9 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
 
   const contextSummary = uniqueStrings([
     productLabel ? `Requested deliverable: ${productLabel}.` : undefined,
-    input.businessType ? `Type of business: ${input.businessType.replace(/-/g, " ")}.` : undefined,
+    input.businessType ? `Operating domain: ${input.businessType.replace(/-/g, " ")}.` : undefined,
     input.issueType ? `Declared issue type: ${input.issueType}.` : undefined,
+    input.faultArea ? `Declared fault area: ${input.faultArea}.` : undefined,
     input.workflow?.mode ? `Workflow mode: ${input.workflow.mode.replace(/-/g, " ")}.` : undefined,
     input.workflow?.documentIntent ? `Requested document intent: ${input.workflow.documentIntent}.` : undefined,
     input.workflow?.businessJustification ? `Business justification: ${input.workflow.businessJustification}.` : undefined,
@@ -260,5 +261,7 @@ export function buildCateoContext(caseId: string, input: CateoAssistInput, attac
     contextSummary,
   };
 }
+
+
 
 

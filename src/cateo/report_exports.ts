@@ -64,6 +64,7 @@ export interface CateoTroubleshootingReportPackage {
     workOrderId?: string;
     partNumber?: string;
     businessType?: string;
+    faultArea?: string;
     issueType: string;
   };
   asset: {
@@ -279,6 +280,7 @@ function sectionLines(report: CateoTroubleshootingReportPackage): Array<{ headin
         report.title,
         report.request.problemDescription,
         `Issue type: ${report.request.issueType}`,
+        report.request.faultArea ? `Fault area: ${report.request.faultArea}` : undefined,
         report.request.errorCode ? `Error code: ${report.request.errorCode}` : undefined,
         report.request.workOrderId ? `Work order: ${report.request.workOrderId}` : undefined,
       ]),
@@ -286,7 +288,7 @@ function sectionLines(report: CateoTroubleshootingReportPackage): Array<{ headin
     {
       heading: "System and Part Identification",
       lines: unique([
-        report.request.businessType ? `Business type: ${report.request.businessType}` : undefined,
+        report.request.businessType ? `Operating domain: ${report.request.businessType}` : undefined,
         report.asset.assetId ? `Asset ID: ${report.asset.assetId}` : undefined,
         report.asset.assetType ? `Asset type: ${report.asset.assetType}` : undefined,
         report.asset.manufacturer ? `Manufacturer: ${report.asset.manufacturer}` : undefined,
@@ -726,3 +728,6 @@ export function persistTroubleshootingReportPackage(caseRecord: CateoCaseRecord,
   writeProtectedJson(reportPackage.indexing.jsonPath, reportPackage);
   return reportPackage;
 }
+
+
+

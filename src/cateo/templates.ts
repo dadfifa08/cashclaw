@@ -1,7 +1,7 @@
 import type { CateoArtifactType, CateoInstructionTemplate, CateoTaskClass } from "./types.js";
 import { loadTroubleshootingRulesDocument } from "./rules_document.js";
 
-const TEMPLATE_VERSION = "1.2.0";
+const TEMPLATE_VERSION = "1.3.0";
 
 function uniqueArtifacts(values: CateoArtifactType[]): CateoArtifactType[] {
   return [...new Set(values)];
@@ -24,12 +24,14 @@ function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifac
     fieldExpectations: [
       "Include a concrete problem definition, system context, observed conditions, assumptions, and ranked hypotheses.",
       "Include recommended actions, validation procedures, risk implications, provenance-ready references, and explicit hazards when available.",
+      "For troubleshooting outputs, prefer a guide structure with prework, numbered troubleshooting steps, expected results, escalation triggers, and final validation steps.",
       "Use manufacturer, OEM, manual, datasheet, or other verified references when they materially improve specificity.",
       "Do not leave confidence, risk, expected values, or follow-up actions implicit.",
     ],
     outputConstraints: [
       "Return schema-compatible JSON only for the stage contract.",
       "Avoid unsupported claims, hidden leaps, vague release-to-service recommendations, or generic filler detached from the evidence.",
+      "Do not collapse the troubleshooting guide into high-level summary prose when concrete stepwise instructions can be produced from the evidence.",
       "Keep the output suitable for audit logging, revision history, and downstream analytics.",
     ],
     requiredArtifacts: uniqueArtifacts(requiredArtifacts),

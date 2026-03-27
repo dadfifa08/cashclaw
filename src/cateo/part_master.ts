@@ -56,6 +56,7 @@ export interface CateoPartMasterRecord {
   taskClasses: CateoTaskClass[];
   failureCodes: string[];
   failureModes: string[];
+  faultAreas: string[];
   organizations: string[];
   assetIds: string[];
   workOrderIds: string[];
@@ -392,6 +393,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
         taskClasses: [],
         failureCodes: [],
         failureModes: [],
+        faultAreas: [],
         organizations: [],
         assetIds: [],
         workOrderIds: [],
@@ -406,7 +408,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
         configurationFingerprint: projectedConfigurationFingerprint,
         externalSystemLinks: projectedExternalSystemLinks,
         deepMetadata: projectedDeepMetadata,
-        approvalStates: {},
+        approvalStates: {} as Record<string, number>,
         riskTiers: [],
         lastSeenAt: artifact.updatedAt,
         sourceEvidenceCount: 0,
@@ -466,6 +468,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       current.taskClasses = unique([...current.taskClasses, linkedCase?.context.taskClass, metadata.taskClass]) as CateoTaskClass[];
       current.failureCodes = unique([...current.failureCodes, metadata.classification?.failureCode, linkedCase?.context.failureCode?.code]);
       current.failureModes = unique([...current.failureModes, metadata.classification?.failureMode, metadata.classification?.failureLabel]);
+      current.faultAreas = unique([...current.faultAreas, linkedCase?.context.faultArea, metadata.faultArea, metadata.classification?.faultArea, linkedCase?.context.issueType]);
       current.organizations = unique([...current.organizations, linkedCase?.requester?.organization]);
       current.assetIds = unique([...current.assetIds, metadata.asset?.assetId, artifact.assetId]);
       current.workOrderIds = unique([...current.workOrderIds, metadata.workOrder?.workOrderId, artifact.workOrderId]);
@@ -527,7 +530,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       partFamily: undefined,
       lifecycleState: undefined,
       persistentObjectId: undefined,
-      entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model, objectCategory: record.context.partResolution?.partNumber?.toLowerCase().includes("ln") ? "ln" : undefined }),
+      entityTypes: inferEntityTypes({ displayTitle: record.context.partResolution?.partDescription ?? record.context.title, description: record.context.partResolution?.partDescription, taxonomyTags: [record.input.businessType, record.context.faultArea, record.context.issueType].filter(Boolean) as string[], componentTitle: record.context.machine?.model, objectCategory: record.context.partResolution?.partNumber?.toLowerCase().includes("ln") ? "ln" : undefined }),
       parentPartNumbers: [],
       childPartNumbers: [],
       assemblyPartNumbers: [],
@@ -543,6 +546,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       taskClasses: unique([record.context.taskClass]) as CateoTaskClass[],
       failureCodes: unique([record.context.failureCode?.code]),
       failureModes: unique(record.context.partResolution?.failureModes ?? []),
+      faultAreas: unique([record.context.faultArea, record.context.issueType]),
       organizations: unique([record.requester?.organization]),
       assetIds: unique([record.context.asset?.assetId]),
       workOrderIds: unique([record.context.workOrder?.workOrderId]),
@@ -557,7 +561,7 @@ export function buildCateoPartMaster(args: { artifactRecords: CateoArtifactRecor
       configurationFingerprint: undefined,
       externalSystemLinks: [],
       deepMetadata: undefined,
-      approvalStates: {},
+      approvalStates: {} as Record<string, number>,
       riskTiers: unique([record.input.workflow?.riskTier]) as CateoRiskTier[],
       lastSeenAt: record.updatedAt,
       sourceEvidenceCount: Math.max(1, record.context.attachments.length + record.context.serviceHistory.length),
@@ -664,4 +668,10 @@ export function getCateoPartMasterRecord(partNumber: string): CateoPartMasterRec
 export function getCateoControlledTaxonomy(): CateoControlledTaxonomySnapshot {
   return loadCateoPartMaster().taxonomy;
 }
+
+
+
+
+
+
 
