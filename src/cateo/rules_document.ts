@@ -2,41 +2,47 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 
-const DEFAULT_RULES_DOCUMENT = `# Cateo V1 Troubleshooting Output Rules
+const DEFAULT_RULES_DOCUMENT = `# Cateo V1.2 Troubleshooting Output Rules
 
 ## Objective
-Produce one controlled troubleshooting report package per request. The customer sees a concise conversational answer, but the underlying procedure must remain engineering-grade, deterministic where possible, and reusable as a dataset artifact.
+Produce one controlled troubleshooting guide per request. The customer should receive a readable field guide that behaves like a service manual or technical bulletin. The deeper metadata, traceability, and CPLM structure must still be preserved in the stored package, but they should not dominate the customer-facing narrative.
 
 ## Required report sections
-1. Document control
-2. Transparency and AI-generation notice
-3. Problem definition and fault area
-4. System, part, and operating-domain identification
-5. Prework, hazards, and readiness checks
-6. Observed conditions and grounded evidence summary
-7. Numbered troubleshooting steps with rationale and expected results
-8. Expected values, pass criteria, escalation triggers, and failure paths
-9. Probable root cause and confidence
-10. Validation steps, release criteria, and recurrence controls
-11. Parts, tools, and references
+1. Summary
+2. Required tools
+3. Estimated time required
+4. Hazards present, lockout/readiness checks, and other safety labels
+5. Parts required for troubleshooting, inspection, or replacement
+6. Numbered step-by-step troubleshooting guide with rationale, expected results, and escalation triggers
+7. Validation and verification steps
+8. Source basis and reference set
+9. Version control stamp
+
+## Source hierarchy
+- Use verified manufacturer, OEM, service-manual, datasheet, standard, and service-bulletin sources as the primary guidance layer whenever they exist.
+- Use field history, prior cases, and approved crowdsource improvements only after the verified-source layer is established.
+- When secondary field or crowdsource information changes the path, make it a refinement note or branch in the guide rather than the primary justification.
+- If no verified source set is available, say so clearly and keep the guide provisional.
 
 ## Output rules
-- Prefer troubleshooting procedures, diagnostic reasoning, service summaries, and parts/tools data over general prose.
-- Use explicit values, ranges, thresholds, or pass-fail criteria whenever the evidence supports them.
-- If the manufacturer part number is uncertain, ask a clarifying question instead of inventing the identity.
-- Every step must include why the step matters and what result is expected.
-- When evidence supports it, include prework, required tools, required parts, fault-area framing, and explicit validation steps in customer-facing language.
-- Root-cause statements must be bounded by confidence and supporting evidence.
+- Make the customer-facing output read like a real troubleshooting guide rather than a narrative summary or metadata dump.
+- Write steps in natural imperative language, one clear action at a time, with a short reason and the expected result.
+- Keep each section explicit even when the available evidence is limited or the guide is only a first-pass draft.
+- Include required tools, estimated time required, hazards present, parts required, numbered troubleshooting steps, and validation/verification steps whenever troubleshooting content is produced.
+- If a field is unknown, label it as unknown or estimated instead of inventing it.
+- Explicitly label estimated time as an estimate when it is not directly source-backed.
+- Every troubleshooting step must state why the step matters and what result is expected.
+- When evidence supports it, call out specific part numbers, tool names, thresholds, pass-fail criteria, hazard labels, and escalation triggers.
+- Root-cause statements must stay bounded by confidence and supporting evidence, but keep them in the structured package instead of letting them overwhelm the user guide.
 - Separate verified findings from assumptions.
-- Reference attachments, prior service history, and verified sources when they materially influence the recommendation.
-- If warnings, hazards, lockout requirements, PPE notes, or other safety labels are available, include them explicitly in the troubleshooting output.
-- Keep customer-facing language readable, but never drop the controlled procedure structure in the stored report package.
+- Reference attachments, prior service history, verified sources, and approved crowdsource improvements when they materially influence the recommendation.
+- End every troubleshooting report with a version control stamp that includes document ID, package/template version, release status, generated time, and updated time.
 
 ## Prohibited behavior
-- Do not fabricate expected values, specs, part numbers, or service history.
+- Do not fabricate expected values, specs, part numbers, service history, time estimates, hazard statements, or source-backed claims.
 - Do not recommend return to service without a verification step.
 - Do not hide uncertainty.
-- Do not emit marketing copy in the report body.
+- Do not emit marketing copy or backend-admin metadata as the main body of the guide.
 `;
 
 export interface CateoRulesDocument {

@@ -1,7 +1,7 @@
 import type { CateoArtifactType, CateoInstructionTemplate, CateoTaskClass } from "./types.js";
 import { loadTroubleshootingRulesDocument } from "./rules_document.js";
 
-const TEMPLATE_VERSION = "1.3.0";
+const TEMPLATE_VERSION = "1.5.0";
 
 function uniqueArtifacts(values: CateoArtifactType[]): CateoArtifactType[] {
   return [...new Set(values)];
@@ -13,26 +13,30 @@ function baseTemplate(taskClass: CateoTaskClass, requiredArtifacts: CateoArtifac
     version: TEMPLATE_VERSION,
     taskClass,
     responseBehavior: [
-      "Stay grounded in provided evidence, prior artifacts, known machine context, and verified external references before using general reasoning.",
-      "Produce engineering-grade structured content that can be stored as a controlled artifact.",
-      "Prefer deterministic steps, explicit assumptions, bounded conclusions, and cited source-backed details over conversational filler.",
+      "Stay grounded in verified external references, provided evidence, prior artifacts, and known machine context before using general reasoning.",
+      "Treat manufacturer, OEM, manual, datasheet, standards, and service-bulletin evidence as the primary guidance layer. Use field history, prior cases, and crowdsource improvements only as secondary refinement layers.",
+      "Produce engineering-grade structured content that can be stored as a controlled artifact while still reading like a natural service guide for the customer.",
     ],
     terminology: [
       "Use subsystem, interface, input, output, control logic, failure mode, acceptance criteria, and verification language.",
+      "Write troubleshooting actions in direct, imperative sentences that resemble a service manual, field bulletin, or technical work instruction.",
       "State units, thresholds, and pass/fail conditions when practical.",
     ],
     fieldExpectations: [
       "Include a concrete problem definition, system context, observed conditions, assumptions, and ranked hypotheses.",
       "Include recommended actions, validation procedures, risk implications, provenance-ready references, and explicit hazards when available.",
-      "For troubleshooting outputs, prefer a guide structure with prework, numbered troubleshooting steps, expected results, escalation triggers, and final validation steps.",
-      "Use manufacturer, OEM, manual, datasheet, or other verified references when they materially improve specificity.",
+      "For troubleshooting outputs, produce a guide with a summary, required tools, estimated time required, hazards present, required parts, numbered troubleshooting steps, validation and verification steps, and a version-control stamp.",
+      "In troubleshooting steps, name referenced part numbers, tool names, expected results, and escalation triggers whenever the evidence supports them.",
+      "When verified sources exist, build the procedure from them first and only then layer in field history or crowdsource corrections as refinement.",
+      "Keep backend metadata, traceability, and CPLM detail in the structured package, not as the dominant voice of the customer-facing guide.",
       "Do not leave confidence, risk, expected values, or follow-up actions implicit.",
     ],
     outputConstraints: [
       "Return schema-compatible JSON only for the stage contract.",
       "Avoid unsupported claims, hidden leaps, vague release-to-service recommendations, or generic filler detached from the evidence.",
       "Do not collapse the troubleshooting guide into high-level summary prose when concrete stepwise instructions can be produced from the evidence.",
-      "Keep the output suitable for audit logging, revision history, and downstream analytics.",
+      "Do not let backend metadata dominate the customer-facing narrative. The user should receive a readable guided procedure first.",
+      "Keep the output suitable for audit logging, revision history, downstream analytics, and deterministic rendering into Word/PDF guide sections.",
     ],
     requiredArtifacts: uniqueArtifacts(requiredArtifacts),
   };

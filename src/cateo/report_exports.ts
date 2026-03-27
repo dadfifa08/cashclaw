@@ -234,157 +234,210 @@ function wrapText(text: string, width = 92): string[] {
   return lines;
 }
 
-function sectionLines(report: CateoTroubleshootingReportPackage): Array<{ heading: string; lines: string[] }> {
-  const expectedValueLines = report.expectedValues;
-  const failurePathLines = report.failurePaths;
-  const diagnosticSteps = report.diagnosticProcedure.flatMap((step) => unique([
+function formatDuration(minutes: number): string {
+  const rounded = Math.max(15, Math.round(minutes / 5) * 5);
+  if (rounded >= 60) {
+    const hours = Math.floor(rounded / 60);
+    const remainder = rounded % 60;
+    return remainder > 0 ? `${hours} hr ${remainder} min` : `${hours} hr`;
+  }
+  return `${rounded} min`;
+}
+
+function transparencyNoticeLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    "This guide is initially AI-generated.",
+    "Cateo builds the first pass from verified manufacturer, OEM, manual, datasheet, bulletin, and standards sources when available.",
+    "Field history and approved crowdsource improvements are applied only as secondary refinements and retained in revision history.",
+    `Current release status: ${report.documentControl.releaseStatus ?? "draft"}.`,
+    "Verify against approved records before operational, safety, regulatory, medical, or legal use.",
+  ]);
+}
+
+function estimateTimeLines(report: CateoTroubleshootingReportPackage): string[] {
+  const stepCount = Math.max(report.diagnosticProcedure.length, 1);
+  const toolCount = report.partsAndTools.requiredTools.length + report.partsAndTools.tools.length;
+  const partCount = report.partsAndTools.requiredParts.length + report.partsAndTools.parts.length;
+  const minutes = Math.max(30, (stepCount * 15) + (toolCount * 5) + (partCount * 3));
+  return [
+    `Estimated time required: ${formatDuration(minutes)}.`,
+    "Actual field time depends on access, lockout, warm-up, calibration, and replacement scope.",
+  ];
+}
+
+function summaryLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    report.title,
+    report.request.problemDescription,
+    report.interaction.message,
+    report.request.issueType ? `Issue type: ${report.request.issueType}` : undefined,
+    (report.request.faultArea || report.request.issueType) ? `Fault area: ${report.request.faultArea || report.request.issueType}` : undefined,
+    report.request.businessType ? `Operating domain: ${report.request.businessType}` : undefined,
+    (report.asset.model || report.asset.assetType) ? `System / instrument: ${report.asset.model || report.asset.assetType}` : undefined,
+    (report.part.partNumber || report.request.partNumber) ? `Part number: ${report.part.partNumber || report.request.partNumber}` : undefined,
+    report.request.errorCode ? `Error code: ${report.request.errorCode}` : undefined,
+    report.request.workOrderId ? `Work order: ${report.request.workOrderId}` : undefined,
+  ]);
+}
+
+function hazardLines(report: CateoTroubleshootingReportPackage): string[] {
+  const hazards = unique(report.warningsAndHazards);
+  return hazards.length > 0 ? hazards : ["No explicit hazard labels were captured. Verify lockout, PPE, and local safety controls before starting work."];
+}
+
+function requiredToolLines(report: CateoTroubleshootingReportPackage): string[] {
+  const lines = unique([
+    ...report.partsAndTools.requiredTools.map((item) => `Required tool: ${item}`),
+    ...report.partsAndTools.tools.map((tool) => `${tool.name} x${tool.quantity}${tool.purpose ? ` - ${tool.purpose}` : ""}`),
+  ]);
+  return lines.length > 0 ? lines : ["No specific tools were captured. Bring the standard diagnostic kit for this system."];
+}
+
+function requiredPartLines(report: CateoTroubleshootingReportPackage): string[] {
+  const lines = unique([
+    ...report.partsAndTools.requiredParts.map((item) => `Required part: ${item}`),
+    ...report.partsAndTools.parts.map((part) => `${part.sku} x${part.quantity}: ${part.description}${part.justification ? ` - ${part.justification}` : ""}`),
+    ...report.partsAndTools.consumables.map((item) => `Consumable: ${item}`),
+  ]);
+  return lines.length > 0 ? lines : ["No replacement parts or consumables were captured for this guide."];
+}
+
+function problemFrameLines(report: CateoTroubleshootingReportPackage): string[] {
+  const primarySources = unique([
+    ...report.part.verifiedSources.slice(0, 4).map((source) => `${source.title}${source.documentType ? ` (${source.documentType})` : ""}`),
+    ...report.part.referenceDocuments.slice(0, 3).map((item) => `Reference document: ${item}`),
+  ]);
+  const fieldSignals = unique(report.references
+    .filter((reference) => reference.sourceType === "history")
+    .slice(0, 3)
+    .map((reference) => reference.detail ? `${reference.label}: ${reference.detail}` : reference.label));
+
+  return unique([
+    primarySources.length > 0 ? `Primary guidance basis: ${primarySources.join("; ")}` : "Primary guidance basis: No verified manufacturer or manual source set was captured. Treat this guide as provisional.",
+    report.sourceGrounding.expectedValues.length > 0 ? `Source-backed checkpoints: ${report.sourceGrounding.expectedValues.slice(0, 3).join("; ")}` : undefined,
+    ...report.observedConditions.slice(0, 3).map((item) => `Observed condition: ${item}`),
+    ...report.evidenceSummary.slice(0, 2).map((item) => `Supporting context: ${item}`),
+    fieldSignals.length > 0 ? `Secondary field and crowdsource refinement: ${fieldSignals.join("; ")}` : "Secondary field and crowdsource refinement: No prior field history or crowdsource refinement was captured.",
+  ]);
+}
+
+function diagnosticStepLines(report: CateoTroubleshootingReportPackage): string[] {
+  if (report.diagnosticProcedure.length === 0) {
+    return ["No structured troubleshooting path was stored for this release. Review the guide basis, validation criteria, and references before continuing."];
+  }
+  return report.diagnosticProcedure.flatMap((step) => unique([
     `${step.stepId}: ${step.action}`,
-    `Why: ${step.rationale}`,
-    `Expected result: ${step.expectedResult}`,
+    `Purpose: ${step.rationale}`,
+    `What you should see: ${step.expectedResult}`,
     step.escalationTrigger ? `Escalate when: ${step.escalationTrigger}` : undefined,
     "",
   ]));
-  const hypothesisLines = report.rootCause.hypotheses.flatMap((hypothesis) => unique([
-    `${hypothesis.name} (${hypothesis.status})`,
-    hypothesis.evidenceFor.length > 0 ? `Evidence for: ${hypothesis.evidenceFor.join("; ")}` : undefined,
-    hypothesis.evidenceAgainst.length > 0 ? `Evidence against: ${hypothesis.evidenceAgainst.join("; ")}` : undefined,
-    "",
-  ]));
-  const referenceLines = report.references.flatMap((reference) => unique([
-    `${reference.label} [${reference.sourceType}]`,
-    reference.detail,
-    reference.url,
-    "",
-  ]));
+}
 
+function validationLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    ...report.verification.acceptanceCriteria.map((item) => `Acceptance: ${item}`),
+    ...report.verification.completionCriteria.map((item) => `Completion: ${item}`),
+    ...report.verification.recommendations.map((item) => `Recommendation: ${item}`),
+    ...report.expectedValues.map((item) => `Expected value: ${item}`),
+    ...report.verification.unresolvedRisks.map((item) => `Open risk: ${item}`),
+  ]);
+}
+
+function rootCauseLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    report.rootCause.statement,
+    report.rootCause.confidence ? `Confidence: ${report.rootCause.confidence}` : undefined,
+    ...report.rootCause.hypotheses.slice(0, 2).map((hypothesis) => `${hypothesis.name} (${hypothesis.status})`),
+  ]);
+}
+
+function referenceLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    ...report.references.flatMap((reference) => unique([
+      `${reference.label} [${reference.sourceType}]`,
+      reference.detail,
+      reference.url,
+      "",
+    ])),
+    ...report.part.referenceDocuments.map((item) => `Reference document: ${item}`),
+    ...report.part.verifiedSources.flatMap((source) => unique([
+      `${source.title} [verified-source]`,
+      source.reason,
+      source.summary,
+      source.documentType ? `Document type: ${source.documentType}` : undefined,
+      source.publisherType ? `Publisher type: ${source.publisherType}` : undefined,
+      source.url,
+      "",
+    ])),
+  ]);
+}
+
+function versionStampLines(report: CateoTroubleshootingReportPackage): string[] {
+  return unique([
+    `Document ID: ${report.documentControl.documentId}`,
+    `Package version: ${report.packageVersion}`,
+    report.documentControl.templateId ? `Template: ${report.documentControl.templateId} v${report.documentControl.templateVersion ?? "n/a"}` : undefined,
+    `Release status: ${report.documentControl.releaseStatus ?? "draft"}`,
+    report.documentControl.review.stage ? `Review stage: ${report.documentControl.review.stage}` : undefined,
+    `Generated: ${formatReportDate(report.generatedAt)}`,
+    `Updated: ${formatReportDate(report.updatedAt)}`,
+  ]);
+}
+
+function sectionLines(report: CateoTroubleshootingReportPackage): Array<{ heading: string; lines: string[] }> {
   return [
     {
-      heading: "Document Control",
-      lines: unique([
-        `Document ID: ${report.documentControl.documentId}`,
-        `Package version: ${report.packageVersion}`,
-        report.documentControl.templateId ? `Template: ${report.documentControl.templateId} v${report.documentControl.templateVersion ?? "n/a"}` : undefined,
-        `Release status: ${report.documentControl.releaseStatus ?? "draft"}`,
-        report.documentControl.review.stage ? `Review stage: ${report.documentControl.review.stage}` : undefined,
-        report.documentControl.review.technicalStatus ? `Technical review: ${report.documentControl.review.technicalStatus}` : undefined,
-        report.documentControl.review.qualityStatus ? `Quality review: ${report.documentControl.review.qualityStatus}` : undefined,
-        `Generated: ${formatReportDate(report.generatedAt)}`,
-        `Updated: ${formatReportDate(report.updatedAt)}`,
-        `Stored folder: ${report.indexing.folderPath}`,
-        `Artifact count: ${String(report.documentControl.artifactCount)}`,
-      ]),
+      heading: "Transparency and Usage Notice",
+      lines: transparencyNoticeLines(report),
     },
     {
-      heading: "Problem Definition",
-      lines: unique([
-        report.title,
-        report.request.problemDescription,
-        `Issue type: ${report.request.issueType}`,
-        report.request.faultArea ? `Fault area: ${report.request.faultArea}` : undefined,
-        report.request.errorCode ? `Error code: ${report.request.errorCode}` : undefined,
-        report.request.workOrderId ? `Work order: ${report.request.workOrderId}` : undefined,
-      ]),
+      heading: "Summary",
+      lines: summaryLines(report),
     },
     {
-      heading: "System and Part Identification",
-      lines: unique([
-        report.request.businessType ? `Operating domain: ${report.request.businessType}` : undefined,
-        report.asset.assetId ? `Asset ID: ${report.asset.assetId}` : undefined,
-        report.asset.assetType ? `Asset type: ${report.asset.assetType}` : undefined,
-        report.asset.manufacturer ? `Manufacturer: ${report.asset.manufacturer}` : undefined,
-        report.asset.model ? `Model: ${report.asset.model}` : undefined,
-        report.asset.serialNumber ? `Serial number: ${report.asset.serialNumber}` : undefined,
-        report.request.partNumber ? `Requested part number: ${report.request.partNumber}` : undefined,
-        report.part.partNumber ? `Resolved part number: ${report.part.partNumber}` : undefined,
-        report.part.description ? `Part description: ${report.part.description}` : undefined,
-        report.part.confidencePct ? `Part match confidence: ${report.part.confidencePct}%` : undefined,
-        report.asset.locationHierarchy.length > 0 ? `Location: ${report.asset.locationHierarchy.join(" > ")}` : undefined,
-        report.asset.environment ? `Environment: ${report.asset.environment}` : undefined,
-      ]),
+      heading: "Time Required",
+      lines: estimateTimeLines(report),
     },
     {
-      heading: "Observed Conditions and Evidence",
-      lines: [
-        ...report.observedConditions,
-        ...report.evidenceSummary,
-      ],
+      heading: "Hazards Present",
+      lines: hazardLines(report),
     },
     {
-      heading: "Warnings and Hazards",
-      lines: report.warningsAndHazards.length > 0 ? report.warningsAndHazards : ["No explicit warnings or hazard labels were available in the validated source set."],
+      heading: "Required Tools",
+      lines: requiredToolLines(report),
     },
     {
-      heading: "Source Grounding",
-      lines: [
-        ...report.sourceGrounding.groundedFindings,
-        ...report.sourceGrounding.expectedValues.map((value) => `Expected value: ${value}`),
-        ...report.sourceGrounding.referenceDocuments.map((value) => `Reference document: ${value}`),
-      ],
+      heading: "Parts Required",
+      lines: requiredPartLines(report),
     },
     {
-      heading: "Assumptions and Constraints",
-      lines: unique([
-        ...report.assumptions,
-        report.request.contextNotes ? `Context notes: ${report.request.contextNotes}` : undefined,
-      ]),
+      heading: "Guide Basis and Source Order",
+      lines: problemFrameLines(report),
     },
     {
-      heading: "Step-by-Step Diagnostics",
-      lines: diagnosticSteps,
+      heading: "Step-by-Step Troubleshooting Guide",
+      lines: diagnosticStepLines(report),
     },
     {
-      heading: "Expected Values and Failure Paths",
-      lines: [
-        ...expectedValueLines,
-        ...failurePathLines.map((value) => `Failure path: ${value}`),
-      ],
+      heading: "Validation and Verification",
+      lines: validationLines(report),
     },
     {
-      heading: "Root Cause and Confidence",
-      lines: unique([
-        report.rootCause.statement,
-        report.rootCause.confidence ? `Confidence: ${report.rootCause.confidence}` : undefined,
-        ...hypothesisLines,
-      ]),
-    },
-    {
-      heading: "Verification and Release",
-      lines: [
-        ...report.verification.acceptanceCriteria.map((value) => `Acceptance: ${value}`),
-        ...report.verification.completionCriteria.map((value) => `Completion: ${value}`),
-        ...report.verification.recommendations.map((value) => `Recommendation: ${value}`),
-        ...report.verification.unresolvedRisks.map((value) => `Open risk: ${value}`),
-      ],
-    },
-    {
-      heading: "Parts, Tools, and Preventive Maintenance",
-      lines: [
-        ...report.partsAndTools.requiredParts.map((value) => `Required part: ${value}`),
-        ...report.partsAndTools.requiredTools.map((value) => `Required tool: ${value}`),
-        ...report.partsAndTools.parts.map((part) => `${part.sku} x${part.quantity}: ${part.description} - ${part.justification}`),
-        ...report.partsAndTools.tools.map((tool) => `${tool.name} x${tool.quantity}: ${tool.purpose}`),
-        ...report.partsAndTools.consumables.map((value) => `Consumable: ${value}`),
-        ...report.preventiveMaintenance.suggestions.map((value) => `PM suggestion: ${value}`),
-      ],
+      heading: "Current Engineering Note",
+      lines: rootCauseLines(report),
     },
     {
       heading: "References",
-      lines: [
-        ...referenceLines,
-        ...report.part.verifiedSources.flatMap((source) => unique([
-          `${source.title} [verified-source]`,
-          source.reason,
-          source.summary,
-          source.documentType ? `Document type: ${source.documentType}` : undefined,
-          source.publisherType ? `Publisher type: ${source.publisherType}` : undefined,
-          source.url,
-          "",
-        ])),
-      ],
+      lines: referenceLines(report),
+    },
+    {
+      heading: "Version Control Stamp",
+      lines: versionStampLines(report),
     },
   ].map((section) => ({
     heading: section.heading,
-    lines: section.lines.flatMap((line) => wrapText(line)).filter((line, index, array) => line || array[index - 1] != ""),
+    lines: section.lines.flatMap((line) => wrapText(line)).filter((line, index, array) => line || array[index - 1] !== ""),
   })).filter((section) => section.lines.length > 0);
 }
 
@@ -559,6 +612,7 @@ export function buildTroubleshootingReportPackage(caseRecord: CateoCaseRecord, a
       workOrderId: caseRecord.context.workOrder?.workOrderId,
       partNumber: caseRecord.context.partResolution?.partNumber || caseRecord.input.partNumber,
       businessType: caseRecord.input.businessType || caseRecord.context.businessType,
+      faultArea: caseRecord.input.faultArea || caseRecord.context.faultArea,
       issueType: caseRecord.context.issueType || caseRecord.context.failureCode?.label || caseRecord.context.taskClass,
     },
     asset: {
@@ -728,6 +782,7 @@ export function persistTroubleshootingReportPackage(caseRecord: CateoCaseRecord,
   writeProtectedJson(reportPackage.indexing.jsonPath, reportPackage);
   return reportPackage;
 }
+
 
 
 

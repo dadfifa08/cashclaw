@@ -283,14 +283,29 @@ function buildPromptPayload(input: CateoAssistInput, context: CateoContextBundle
 }
 
 function fallbackLeadPlan(route: CateoRoutingDecision, context: CateoContextBundle, input: CateoAssistInput): CateoLeadPlan {
+  const sourceTitles = primarySourceTitles(context);
+  const fieldSignals = secondaryFieldSignals(context);
+  const expectedValues = uniqueStrings(context.partResolution?.expectedValues ?? []).slice(0, 3);
+  const subject = troubleshootingSubjectLabel(context, input);
+  const faultArea = troubleshootingFaultAreaLabel(context, input);
+
   return {
     taskClass: route.taskClass,
-    objective: `Produce a ${route.requestedArtifacts.join(", ")} package for ${context.asset?.assetId ?? context.machine?.model ?? "the reported asset"}.`,
+    objective: `Produce a ${route.requestedArtifacts.join(", ")} package for ${subject} that reads like a guided troubleshooting manual for ${faultArea}.`,
     evidencePlan: uniqueStrings([
-      "Verify the reported symptom against the current operating state.",
-      context.failureCode ? `Confirm the failure code ${context.failureCode.code} against the approved taxonomy.` : "Capture and classify the observed failure mode.",
-      context.serviceHistory.length > 0 ? "Review recent maintenance history for repeat interventions and unresolved findings." : "Collect recent maintenance or work-order context before committing to a corrective path.",
-      context.digitalTwin ? "Compare observed geometry against the expected reference state and record deviations." : "Capture dimensional, visual, or functional evidence required to confirm the fault state.",
+      sourceTitles.length > 0
+        ? `Review the verified online and manual source set for ${subject} before starting work: ${sourceTitles.join("; ")}.`
+        : `Review the best available manufacturer, OEM, service, or standards references for ${subject} before starting work.`,
+      `Verify the reported symptom at ${faultArea} against the current operating state${context.failureCode ? ` and confirm whether ${context.failureCode.code} is active` : ""}.`,
+      expectedValues.length > 0
+        ? `Check the source-backed operating condition against these expected values: ${expectedValues.join("; ")}.`
+        : `Capture one objective measurement or observation that can confirm whether ${faultArea} is truly out of range.`,
+      context.digitalTwin
+        ? "Compare the observed condition against the expected reference geometry or configuration and record deviations."
+        : "Inspect the affected area for visual, mechanical, electrical, or process evidence that confirms the fault state.",
+      fieldSignals.length > 0
+        ? `If the verified-source path does not isolate the issue, use these field-history or crowdsource refinements next: ${fieldSignals.join("; ")}.`
+        : "If the verified-source path does not isolate the issue, document the source gap before moving into engineering judgment or field-history refinement.",
     ]),
     assumptions: uniqueStrings([
       input.errorCode ? `The reported code ${input.errorCode} is relevant to the present symptom.` : "The reported symptom is current and reproducible.",
@@ -299,15 +314,18 @@ function fallbackLeadPlan(route: CateoRoutingDecision, context: CateoContextBund
     risks: uniqueStrings([
       "Do not return the equipment to service without validating the correction against acceptance criteria.",
       context.digitalTwin?.status === "fail" ? "Out-of-tolerance geometric conditions may indicate latent mechanical damage." : "Evidence gaps may hide a secondary cause if the inspection is rushed.",
+      sourceTitles.length === 0 ? "No verified external source set was captured, so the guide must stay explicitly provisional." : "",
     ]),
     decisionBasis: uniqueStrings([
+      sourceTitles.length > 0 ? `Primary guidance basis: ${sourceTitles.join("; ")}.` : "Primary guidance basis is incomplete because no verified external source set was captured.",
+      fieldSignals.length > 0 ? `Secondary refinement basis: ${fieldSignals.join("; ")}.` : "Limited field history increases uncertainty in later troubleshooting branches.",
       ...context.contextSummary,
-      context.serviceHistory.length > 0 ? "Maintenance recurrence and unresolved findings influence the decision path." : "Limited maintenance history increases uncertainty.",
     ]),
     artifactPriorities: route.requestedArtifacts,
     maintenanceConsiderations: uniqueStrings([
       context.workOrder?.workOrderId ? `Tie all deliverables back to work order ${context.workOrder.workOrderId}.` : "Create a work-order-ready deliverable package.",
       "Keep regulatory traceability and revision control intact.",
+      "Keep deep CPLM metadata in the controlled package rather than turning it into the main customer-facing voice.",
     ]),
     partsConsiderations: uniqueStrings([
       context.suggestedParts.length > 0 ? `Known candidate parts: ${context.suggestedParts.map((entry) => entry.sku).join(", ")}.` : "No confident part mapping is available yet.",
@@ -365,7 +383,7 @@ function fallbackStructure(route: CateoRoutingDecision, context: CateoContextBun
 function fallbackFinal(route: CateoRoutingDecision, context: CateoContextBundle, leadPlan: CateoLeadPlan, critique?: CateoChallengerCritique): CateoFinalSynthesis {
   const confidence: CateoConfidence = critique && critique.evidenceGaps.length > 1 ? "medium" : (context.digitalTwin?.status === "fail" ? "high" : "medium");
   return {
-    executiveSummary: `Prepared ${route.requestedArtifacts.length} structured Cateo artifact(s) for ${context.asset?.assetId ?? context.machine?.model ?? "the reported asset"} with explicit evidence, assumptions, and follow-up controls.`,
+    executiveSummary: `Prepared ${route.requestedArtifacts.length} structured Cateo artifact(s) for ${context.asset?.assetId ?? context.machine?.model ?? "the reported asset"} as a guided troubleshooting package grounded in verified sources first and field refinements second.`,
     decision: "draft",
     confidence,
     rootCauseStatement: critique?.alternateHypotheses?.[0]
@@ -520,6 +538,96 @@ function ensureHypotheses(critique: CateoChallengerCritique | undefined, finalSy
   }];
 }
 
+function primarySourceTitles(context: CateoContextBundle): string[] {
+  return uniqueStrings((context.partResolution?.verifiedSources ?? []).map((source) => source.title)).slice(0, 3);
+}
+
+function secondaryFieldSignals(context: CateoContextBundle): string[] {
+  return uniqueStrings([
+    ...context.serviceHistory.slice(0, 2).map((entry) => entry.actionTaken ? `${entry.summary} / prior action: ${entry.actionTaken}` : entry.summary),
+    ...(context.partResolution?.failureModes ?? []).slice(0, 2).map((mode) => `Known field failure mode: ${mode}`),
+  ]).slice(0, 3);
+}
+
+function troubleshootingSubjectLabel(context: CateoContextBundle, input: CateoAssistInput): string {
+  return context.partResolution?.partNumber || input.partNumber || context.asset?.assetId || context.machine?.model || "the affected system";
+}
+
+function troubleshootingFaultAreaLabel(context: CateoContextBundle, input: CateoAssistInput): string {
+  return context.faultArea || context.issueType || input.issueType || input.errorCode || "the reported fault area";
+}
+
+function buildManualStyleTroubleshootingSteps(
+  input: CateoAssistInput,
+  context: CateoContextBundle,
+  critique: CateoChallengerCritique | undefined,
+): CateoTroubleshootingProcedure["steps"] {
+  const sourceTitles = primarySourceTitles(context);
+  const fieldSignals = secondaryFieldSignals(context);
+  const expectedValues = uniqueStrings(context.partResolution?.expectedValues ?? []).slice(0, 2);
+  const subject = troubleshootingSubjectLabel(context, input);
+  const faultArea = troubleshootingFaultAreaLabel(context, input);
+  const replacementHint = buildSuggestedPartLines(context.suggestedParts)[0];
+  const steps: CateoTroubleshootingProcedure["steps"] = [
+    {
+      id: "ts-1",
+      action: sourceTitles.length > 0
+        ? `Review the verified reference set for ${subject} before starting work: ${sourceTitles.join("; ")}. Note the documented hazards, access conditions, and expected states that apply to ${faultArea}.`
+        : `Review the best available manufacturer, OEM, or service documentation for ${subject} before starting work, and record any documented hazards or expected states for ${faultArea}.`,
+      rationale: "Verified online and manual sources are the primary guidance layer for this procedure.",
+      expectedResult: sourceTitles.length > 0
+        ? "You have the correct reference baseline, hazard picture, and documented starting conditions before touching the equipment."
+        : "You understand the safest available baseline and know where source gaps remain.",
+    },
+    {
+      id: "ts-2",
+      action: `Confirm the reported symptom at ${faultArea} with the equipment in a known operating state${context.failureCode ? ` and verify whether ${context.failureCode.code} is active` : ""}.`,
+      rationale: "The guide must start from an observed condition, not only the reported narrative.",
+      expectedResult: "You either reproduce the symptom under controlled conditions or document that the current state does not match the report.",
+      escalationTrigger: critique?.blindSpots[0],
+    },
+    {
+      id: "ts-3",
+      action: expectedValues.length > 0
+        ? `Check the source-backed operating condition against these expected values: ${expectedValues.join("; ")}.`
+        : `Measure or observe one objective condition that can confirm whether ${faultArea} is actually out of range or behaving abnormally.`,
+      rationale: "Source-backed expected values are stronger than generic troubleshooting guesses.",
+      expectedResult: expectedValues.length > 0
+        ? "You know whether the measured condition matches the documented expectation."
+        : "You capture an objective reading or observation that supports the next decision.",
+      escalationTrigger: critique?.blindSpots[1],
+    },
+    {
+      id: "ts-4",
+      action: `Inspect ${subject} and the surrounding ${faultArea} interfaces for documented failure cues, looseness, contamination, wear, or connection issues that match the current symptom.`,
+      rationale: "Once the symptom is confirmed, the physical inspection should focus on the part and interfaces tied to the verified source set.",
+      expectedResult: "You either find a concrete abnormal condition in the target area or rule that area out with evidence.",
+      escalationTrigger: critique?.blindSpots[2],
+    },
+  ];
+
+  if (fieldSignals.length > 0) {
+    steps.push({
+      id: `ts-${steps.length + 1}`,
+      action: `If the verified-source path does not isolate the issue, apply the strongest field and prior-case checks next: ${fieldSignals.join("; ")}.`,
+      rationale: "Field history and crowdsource improvements are secondary evidence layers used to refine the guide after the verified-source path is exhausted.",
+      expectedResult: "You confirm whether a repeat failure pattern, prior corrective action, or known field workaround changes the next step.",
+      escalationTrigger: critique?.blindSpots[3],
+    });
+  }
+
+  steps.push({
+    id: `ts-${steps.length + 1}`,
+    action: replacementHint
+      ? `If the fault remains after the checks above, replace or escalate the suspect item starting with ${replacementHint}. Re-run the symptom check immediately after the action.`
+      : "If the fault remains after the checks above, escalate to the next controlled repair action or part-isolation path and re-run the symptom check immediately after the action.",
+    rationale: "The guide must end with a controlled next move rather than leaving the user at an unresolved dead end.",
+    expectedResult: "You either restore the expected condition or have a bounded escalation package for the next technical step.",
+  });
+
+  return steps;
+}
+
 function buildTroubleshootingArtifact(
   input: CateoAssistInput,
   context: CateoContextBundle,
@@ -528,27 +636,27 @@ function buildTroubleshootingArtifact(
   blueprint: CateoStructureBlueprint | undefined,
   finalSynthesis: CateoFinalSynthesis,
 ): CateoTroubleshootingProcedure {
+  const sourceTitles = primarySourceTitles(context);
+  const fieldSignals = secondaryFieldSignals(context);
+  const expectedValues = uniqueStrings(context.partResolution?.expectedValues ?? []).slice(0, 4);
+  const steps = buildManualStyleTroubleshootingSteps(input, context, critique);
+  const subject = troubleshootingSubjectLabel(context, input);
+  const faultArea = troubleshootingFaultAreaLabel(context, input);
+  const hazardSignals = uniqueStrings(context.partResolution?.hazardSignals ?? []);
+
   const evidenceSummary = uniqueStrings([
+    sourceTitles.length > 0 ? `Primary verified guidance basis: ${sourceTitles.join("; ")}.` : "Primary verified guidance basis was not captured; treat the guide as provisional.",
+    expectedValues.length > 0 ? `Source-backed checkpoints: ${expectedValues.join("; ")}.` : "No source-backed expected values were captured for this guide.",
+    fieldSignals.length > 0 ? `Secondary field and crowdsource refinement basis: ${fieldSignals.join("; ")}.` : "No prior field or crowdsource refinement signals were captured for this guide.",
     ...context.contextSummary,
-    ...leadPlan.evidencePlan,
+    ...leadPlan.decisionBasis,
+    ...(context.partResolution?.groundedFindings ?? []),
     ...(critique?.evidenceGaps ?? []),
   ]);
 
-  const steps = leadPlan.evidencePlan.slice(0, 4).map((entry, index) => ({
-    id: `ts-${index + 1}`,
-    action: entry,
-    rationale: critique?.recommendedAdjustments[index] ?? "This step reduces ambiguity before a corrective action is released.",
-    expectedResult: index === 0
-      ? "The symptom is reproduced or ruled out under a known operating state."
-      : index === 1
-        ? "The fault state is confirmed with objective evidence."
-        : "Evidence is collected with enough quality to support the engineering decision.",
-    escalationTrigger: critique?.blindSpots[index],
-  }));
-
   return {
     title: findBlueprintTitle(blueprint, "troubleshooting-procedure", `Troubleshooting procedure for ${context.asset?.assetId ?? context.machine?.model ?? "reported asset"}`),
-    objective: finalSynthesis.executiveSummary,
+    objective: `Guide the user through diagnosing ${faultArea} on ${subject} using verified sources first and field refinement second.`,
     failureCode: context.failureCode?.code ?? input.errorCode,
     symptoms: uniqueStrings([input.symptomDescription, ...context.observedConditions]),
     assumptions: uniqueStrings(leadPlan.assumptions),
@@ -556,9 +664,10 @@ function buildTroubleshootingArtifact(
     safetyPrecautions: uniqueStrings([
       "Verify energy isolation and process safety before intrusive inspection.",
       "Use approved personal protective equipment for the asset class and environment.",
+      ...hazardSignals,
       context.digitalTwin?.status === "fail" ? "Do not return the asset to service until the geometric deviation is resolved or accepted." : "",
     ]),
-    requiredParts: buildSuggestedPartLines(context.suggestedParts),
+    requiredParts: uniqueStrings(buildSuggestedPartLines(context.suggestedParts)),
     requiredTools: buildToolList(context.taskClass, context),
     steps: steps.length > 0 ? steps : [{
       id: "ts-1",
@@ -568,6 +677,7 @@ function buildTroubleshootingArtifact(
     }],
     acceptanceCriteria: uniqueStrings([
       "The failure condition is cleared or bounded with objective evidence.",
+      expectedValues.length > 0 ? `Any source-backed expected values are satisfied after the troubleshooting action: ${expectedValues.join("; ")}.` : "",
       "No unresolved critical risks remain in the service report.",
       context.digitalTwin ? "All critical digital-twin deviations are resolved, remeasured, or dispositioned." : "",
     ]),
@@ -1684,7 +1794,9 @@ export async function generateCateoArtifacts(
       "You are Cateo's builder model for structured engineering artifacts.",
       "Return JSON only.",
       "Obey the instruction template and produce schema-ready artifacts. Invalid or incomplete drafts will be rejected and retried.",
+      "For troubleshooting-procedure drafts, write the content like a user-facing service guide or technical bulletin with natural imperative instructions, not a metadata summary.",
       "When verified source findings, expected values, document references, or hazard labels are present, weave them into the procedure, warnings, and verification steps instead of producing generic advice.",
+      "Build the guide from verified online/manual sources first. Use field history and crowdsource improvements only as secondary refinement layers when the primary source path is not enough.",
       "Instruction template:",
       templatePayload,
       "Request and context payload:",
@@ -1697,7 +1809,7 @@ export async function generateCateoArtifacts(
       stage: "builder",
       llm: runtime.structure!,
       modelInfo: runtime.meta.structure!,
-      systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
+      systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. For troubleshooting-procedure drafts, write a user-facing manual-style guide with natural imperative steps. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
       userPrompt: builderPrompt,
       fallback: {
         packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
@@ -1773,7 +1885,7 @@ export async function generateCateoArtifacts(
         stage: "builder",
         llm: runtime.structure!,
         modelInfo: runtime.meta.structure!,
-        systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
+        systemPrompt: "Return a compact JSON object with keys packageSummary, artifactPlans, and artifactDrafts. artifactPlans entries must include artifactType, title, sectionOrder, qualityGates, and requiredEvidence. artifactDrafts entries must include artifactType, title, and content. For troubleshooting-procedure drafts, write a user-facing manual-style guide with natural imperative steps. Use grounded source details when present; do not invent source-backed values. No prose outside JSON.",
         userPrompt: builderRetryPrompt,
         fallback: {
           packageSummary: `Structured Cateo package with ${route.requestedArtifacts.length} artifact(s).`,
@@ -2478,6 +2590,9 @@ export function signOffCateoArtifact(request: CateoSignoffRequest, options: Serv
   appendAuditEvent({ actor: "operator", category: "cateo_artifact", action: "signoff", outcome: "success", message: `${request.state} sign-off recorded for artifact ${request.artifactId}`, requestId: options.requestId, metadata: { actor: request.actor, role: request.role, state: request.state } });
   return updated;
 }
+
+
+
 
 
 
