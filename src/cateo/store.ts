@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
+import { toProjectedEffectivityRules, toProjectedExternalSystemLinks, toProjectedObjectMetadata, toProjectedRelationships } from "./cplm_projection.js";
 import { syncCateoOntology } from "./ontology.js";
 import { syncCateoPartMaster } from "./part_master.js";
 import { searchVectorIndex, upsertArtifactVectorEntry, upsertCaseVectorEntry } from "./vector_index.js";
@@ -20,6 +21,7 @@ export interface ArtifactCatalogRow {
   artifactId: string;
   caseId: string;
   artifactType: string;
+  title?: string;
   assetId?: string;
   workOrderId?: string;
   schemaId: string;
@@ -38,6 +40,12 @@ export interface ArtifactCatalogRow {
   canonicalArtifactId?: string;
   duplicateGroupId?: string;
   relationCount?: number;
+  documentType?: string;
+  persistentObjectId?: string;
+  objectMetadata?: ReturnType<typeof toProjectedObjectMetadata>;
+  effectivity?: ReturnType<typeof toProjectedEffectivityRules>;
+  relationships?: ReturnType<typeof toProjectedRelationships>;
+  externalSystemLinks?: ReturnType<typeof toProjectedExternalSystemLinks>;
   taxonomyTags: string[];
 }
 
@@ -52,6 +60,7 @@ export interface CaseCatalogRow {
   runId: string;
   title: string;
   taskClass: string;
+  createdAt: string;
   productOffering?: string;
   workflowMode?: string;
   partNumber?: string;
@@ -71,7 +80,18 @@ export interface CaseCatalogRow {
   requiresEngineerReview?: boolean;
   artifactIds: string[];
   interactionSummary?: string;
+  businessJustification?: string;
+  drjJustification?: string;
+  documentIntent?: string;
+  complianceScope: string[];
   riskTier?: string;
+  reviewStage?: string;
+  technicalReviewStatus?: string;
+  technicalReviewNote?: string;
+  qualityReviewStatus?: string;
+  qualityReviewNote?: string;
+  reviewerDecisionStatus?: string;
+  reviewerDecisionSummary?: string;
   updatedAt: string;
 }
 
@@ -80,6 +100,9 @@ interface CaseCatalogFile {
   updatedAt: string;
   rows: CaseCatalogRow[];
 }
+
+const artifactRebuildCache = new Map<string, { updatedAt: string; record: CateoArtifactRecord }>();
+const caseRebuildCache = new Map<string, { updatedAt: string; record: CateoCaseRecord }>();
 
 function getCateoDir(): string {
   return path.join(getConfigDir(), "cateo");
@@ -180,6 +203,53 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function snapshotRecord<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function rememberArtifactForRebuild(record: CateoArtifactRecord): void {
+  artifactRebuildCache.set(record.artifactId, {
+    updatedAt: record.updatedAt,
+    record: snapshotRecord(record),
+  });
+}
+
+function rememberCaseForRebuild(record: CateoCaseRecord): void {
+  caseRebuildCache.set(record.caseId, {
+    updatedAt: record.updatedAt,
+    record: snapshotRecord(record),
+  });
+}
+
+function artifactForRebuild(row: Pick<ArtifactCatalogRow, "artifactId" | "updatedAt">): CateoArtifactRecord | null {
+  const cached = artifactRebuildCache.get(row.artifactId);
+  if (cached?.updatedAt === row.updatedAt) {
+    return cached.record;
+  }
+  const record = readProtectedJson<CateoArtifactRecord | null>(artifactPath(row.artifactId), null);
+  if (!record) {
+    artifactRebuildCache.delete(row.artifactId);
+    return null;
+  }
+  const normalized = normalizeArtifactRecord(record);
+  rememberArtifactForRebuild(normalized);
+  return artifactRebuildCache.get(row.artifactId)?.record ?? normalized;
+}
+
+function caseForRebuild(row: Pick<CaseCatalogRow, "caseId" | "updatedAt">): CateoCaseRecord | null {
+  const cached = caseRebuildCache.get(row.caseId);
+  if (cached?.updatedAt === row.updatedAt) {
+    return cached.record;
+  }
+  const record = readProtectedJson<CateoCaseRecord | null>(casePath(row.caseId), null);
+  if (!record) {
+    caseRebuildCache.delete(row.caseId);
+    return null;
+  }
+  rememberCaseForRebuild(record);
+  return caseRebuildCache.get(row.caseId)?.record ?? record;
+}
+
 function diffRecursive(before: unknown, after: unknown, currentPath: string, diff: CateoJsonDiffEntry[]): void {
   const beforeSerialized = stableStringify(before);
   const afterSerialized = stableStringify(after);
@@ -232,6 +302,7 @@ function upsertArtifactCatalog(record: CateoArtifactRecord): void {
     artifactId: record.artifactId,
     caseId: record.caseId,
     artifactType: record.artifactType,
+    title: metadata?.artifactTitle,
     assetId: record.assetId,
     workOrderId: record.workOrderId,
     schemaId: record.schema.id,
@@ -250,6 +321,12 @@ function upsertArtifactCatalog(record: CateoArtifactRecord): void {
     canonicalArtifactId: record.canonicalArtifactId,
     duplicateGroupId: record.duplicateGroupId,
     relationCount: metadata?.relations?.length ?? 0,
+    documentType: metadata?.documentType,
+    persistentObjectId: metadata?.objectMetadata?.persistentObjectId,
+    objectMetadata: toProjectedObjectMetadata(metadata),
+    effectivity: toProjectedEffectivityRules(metadata?.effectivity),
+    relationships: toProjectedRelationships(metadata?.relations),
+    externalSystemLinks: toProjectedExternalSystemLinks(metadata?.externalSystemIds),
     taxonomyTags: metadata?.taxonomyTags ?? [],
   };
 
@@ -273,11 +350,13 @@ function saveCaseCatalog(file: CaseCatalogFile): void {
 }
 
 function upsertCaseCatalog(record: CateoCaseRecord): void {
+  const workflow = record.reviewWorkflow;
   const next: CaseCatalogRow = {
     caseId: record.caseId,
     runId: record.runId,
     title: record.context.title,
     taskClass: record.context.taskClass,
+    createdAt: record.createdAt,
     productOffering: record.input.productOffering,
     workflowMode: record.input.workflow?.mode,
     partNumber: record.context.partResolution?.partNumber ?? record.input.partNumber,
@@ -297,7 +376,18 @@ function upsertCaseCatalog(record: CateoCaseRecord): void {
     requiresEngineerReview: record.interaction?.requiresEngineerReview ?? record.requester?.requiresEngineerReview,
     artifactIds: record.artifacts,
     interactionSummary: record.interaction?.message,
+    businessJustification: record.input.workflow?.businessJustification,
+    drjJustification: record.input.workflow?.drjJustification,
+    documentIntent: record.input.workflow?.documentIntent,
+    complianceScope: record.input.workflow?.complianceScope ?? [],
     riskTier: record.input.workflow?.riskTier,
+    reviewStage: workflow?.stage,
+    technicalReviewStatus: workflow?.technical?.status,
+    technicalReviewNote: workflow?.technical?.note,
+    qualityReviewStatus: workflow?.quality?.status,
+    qualityReviewNote: workflow?.quality?.note,
+    reviewerDecisionStatus: record.trace.reviewerDecision?.overallStatus,
+    reviewerDecisionSummary: record.trace.reviewerDecision?.summary,
     updatedAt: record.updatedAt,
   };
 
@@ -312,11 +402,10 @@ function rebuildMaterializedIndexes(): void {
   const artifactCatalog = loadArtifactCatalog();
   const caseCatalog = loadCaseCatalog();
   const artifactRecords = artifactCatalog.rows
-    .map((row) => readProtectedJson<CateoArtifactRecord | null>(artifactPath(row.artifactId), null))
-    .filter((record): record is CateoArtifactRecord => Boolean(record))
-    .map((record) => normalizeArtifactRecord(record));
+    .map((row) => artifactForRebuild(row))
+    .filter((record): record is CateoArtifactRecord => Boolean(record));
   const caseRecords = caseCatalog.rows
-    .map((row) => readProtectedJson<CateoCaseRecord | null>(casePath(row.caseId), null))
+    .map((row) => caseForRebuild(row))
     .filter((record): record is CateoCaseRecord => Boolean(record));
   syncCateoOntology({ artifactRecords, caseRecords });
   syncCateoPartMaster({ artifactRecords, caseRecords });
@@ -357,6 +446,7 @@ export function saveArtifactRecord(record: CateoArtifactRecord): CateoArtifactRe
   writeProtectedJson(artifactPath(normalized.artifactId), normalized);
   upsertArtifactCatalog(normalized);
   upsertArtifactVectorEntry(normalized);
+  rememberArtifactForRebuild(normalized);
   rebuildMaterializedIndexes();
   return normalized;
 }
@@ -370,6 +460,7 @@ export function saveCaseRecord(record: CateoCaseRecord): CateoCaseRecord {
   writeProtectedJson(casePath(record.caseId), record);
   upsertCaseCatalog(record);
   upsertCaseVectorEntry(record);
+  rememberCaseForRebuild(record);
   rebuildMaterializedIndexes();
   return record;
 }

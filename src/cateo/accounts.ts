@@ -123,9 +123,39 @@ function profileIdFor(config: CashClawConfig, record: UserRec, requesterId?: str
 }
 function userSnapshot(config: CashClawConfig, record: UserRec): CateoPublicUserSnapshot { const normalized = normalizeUserRecord(record); return { userId: normalized.userId, createdAt: normalized.createdAt, updatedAt: normalized.updatedAt, lastLoginAt: normalized.lastLoginAt, status: normalized.status, email: normalized.email, username: normalized.username, displayName: normalized.displayName, organization: normalized.organization, roles: [...normalized.roles], profileId: normalized.profileId, profile: normalized.profileId ? getPilotProfile(config, normalized.profileId, normalized.requesterIds[0]) ?? null : null, security: { twoFactorEnabled: normalized.security.twoFactor.enabled, passwordChangedAt: normalized.security.passwordChangedAt }, preferences: normalized.preferences }; }
 function saveUser(config: CashClawConfig, store: UserFile, record: UserRec) { const normalized = normalizeUserRecord(record); const users = store.users.filter((entry) => entry.userId !== normalized.userId); users.push(normalized); saveUsers({ version: USER_DB, updatedAt: nowIso(), users }); return userSnapshot(config, normalized); }
-function guardLogin(identifier: string, requesterId?: string) { const key = `${identifier.toLowerCase()}::${requesterId ?? "anon"}`; const state = throttle.get(key); const now = Date.now(); if (!state) return; state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS); if (state.lockedUntil && state.lockedUntil > now) throw new CateoPublicAuthError("LOGIN_THROTTLED", "Too many login attempts. Try again later.", 429); if (state.lockedUntil && state.lockedUntil <= now) throttle.delete(key); }
-function failedLogin(identifier: string, requesterId?: string) { const key = `${identifier.toLowerCase()}::${requesterId ?? "anon"}`; const state = throttle.get(key) ?? { failures: [] as number[] }; const now = Date.now(); state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS); state.failures.push(now); if (state.failures.length >= LIMIT) state.lockedUntil = now + LOCK_MS; throttle.set(key, state); }
-const clearLogin = (identifier: string, requesterId?: string) => throttle.delete(`${identifier.toLowerCase()}::${requesterId ?? "anon"}`);
+function throttleKeys(identifier: string, requesterId?: string): string[] {
+  const normalized = identifier.toLowerCase();
+  return [
+    `id:${normalized}`,
+    `pair:${normalized}::${requesterId ?? "anon"}`,
+    requesterId ? `requester:${requesterId}` : undefined,
+  ].filter((value): value is string => Boolean(value));
+}
+function guardLogin(identifier: string, requesterId?: string) {
+  const now = Date.now();
+  for (const key of throttleKeys(identifier, requesterId)) {
+    const state = throttle.get(key);
+    if (!state) continue;
+    state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS);
+    if (state.lockedUntil && state.lockedUntil > now) throw new CateoPublicAuthError("LOGIN_THROTTLED", "Too many login attempts. Try again later.", 429);
+    if (state.lockedUntil && state.lockedUntil <= now && state.failures.length === 0) throttle.delete(key);
+  }
+}
+function failedLogin(identifier: string, requesterId?: string) {
+  const now = Date.now();
+  for (const key of throttleKeys(identifier, requesterId)) {
+    const state = throttle.get(key) ?? { failures: [] as number[] };
+    state.failures = state.failures.filter((stamp) => now - stamp <= WINDOW_MS);
+    state.failures.push(now);
+    if (state.failures.length >= LIMIT) state.lockedUntil = now + LOCK_MS;
+    throttle.set(key, state);
+  }
+}
+const clearLogin = (identifier: string, requesterId?: string) => {
+  for (const key of throttleKeys(identifier, requesterId)) {
+    throttle.delete(key);
+  }
+};
 function findUser(store: UserFile, identifier: string) { const id = identifier.trim().toLowerCase(); return store.users.find((entry) => entry.email?.toLowerCase() === id || entry.username?.toLowerCase() === id) ?? null; }
 function requireUser(store: UserFile, userId: string): UserRec { const user = store.users.find((entry) => entry.userId === userId && entry.status === "active"); if (!user) throw new CateoPublicAuthError("USER_NOT_FOUND", "User not found.", 404); return normalizeUserRecord(user); }
 function defaultSecurity(): UserSecurityRec { return { twoFactor: { enabled: false, recoveryCodeHashes: [] } }; }

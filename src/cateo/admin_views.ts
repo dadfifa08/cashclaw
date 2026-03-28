@@ -2,7 +2,7 @@ import { listConversationSummaries, loadConversationRecord } from "./conversatio
 import { buildCateoApprovalMatrix, type CateoApprovalMatrix } from "./approval_matrix.js";
 import { getCateoControlledTaxonomy, getCateoPartMasterRecord, listCateoPartMasterRecords, type CateoControlledTaxonomySnapshot, type CateoPartMasterRecord } from "./part_master.js";
 import { persistTroubleshootingReportPackage } from "./report_exports.js";
-import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord } from "./store.js";
+import { loadArtifactRecord, loadCaseRecord, listArtifactCatalogRows, listCaseCatalogRows, saveCaseRecord, type ArtifactCatalogRow, type CaseCatalogRow } from "./store.js";
 import type { CateoArtifactRecord, CateoCaseRecord, CateoConfidence, CateoInteractionReleaseStatus, CateoProductOffering, CateoServiceTier, CateoTaskClass, CateoWorkflowMode } from "./types.js";
 import { deriveDeepMetadataFromArtifactMetadata, toProjectedChangeHistory, toProjectedConfigurationFingerprint, toProjectedEffectivityRules, toProjectedExternalSystemLinks, toProjectedObjectMetadata, toProjectedRelationships } from "./cplm_projection.js";
 import { deriveCaseReviewWorkflow, syncCaseReviewPackageFiles } from "./review_workflow.js";
@@ -52,6 +52,7 @@ export interface AdminCaseItem {
   complianceScope: string[];
   riskTier?: string;
   requiresEngineerReview: boolean;
+  reviewStage?: string;
   qualityGates: QualityGateItem[];
 }
 
@@ -142,11 +143,29 @@ function includesFilter(haystack: Array<string | undefined | null>, query: strin
   return text.includes(query);
 }
 
+async function readJsonPayload<T>(response: Response): Promise<T | null> {
+  const raw = await response.text();
+  if (!raw.trim()) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 function hasViewerAccess(record: CateoCaseRecord, viewer: CateoAdminViewer): boolean {
   if (viewer.admin) return true;
   if (viewer.userId && record.userId === viewer.userId) return true;
   if (viewer.profileId && record.requester?.profileId === viewer.profileId) return true;
   if (viewer.requesterId && record.requester?.requesterId === viewer.requesterId) return true;
+  return false;
+}
+
+function hasViewerAccessRow(row: CaseCatalogRow, viewer: CateoAdminViewer): boolean {
+  if (viewer.admin) return true;
+  if (viewer.userId && row.ownerUserId === viewer.userId) return true;
+  if (viewer.profileId && row.profileId === viewer.profileId) return true;
+  if (viewer.requesterId && row.requesterId === viewer.requesterId) return true;
   return false;
 }
 
@@ -251,7 +270,143 @@ function toAdminCaseItem(record: CateoCaseRecord): AdminCaseItem {
     complianceScope: record.input.workflow?.complianceScope ?? [],
     riskTier: record.input.workflow?.riskTier,
     requiresEngineerReview: Boolean(record.interaction?.requiresEngineerReview ?? record.requester?.requiresEngineerReview),
+    reviewStage: record.reviewWorkflow?.stage,
     qualityGates: buildQualityGates(record),
+  };
+}
+
+function effectiveReviewStage(input: { reviewStage?: string; requiresEngineerReview: boolean; releaseStatus?: CateoInteractionReleaseStatus }): string | undefined {
+  if (input.reviewStage) return input.reviewStage;
+  if (!input.requiresEngineerReview) return undefined;
+  return input.releaseStatus === "available" ? "released" : "technical-review";
+}
+
+function buildQualityGatesFromSummary(input: {
+  workflowMode?: CateoWorkflowMode;
+  artifactCount: number;
+  reviewerDecisionStatus?: string;
+  reviewerDecisionSummary?: string;
+  releaseStatus?: CateoInteractionReleaseStatus;
+  requiresEngineerReview: boolean;
+  reviewStage?: string;
+  technicalReviewStatus?: string;
+  technicalReviewNote?: string;
+  qualityReviewStatus?: string;
+  qualityReviewNote?: string;
+}): QualityGateItem[] {
+  const reviewStage = effectiveReviewStage(input);
+  const gates: QualityGateItem[] = [
+    {
+      gateId: "intake",
+      label: "Structured intake",
+      status: "complete",
+      note: input.workflowMode === "reviewed-document" ? "Deterministic reviewed-document request captured." : "Conversational request captured.",
+    },
+    {
+      gateId: "ai-draft",
+      label: "AI draft package",
+      status: input.artifactCount > 0 ? "complete" : "pending",
+      note: input.artifactCount > 0 ? `${input.artifactCount} artifact(s) generated.` : "Awaiting artifact package generation.",
+    },
+    {
+      gateId: "ai-review",
+      label: "Second-agent review",
+      status: input.reviewerDecisionStatus === "needs-revision" ? "blocked" : input.reviewerDecisionSummary ? "complete" : "pending",
+      note: input.reviewerDecisionSummary ?? "Awaiting reviewer stage output.",
+    },
+  ];
+
+  if (reviewStage) {
+    gates.push({
+      gateId: "technical-review",
+      label: "Technical review",
+      status: reviewStage === "technical-review" ? "pending" : "complete",
+      note: input.technicalReviewStatus === "redlined"
+        ? input.technicalReviewNote || "Technical reviewer added redlines and forwarded the package to quality."
+        : reviewStage === "technical-review"
+          ? "Waiting for the technical reviewer to approve or redline the package."
+          : input.technicalReviewNote || "Technical review completed and the package is ready for quality.",
+    });
+    gates.push({
+      gateId: "quality-release",
+      label: "Quality release",
+      status: reviewStage === "released" ? "complete" : reviewStage === "quality-review" ? "pending" : "blocked",
+      note: reviewStage === "released"
+        ? input.qualityReviewNote || "Quality reviewer released the final package."
+        : reviewStage === "quality-review"
+          ? "Ready for quality or admin release."
+          : "Blocked until technical review completes.",
+    });
+  }
+
+  gates.push({
+    gateId: "customer-release",
+    label: "Customer release",
+    status: input.releaseStatus === "available" ? "complete" : input.releaseStatus === "clarification-required" ? "blocked" : reviewStage === "technical-review" ? "blocked" : "pending",
+    note: input.releaseStatus === "available"
+      ? "Visible in the customer workspace."
+      : input.releaseStatus === "clarification-required"
+        ? "Blocked pending additional customer clarification."
+        : reviewStage === "quality-review"
+          ? "Awaiting the quality release decision."
+          : reviewStage === "technical-review"
+            ? "Not available until technical review completes."
+            : "Awaiting release decision.",
+  });
+
+  return gates;
+}
+
+function toAdminCaseItemFromCatalogRow(row: CaseCatalogRow): AdminCaseItem {
+  return {
+    caseId: row.caseId,
+    runId: row.runId,
+    title: row.title,
+    taskClass: row.taskClass as CateoTaskClass,
+    productOffering: row.productOffering as CateoProductOffering | undefined,
+    workflowMode: row.workflowMode as CateoWorkflowMode | undefined,
+    businessType: row.businessType,
+    partNumber: row.partNumber,
+    issueType: row.issueType,
+    serviceTier: row.serviceTier as CateoServiceTier | undefined,
+    releaseStatus: row.releaseStatus as CateoInteractionReleaseStatus | undefined,
+    confidence: row.confidence as CateoConfidence | undefined,
+    assetId: row.assetId,
+    workOrderId: row.workOrderId,
+    conversationId: row.conversationId,
+    requesterId: row.requesterId,
+    userId: row.ownerUserId,
+    profileId: row.profileId,
+    displayName: row.displayName,
+    organization: row.organization,
+    artifactCount: row.artifactIds.length,
+    createdAt: row.createdAt || row.updatedAt,
+    updatedAt: row.updatedAt,
+    interactionSummary: row.interactionSummary,
+    businessJustification: row.businessJustification,
+    drjJustification: row.drjJustification,
+    documentIntent: row.documentIntent,
+    complianceScope: row.complianceScope ?? [],
+    riskTier: row.riskTier,
+    requiresEngineerReview: Boolean(row.requiresEngineerReview),
+    reviewStage: effectiveReviewStage({
+      reviewStage: row.reviewStage,
+      requiresEngineerReview: Boolean(row.requiresEngineerReview),
+      releaseStatus: row.releaseStatus as CateoInteractionReleaseStatus | undefined,
+    }),
+    qualityGates: buildQualityGatesFromSummary({
+      workflowMode: row.workflowMode as CateoWorkflowMode | undefined,
+      artifactCount: row.artifactIds.length,
+      reviewerDecisionStatus: row.reviewerDecisionStatus,
+      reviewerDecisionSummary: row.reviewerDecisionSummary,
+      releaseStatus: row.releaseStatus as CateoInteractionReleaseStatus | undefined,
+      requiresEngineerReview: Boolean(row.requiresEngineerReview),
+      reviewStage: row.reviewStage,
+      technicalReviewStatus: row.technicalReviewStatus,
+      technicalReviewNote: row.technicalReviewNote,
+      qualityReviewStatus: row.qualityReviewStatus,
+      qualityReviewNote: row.qualityReviewNote,
+    }),
   };
 }
 
@@ -287,33 +442,34 @@ function matchesCaseFilters(item: AdminCaseItem, filters: Record<string, string 
 
 export function listAdminCases(filters: Record<string, string | undefined> = {}): AdminCaseItem[] {
   return listCaseCatalogRows()
-    .map((row) => loadCaseRecord(row.caseId))
-    .filter((record): record is CateoCaseRecord => Boolean(record))
-    .map(toAdminCaseItem)
+    .map(toAdminCaseItemFromCatalogRow)
     .filter((item) => matchesCaseFilters(item, filters))
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
 export function listViewerCases(viewer: CateoAdminViewer, filters: Record<string, string | undefined> = {}): AdminCaseItem[] {
   return listCaseCatalogRows()
-    .map((row) => loadCaseRecord(row.caseId))
-    .filter((record): record is CateoCaseRecord => Boolean(record))
-    .filter((record) => hasViewerAccess(record, viewer))
-    .map(toAdminCaseItem)
+    .filter((row) => hasViewerAccessRow(row, viewer))
+    .map(toAdminCaseItemFromCatalogRow)
     .filter((item) => matchesCaseFilters(item, filters))
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
 function latestCaseByConversationId(): Map<string, AdminCaseItem> {
   const map = new Map<string, AdminCaseItem>();
-  for (const item of listAdminCases()) {
-    if (!item.conversationId) continue;
-    const current = map.get(item.conversationId);
+  for (const row of listCaseCatalogRows()) {
+    if (!row.conversationId) continue;
+    const item = toAdminCaseItemFromCatalogRow(row);
+    const current = map.get(row.conversationId);
     if (!current || item.updatedAt > current.updatedAt) {
-      map.set(item.conversationId, item);
+      map.set(row.conversationId, item);
     }
   }
   return map;
+}
+
+function caseCatalogRowMap(): Map<string, CaseCatalogRow> {
+  return new Map(listCaseCatalogRows().map((row) => [row.caseId, row]));
 }
 
 export function listAdminConversations(filters: Record<string, string | undefined> = {}): AdminConversationItem[] {
@@ -351,46 +507,60 @@ export function listAdminConversations(filters: Record<string, string | undefine
     .sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
+function toAdminArtifactItemFromCatalogRow(row: ArtifactCatalogRow, linkedCase?: CaseCatalogRow): AdminArtifactItem {
+  return {
+    artifactId: row.artifactId,
+    artifactType: row.artifactType,
+    title: row.title,
+    summary: row.summary,
+    approvalState: row.approvalState,
+    revisionNumber: row.revisionNumber,
+    updatedAt: row.updatedAt,
+    assetId: row.assetId,
+    workOrderId: row.workOrderId,
+    partNumber: row.partNumber,
+    businessType: row.businessType,
+    issueType: row.issueType,
+    failureCode: row.failureCode,
+    taxonomyTags: row.taxonomyTags,
+    serviceTier: linkedCase?.serviceTier as CateoServiceTier | undefined,
+    workflowMode: linkedCase?.workflowMode as CateoWorkflowMode | undefined,
+    productOffering: linkedCase?.productOffering as CateoProductOffering | undefined,
+    displayName: linkedCase?.displayName,
+    organization: linkedCase?.organization,
+    duplicateState: row.duplicateState,
+    caseId: row.caseId,
+    documentType: row.documentType,
+    lifecycleState: row.lifecycleState,
+    persistentObjectId: row.persistentObjectId,
+    objectMetadata: row.objectMetadata,
+    effectivity: row.effectivity,
+    relationships: row.relationships,
+    externalSystemLinks: row.externalSystemLinks,
+  };
+}
+
 export function listAdminArtifacts(filters: Record<string, string | undefined> = {}): AdminArtifactItem[] {
   const q = normalized(filters.q);
+  const caseRows = caseCatalogRowMap();
   return listArtifactCatalogRows()
     .map((row): AdminArtifactItem | null => {
+      const linkedCase = row.caseId ? caseRows.get(row.caseId) : undefined;
+      const needsHydration = row.title === undefined
+        || row.documentType === undefined
+        || row.objectMetadata === undefined
+        || row.effectivity === undefined
+        || row.relationships === undefined
+        || row.externalSystemLinks === undefined;
+      if (!needsHydration) {
+        return toAdminArtifactItemFromCatalogRow(row, linkedCase);
+      }
       const artifact = loadArtifactRecord(row.artifactId);
-      const latest = artifact?.revisions.at(-1);
-      const linkedCase = row.caseId ? loadCaseRecord(row.caseId) : null;
-      if (!artifact || !latest) {
+      if (!artifact) {
         return null;
       }
-      return {
-        artifactId: row.artifactId,
-        artifactType: row.artifactType,
-        title: latest.metadata?.artifactTitle,
-        summary: latest.summary,
-        approvalState: latest.approvalState,
-        revisionNumber: latest.revisionNumber,
-        updatedAt: row.updatedAt,
-        assetId: row.assetId,
-        workOrderId: row.workOrderId,
-        partNumber: row.partNumber,
-        businessType: row.businessType,
-        issueType: row.issueType,
-        failureCode: row.failureCode,
-        taxonomyTags: row.taxonomyTags,
-        serviceTier: linkedCase?.requester?.serviceTier,
-        workflowMode: linkedCase?.input.workflow?.mode,
-        productOffering: linkedCase?.input.productOffering,
-        displayName: linkedCase?.requester?.displayName,
-        organization: linkedCase?.requester?.organization,
-        duplicateState: row.duplicateState,
-        caseId: row.caseId,
-        documentType: latest.metadata?.documentType,
-        lifecycleState: latest.metadata?.lifecycleState,
-        persistentObjectId: latest.metadata?.objectMetadata?.persistentObjectId,
-        objectMetadata: toProjectedObjectMetadata(latest.metadata),
-        effectivity: toProjectedEffectivityRules(latest.metadata?.effectivity),
-        relationships: toProjectedRelationships(latest.metadata?.relations),
-        externalSystemLinks: toProjectedExternalSystemLinks(latest.metadata?.externalSystemIds),
-      };
+      const hydratedCase = row.caseId ? loadCaseRecord(row.caseId) : null;
+      return toAdminArtifactItemFromRecord(artifact, hydratedCase);
     })
     .filter((item): item is AdminArtifactItem => item !== null)
     .filter((item) => includesFilter([
@@ -437,13 +607,13 @@ export async function fetchRedditReviewQueue(): Promise<AdminRedditReviewEnvelop
       },
       signal: controller.signal,
     });
-    const payload = await response.json() as Array<{ reply_queue_id?: number; reddit_post_id?: string | null; subreddit?: string | null; title?: string | null; status?: string | null; confidence?: number | null; proposed_comment?: string | null }> | { detail?: string };
+    const payload = await readJsonPayload<Array<{ reply_queue_id?: number; reddit_post_id?: string | null; subreddit?: string | null; title?: string | null; status?: string | null; confidence?: number | null; proposed_comment?: string | null }> | { detail?: string }>(response);
     if (!response.ok || !Array.isArray(payload)) {
       return {
         configured: true,
         reachable: false,
         items: [],
-        error: Array.isArray(payload) ? `Reviewer service returned ${response.status}` : payload?.detail || `Reviewer service returned ${response.status}`,
+        error: Array.isArray(payload) ? `Reviewer service returned ${response.status}` : payload?.detail || (payload === null ? "Reviewer service returned an unreadable response" : `Reviewer service returned ${response.status}`),
       };
     }
     return {
@@ -494,20 +664,20 @@ export async function submitRedditReviewDecision(input: { replyQueueId: number; 
       }),
       signal: controller.signal,
     });
-    const payload = await response.json() as { reply_queue_id?: number; review_status?: string; detail?: string };
+    const payload = await readJsonPayload<{ reply_queue_id?: number; review_status?: string; detail?: string }>(response);
     if (!response.ok) {
       return {
         configured: true,
         reachable: false,
-        error: payload?.detail || `Reviewer service returned ${response.status}`,
+        error: payload?.detail || (payload === null ? "Reviewer service returned an unreadable response" : `Reviewer service returned ${response.status}`),
       };
     }
     return {
       configured: true,
       reachable: true,
       item: {
-        replyQueueId: payload.reply_queue_id ?? input.replyQueueId,
-        status: payload.review_status,
+        replyQueueId: payload?.reply_queue_id ?? input.replyQueueId,
+        status: payload?.review_status,
       },
     };
   } catch (error) {
