@@ -176,6 +176,11 @@ function buildConversationState(conversation: NonNullable<ReturnType<typeof load
   const releaseStatus = caseRecord?.interaction?.releaseStatus;
   const pending = Boolean(latestAssistantMessage && (latestAssistantMessage.status === "queued" || latestAssistantMessage.status === "running"));
   const reportAvailable = Boolean(reportPayload?.reportPackage && releaseStatus === "available" && !pending);
+  const latestFeedbackForCurrentOutput = caseRecord
+    ? listProcedureFeedbackForConversation(conversation.conversationId).find((item) => item.caseId === caseRecord.caseId)
+    : undefined;
+  const outputAccepted = Boolean(reportAvailable && latestFeedbackForCurrentOutput?.userAction === "accept");
+  const awaitingUserReview = Boolean(reportAvailable && !outputAccepted);
   const clarificationRequired = releaseStatus === "clarification-required";
   const canRespond = !pending && !reportAvailable && (clarificationRequired || latestAssistantMessage?.status === "failed");
   return {
@@ -184,11 +189,15 @@ function buildConversationState(conversation: NonNullable<ReturnType<typeof load
     releaseStatus,
     pending,
     reportAvailable,
-    closed: reportAvailable,
+    closed: outputAccepted,
     canRespond,
     canDownload: reportAvailable,
-    canLeaveFeedback: reportAvailable,
+    canLeaveFeedback: awaitingUserReview,
     clarificationRequired,
+    awaitingUserReview,
+    outputAccepted,
+    latestFeedbackAction: latestFeedbackForCurrentOutput?.userAction,
+    latestFeedbackAt: latestFeedbackForCurrentOutput?.submittedAt,
     clarifyingQuestion: caseRecord?.interaction?.clarifyingQuestion,
     latestRequestPreview: trimPreview(latestUserMessage?.text, 160),
     latestResponsePreview: trimPreview(latestAssistantMessage?.text || latestAssistantMessage?.error, 220),
