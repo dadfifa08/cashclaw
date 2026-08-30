@@ -11,6 +11,7 @@ import { evaluateArtifactPackageRules, summarizeRuleOutcomes } from "./rules.js"
 import { createRevision, findSimilarArtifacts, fingerprintEvidence, loadArtifactRecord, loadCaseRecord, mergeContentPatch, saveArtifactRecord, saveCaseRecord } from "./store.js";
 import { persistTroubleshootingReportPackage } from "./report_exports.js";
 import { ensureCaseReviewWorkflow, syncCaseReviewPackageFiles } from "./review_workflow.js";
+import { initializeCaseReleaseControl, isCurrentContentReleased } from "./release_policy.js";
 import { getInstructionTemplate, renderInstructionTemplate } from "./templates.js";
 import { ingestMediaAttachments, sanitizeAssistInputForPersistence } from "./media_adapter.js";
 import { buildArtifactEnterpriseMetadata } from "./artifact_metadata.js";
@@ -177,6 +178,23 @@ function normalizeAssistInput(input: CateoAssistInput): CateoAssistInput {
     contextNotes: input.contextNotes?.trim() || undefined,
     workflow,
     symptomDescription,
+    conversationContext: input.conversationContext
+      ? {
+          schemaVersion: "cateo-transcript-v1",
+          conversationId: input.conversationContext.conversationId.trim().slice(0, 128),
+          maxTurns: Math.min(24, Math.max(2, input.conversationContext.maxTurns || 16)),
+          maxCharacters: Math.min(20_000, Math.max(1_000, input.conversationContext.maxCharacters || 12_000)),
+          truncated: Boolean(input.conversationContext.truncated),
+          turns: input.conversationContext.turns.slice(-24).map((turn) => ({
+            messageId: turn.messageId.slice(0, 128),
+            role: turn.role,
+            kind: turn.kind,
+            content: turn.content.slice(0, 4_000),
+            occurredAt: turn.occurredAt,
+          })),
+          pendingClarification: input.conversationContext.pendingClarification?.slice(0, 500),
+        }
+      : undefined,
   };
 }
 
@@ -263,6 +281,14 @@ function buildPromptPayload(input: CateoAssistInput, context: CateoContextBundle
       symptomDescription: input.symptomDescription,
       observedConditions: input.observedConditions ?? [],
       requestedArtifacts: route.requestedArtifacts,
+      conversationTranscript: input.conversationContext
+        ? {
+            schemaVersion: input.conversationContext.schemaVersion,
+            truncated: input.conversationContext.truncated,
+            turns: input.conversationContext.turns.map((turn) => ({ role: turn.role, kind: turn.kind, content: turn.content })),
+            pendingClarification: input.conversationContext.pendingClarification,
+          }
+        : undefined,
     },
     context: {
       caseId: context.caseId,
@@ -1194,10 +1220,16 @@ export async function findMatchingValidatedProcedure(
   }
 
   const sourceCase = loadCaseRecord(best.candidate.caseId);
-  const relatedArtifacts: CateoArtifactRecord[] = (sourceCase?.artifacts ?? [best.artifact.artifactId])
+  if (!sourceCase) {
+    return null;
+  }
+  const sourceArtifacts = sourceCase.artifacts
     .map((artifactId: string) => loadArtifactRecord(artifactId))
-    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact))
-    .filter((artifact) => {
+    .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+  if (!isCurrentContentReleased(sourceCase, sourceArtifacts)) {
+    return null;
+  }
+  const relatedArtifacts: CateoArtifactRecord[] = sourceArtifacts.filter((artifact) => {
       const latest = artifact.revisions.at(-1);
       const part = normalizedText(latest?.metadata?.parts?.primaryPartNumber || latest?.metadata?.partNumber);
       const requestedPart = normalizedText(context.partResolution?.partNumber || sanitizedInput.partNumber);
@@ -1213,7 +1245,7 @@ export async function findMatchingValidatedProcedure(
 
 ${interaction.message}`;
   interaction.highlights = uniqueStrings([
-    `Matched validated procedure ${best.artifact.artifactId} for ${context.partResolution?.partNumber}.`,
+    `Matched the reviewed procedure for ${context.partResolution?.partNumber}.`,
     ...interaction.highlights,
   ]);
   interaction.releaseStatus = "available";
@@ -1609,7 +1641,7 @@ export async function generateCateoArtifacts(
       const runId = crypto.randomUUID();
       const usage = buildUsageSummary(stageUsages);
       const interaction = {
-        message: partResolution.clarifyingQuestion || "I need the exact manufacturer part number before I can generate the engineering package.",
+        message: partResolution.clarifyingQuestion || "I need the exact manufacturer part number before I can provide the next safe troubleshooting step.",
         highlights: uniqueStrings([
           partResolution.partNumber ? `Candidate part number: ${partResolution.partNumber}` : undefined,
           ...partResolution.evidence.slice(0, 3),
@@ -2016,7 +2048,7 @@ export async function generateCateoArtifacts(
     const ruleSummary = summarizeRuleOutcomes(ruleResults);
     const ruleMessages = ruleResults.filter((entry) => entry.outcome !== "pass").map((entry) => `${entry.ruleId}: ${entry.message}`);
     const escalatedByRules = ruleResults.some((entry) => entry.outcome === "escalate");
-    const requiresEngineerReview = false;
+    const requiresEngineerReview = true;
 
     validationAttempts.push({
       stage: "reviewer",
@@ -2170,7 +2202,7 @@ export async function generateCateoArtifacts(
           toolCalls: [],
         },
       });
-      const approvalState = reviewerDecision.approvedArtifactTypes.includes(draft.artifactType) ? reviewerDecision.approvalState : "draft";
+      const approvalState = "draft" as const;
       const lookupText = [
         sanitizedInput.symptomDescription,
         sanitizedInput.errorCode,
@@ -2349,11 +2381,6 @@ export async function generateCateoArtifacts(
     if (requiresEngineerReview) {
       interaction.releaseStatus = "pending-engineer-review";
       interaction.requiresEngineerReview = true;
-      interaction.message = `${interaction.message}\n\nThis customer tier includes manual engineer validation. Cateo created the artifact package and queued it for sign-off before release to the profile and download catalog.`;
-      interaction.nextActions = uniqueStrings([
-        ...interaction.nextActions,
-        "Wait for manual engineer validation before downloading the final artifact package.",
-      ]);
     }
     const trace = {
       route,
@@ -2411,6 +2438,7 @@ export async function generateCateoArtifacts(
       trace,
     };
 
+    initializeCaseReleaseControl(caseRecord, artifacts);
     ensureCaseReviewWorkflow(caseRecord, artifacts);
 
     try {

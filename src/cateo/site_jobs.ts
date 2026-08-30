@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
-import { loadConfig } from "../config.js";
+import path from "node:path";
+import { getConfigDir, loadConfig } from "../config.js";
 import { createModelRuntime } from "../llm/runtime.js";
 import { appendAuditEvent } from "../security/audit.js";
+import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
 import { getCateoUsageFromError, generateCateoArtifacts } from "./service.js";
 import { settlePilotQuota, type CateoProfileSnapshot } from "./profiles.js";
 import type { CateoAssistInput, CateoInteractionCheckpoint } from "./types.js";
@@ -11,6 +13,7 @@ const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ESTIMATED_DURATION_MS = 2 * 60 * 1000;
 const MIN_RUNNING_REMAINING_MS = 10 * 1000;
 const MAX_DURATION_SAMPLES = 25;
+const JOB_STORE_VERSION = "cateo-site-jobs-v1";
 
 export type AssistJobStatus = "queued" | "running" | "completed" | "failed";
 export type AssistJobResult = Awaited<ReturnType<typeof generateCateoArtifacts>>;
@@ -39,10 +42,21 @@ interface AssistJobRecord {
   profileEmailHash?: string;
   profileServiceTier?: CateoProfileSnapshot["serviceTier"];
   requiresEngineerReview?: boolean;
+  idempotencyKey?: string;
+}
+
+interface AssistJobStoreFile {
+  version: string;
+  updatedAt: string;
+  records: AssistJobRecord[];
+  queue: string[];
+  completedDurationsMs: number[];
+  nextAcceptedSequence: number;
 }
 
 export interface AssistJobSnapshot {
   jobId: string;
+  conversationId?: string;
   requesterId: string;
   profileId?: string;
   acceptedSequence: number;
@@ -107,6 +121,11 @@ let draining = false;
 let drainTimer: NodeJS.Timeout | null = null;
 let nextAcceptedSequence = 1;
 let nextEventId = 1;
+let initialized = false;
+
+function jobStorePath(): string {
+  return path.join(getConfigDir(), "cateo", "db", "site_jobs.json");
+}
 
 function deriveTitle(input: CateoAssistInput): string {
   const title = input.title?.trim();
@@ -169,6 +188,51 @@ function createCheckpoint(args: {
   };
 }
 
+function persistJobs(): void {
+  if (!initialized) return;
+  writeProtectedJson(jobStorePath(), {
+    version: JOB_STORE_VERSION,
+    updatedAt: new Date().toISOString(),
+    records: [...jobs.values()],
+    queue: [...queue],
+    completedDurationsMs: [...completedDurationsMs],
+    nextAcceptedSequence,
+  } satisfies AssistJobStoreFile);
+}
+
+function ensureJobsLoaded(): void {
+  if (initialized) return;
+  initialized = true;
+  const stored = readProtectedJson<AssistJobStoreFile>(jobStorePath(), {
+    version: JOB_STORE_VERSION,
+    updatedAt: new Date(0).toISOString(),
+    records: [],
+    queue: [],
+    completedDurationsMs: [],
+    nextAcceptedSequence: 1,
+  });
+  let recovered = false;
+  for (const source of stored.records ?? []) {
+    const record: AssistJobRecord = { ...source, checkpoints: [...(source.checkpoints ?? [])] };
+    if (record.status === "queued" || record.status === "running") {
+      const now = Date.now();
+      record.status = "failed";
+      record.error = "This request was interrupted before completion. Please send it again.";
+      record.finishedAt = now;
+      record.updatedAt = now;
+      record.input = undefined;
+      record.checkpoints.push(createCheckpoint({ stage: "failed", status: "failed", summary: "The previous process stopped before this request completed." }));
+      recovered = true;
+    }
+    jobs.set(record.jobId, record);
+  }
+  completedDurationsMs.push(...(stored.completedDurationsMs ?? []).slice(-MAX_DURATION_SAMPLES));
+  nextAcceptedSequence = Math.max(stored.nextAcceptedSequence ?? 1, ...[...jobs.values()].map((record) => record.acceptedSequence + 1), 1);
+  if (recovered || (stored.queue ?? []).length > 0) {
+    persistJobs();
+  }
+}
+
 function latestCheckpoint(record: AssistJobRecord): CateoInteractionCheckpoint | undefined {
   return record.checkpoints[record.checkpoints.length - 1];
 }
@@ -194,15 +258,19 @@ function rememberDuration(durationMs: number): void {
 }
 
 function compactJobs(): void {
+  ensureJobsLoaded();
+  let changed = false;
   const now = Date.now();
   for (const [jobId, record] of jobs) {
     if (record.finishedAt && now - record.finishedAt > JOB_TTL_MS) {
       jobs.delete(jobId);
       listeners.delete(jobId);
+      changed = true;
     }
   }
 
   if (jobs.size <= MAX_JOBS) {
+    if (changed) persistJobs();
     return;
   }
 
@@ -215,7 +283,9 @@ function compactJobs(): void {
     if (!record) break;
     jobs.delete(record.jobId);
     listeners.delete(record.jobId);
+    changed = true;
   }
+  if (changed) persistJobs();
 }
 
 function getRunningRecord(): AssistJobRecord | null {
@@ -303,6 +373,7 @@ function snapshot(record: AssistJobRecord, context = buildSnapshotContext()): As
   const metrics = buildPendingMetrics(record, context);
   return {
     jobId: record.jobId,
+    conversationId: record.input?.conversationContext?.conversationId,
     requesterId: record.requesterId,
     profileId: record.profileId,
     acceptedSequence: record.acceptedSequence,
@@ -347,10 +418,12 @@ function emitJobEvent(record: AssistJobRecord, type: AssistJobEventType, checkpo
 function recordCheckpoint(record: AssistJobRecord, checkpoint: CateoInteractionCheckpoint, emitType: AssistJobEventType = "checkpoint"): void {
   record.checkpoints.push(checkpoint);
   record.updatedAt = Date.now();
+  persistJobs();
   emitJobEvent(record, emitType, checkpoint);
 }
 
 async function runNextJob(): Promise<void> {
+  ensureJobsLoaded();
   const jobId = queue.shift();
   if (!jobId) {
     return;
@@ -364,6 +437,7 @@ async function runNextJob(): Promise<void> {
   record.status = "running";
   record.startedAt = Date.now();
   record.updatedAt = record.startedAt;
+  persistJobs();
   emitJobEvent(record, "snapshot");
   appendAuditEvent({
     actor: "server",
@@ -394,6 +468,7 @@ async function runNextJob(): Promise<void> {
         emailHash: record.profileEmailHash,
         serviceTier: record.profileServiceTier,
         requiresEngineerReview: record.requiresEngineerReview,
+        conversationId: record.input.conversationContext?.conversationId,
       } : undefined,
       onCheckpoint: (checkpoint) => {
         recordCheckpoint(record, checkpoint, "checkpoint");
@@ -409,6 +484,7 @@ async function runNextJob(): Promise<void> {
     if (config && record.profileId) {
       settlePilotQuota(config, record.profileId, record.quotaReservationId, result.usage, "completed", record.requestId);
     }
+    persistJobs();
     emitJobEvent(record, "completed");
     appendAuditEvent({
       actor: "server",
@@ -450,6 +526,7 @@ async function runNextJob(): Promise<void> {
     });
   } finally {
     record.input = undefined;
+    persistJobs();
   }
 }
 
@@ -464,6 +541,7 @@ function scheduleDrain(): void {
 }
 
 async function drainQueue(): Promise<void> {
+  ensureJobsLoaded();
   if (draining) {
     return;
   }
@@ -483,9 +561,13 @@ export function submitCompletedAssistJob(
   result: AssistJobResult,
   requesterId: string,
   requestId?: string,
-  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean; statusDetail?: string },
+  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean; statusDetail?: string; idempotencyKey?: string },
 ): AssistJobSnapshot {
   compactJobs();
+  const existing = options?.idempotencyKey
+    ? [...jobs.values()].find((record) => record.requesterId === requesterId && record.idempotencyKey === options.idempotencyKey)
+    : undefined;
+  if (existing) return snapshot(existing);
   const now = Date.now();
   const jobId = crypto.randomUUID();
   const acceptedSequence = nextAcceptedSequence;
@@ -523,10 +605,12 @@ export function submitCompletedAssistJob(
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
     profileServiceTier: options?.profile?.serviceTier,
-    requiresEngineerReview: options?.requiresEngineerReview ?? false,
+    requiresEngineerReview: options?.requiresEngineerReview ?? true,
+    idempotencyKey: options?.idempotencyKey,
   };
 
   jobs.set(jobId, record);
+  persistJobs();
   appendAuditEvent({
     actor: "server",
     category: "site_job",
@@ -543,9 +627,13 @@ export function submitAssistJob(
   input: CateoAssistInput,
   requesterId: string,
   requestId?: string,
-  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean },
+  options?: { profile?: CateoProfileSnapshot; quotaReservationId?: string; requiresEngineerReview?: boolean; idempotencyKey?: string },
 ): AssistJobSnapshot {
   compactJobs();
+  const existing = options?.idempotencyKey
+    ? [...jobs.values()].find((record) => record.requesterId === requesterId && record.idempotencyKey === options.idempotencyKey)
+    : undefined;
+  if (existing) return snapshot(existing);
   const now = Date.now();
   const jobId = crypto.randomUUID();
   const acceptedSequence = nextAcceptedSequence;
@@ -572,11 +660,13 @@ export function submitAssistJob(
     profileDisplayName: options?.profile?.displayName,
     profileOrganization: options?.profile?.organization,
     profileServiceTier: options?.profile?.serviceTier,
-    requiresEngineerReview: options?.requiresEngineerReview ?? false,
+    requiresEngineerReview: options?.requiresEngineerReview ?? true,
+    idempotencyKey: options?.idempotencyKey,
   };
 
   jobs.set(jobId, record);
   queue.push(jobId);
+  persistJobs();
   appendAuditEvent({
     actor: "server",
     category: "site_job",
@@ -601,6 +691,12 @@ export function getAssistJob(jobId: string, requesterId?: string): AssistJobSnap
     return null;
   }
   return snapshot(record);
+}
+
+export function getAssistJobByIdempotency(requesterId: string, idempotencyKey: string): AssistJobSnapshot | null {
+  compactJobs();
+  const record = [...jobs.values()].find((candidate) => candidate.requesterId === requesterId && candidate.idempotencyKey === idempotencyKey);
+  return record ? snapshot(record) : null;
 }
 
 export function listAssistBacklog(requesterId: string): AssistBacklogSnapshot {

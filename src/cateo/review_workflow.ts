@@ -16,14 +16,6 @@ interface ReviewDocumentFile {
   uploadedBy?: string;
 }
 
-function hasReviewerSignoff(artifacts: CateoArtifactRecord[]): boolean {
-  return artifacts.some((artifact) => artifact.revisions.some((revision) => revision.signoffs.some((signoff) => signoff.state === "reviewed" || /review/i.test(signoff.role) || /review/i.test(signoff.meaning))));
-}
-
-function hasApprovedSignoff(artifacts: CateoArtifactRecord[]): boolean {
-  return artifacts.some((artifact) => artifact.revisions.some((revision) => revision.signoffs.some((signoff) => signoff.state === "approved")) || artifact.revisions.at(-1)?.approvalState === "approved");
-}
-
 function normalizeStoredFile(file: CateoStoredReviewFile | undefined): CateoStoredReviewFile | undefined {
   if (!file) {
     return undefined;
@@ -49,52 +41,47 @@ function blankWorkflow(stage: CateoCaseReviewWorkflow["stage"]): CateoCaseReview
 
 export function caseRequiresControlledReview(record: CateoCaseRecord): boolean {
   return Boolean(
-    record.reviewWorkflow
+    record.releaseControl
+    || record.reviewWorkflow
     || record.interaction?.requiresEngineerReview
     || record.interaction?.releaseStatus === "pending-engineer-review",
   );
 }
 
 export function deriveCaseReviewWorkflow(record: CateoCaseRecord, artifacts: CateoArtifactRecord[] = []): CateoCaseReviewWorkflow | null {
-  if (record.reviewWorkflow) {
+  if (record.reviewWorkflow || record.releaseControl) {
+    const controlledStage: CateoCaseReviewWorkflow["stage"] = record.releaseControl?.state === "APPROVED"
+      ? "released"
+      : record.releaseControl?.state === "TECHNICAL_REVIEWED"
+        ? "quality-review"
+        : "technical-review";
+    const prior = record.reviewWorkflow;
     return {
-      stage: record.reviewWorkflow.stage,
+      stage: controlledStage,
       packageFiles: {
-        generatedWord: normalizeStoredFile(record.reviewWorkflow.packageFiles.generatedWord),
-        generatedPdf: normalizeStoredFile(record.reviewWorkflow.packageFiles.generatedPdf),
+        generatedWord: normalizeStoredFile(prior?.packageFiles.generatedWord),
+        generatedPdf: normalizeStoredFile(prior?.packageFiles.generatedPdf),
       },
       technical: {
-        status: record.reviewWorkflow.technical?.status ?? (record.reviewWorkflow.stage === "technical-review" ? "pending" : "approved"),
-        reviewerUserId: record.reviewWorkflow.technical?.reviewerUserId,
-        reviewerDisplayName: record.reviewWorkflow.technical?.reviewerDisplayName,
-        note: record.reviewWorkflow.technical?.note,
-        decidedAt: record.reviewWorkflow.technical?.decidedAt,
-        redlineFile: normalizeStoredFile(record.reviewWorkflow.technical?.redlineFile),
+        status: controlledStage === "technical-review" ? (record.releaseControl?.state === "REJECTED" ? "redlined" : "pending") : "approved",
+        reviewerUserId: prior?.technical?.reviewerUserId,
+        reviewerDisplayName: prior?.technical?.reviewerDisplayName,
+        note: prior?.technical?.note,
+        decidedAt: prior?.technical?.decidedAt,
+        redlineFile: normalizeStoredFile(prior?.technical?.redlineFile),
       },
       quality: {
-        status: record.reviewWorkflow.quality?.status ?? (record.reviewWorkflow.stage === "released" ? "released" : "pending"),
-        reviewerUserId: record.reviewWorkflow.quality?.reviewerUserId,
-        reviewerDisplayName: record.reviewWorkflow.quality?.reviewerDisplayName,
-        note: record.reviewWorkflow.quality?.note,
-        decidedAt: record.reviewWorkflow.quality?.decidedAt,
+        status: controlledStage === "released" ? "released" : "pending",
+        reviewerUserId: prior?.quality?.reviewerUserId,
+        reviewerDisplayName: prior?.quality?.reviewerDisplayName,
+        note: prior?.quality?.note,
+        decidedAt: prior?.quality?.decidedAt,
       },
     };
   }
 
   if (!caseRequiresControlledReview(record)) {
     return null;
-  }
-
-  if (record.interaction?.releaseStatus === "available" || hasApprovedSignoff(artifacts)) {
-    const workflow = blankWorkflow("released");
-    workflow.quality.status = "released";
-    return workflow;
-  }
-
-  if (hasReviewerSignoff(artifacts)) {
-    const workflow = blankWorkflow("quality-review");
-    workflow.technical.status = "approved";
-    return workflow;
   }
 
   return blankWorkflow("technical-review");

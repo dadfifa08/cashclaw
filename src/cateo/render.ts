@@ -241,7 +241,8 @@ export function renderCateoInteraction(artifacts: CateoArtifactRecord[], options
     detailLevel,
     sections,
     artifactPreviews: buildArtifactPreviews(artifacts),
-    releaseStatus: "available",
+    releaseStatus: "pending-engineer-review",
+    requiresEngineerReview: true,
     renderedAt: new Date().toISOString(),
     rendererVersion: RENDERER_VERSION,
   };

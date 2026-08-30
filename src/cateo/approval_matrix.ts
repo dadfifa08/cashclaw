@@ -57,14 +57,6 @@ export function deriveCateoDocumentClass(record: CateoCaseRecord): CateoDocument
   return record.input.workflow?.mode === "reviewed-document" ? "reviewed-engineering-document" : "conversational-assist";
 }
 
-function hasApprovedSignoff(artifacts: CateoArtifactRecord[]): boolean {
-  return artifacts.some((artifact) => artifact.revisions.some((revision) => revision.signoffs.some((signoff) => signoff.state === "approved")));
-}
-
-function hasReviewerSignoff(artifacts: CateoArtifactRecord[]): boolean {
-  return artifacts.some((artifact) => artifact.revisions.some((revision) => revision.signoffs.some((signoff) => signoff.state === "reviewed" || /review/i.test(signoff.role) || /review/i.test(signoff.meaning))));
-}
-
 function artifactsReadyForManualReview(artifacts: CateoArtifactRecord[]): boolean {
   return artifacts.length > 0 && artifacts.every((artifact) => {
     const latest = artifact.revisions.at(-1);
@@ -72,20 +64,13 @@ function artifactsReadyForManualReview(artifacts: CateoArtifactRecord[]): boolea
   });
 }
 
-function requiresHumanReview(args: { workflowMode: CateoWorkflowMode; serviceTier: CateoServiceTier; riskTier: CateoRiskTier; documentClass: CateoDocumentClass }): boolean {
-  return args.workflowMode === "reviewed-document"
-    || args.serviceTier !== "free"
-    || args.riskTier !== "low"
-    || args.documentClass !== "conversational-assist";
+function requiresHumanReview(_args: { workflowMode: CateoWorkflowMode; serviceTier: CateoServiceTier; riskTier: CateoRiskTier; documentClass: CateoDocumentClass }): boolean {
+  return true;
 }
 
 function requiresQaApproval(args: { riskTier: CateoRiskTier; documentClass: CateoDocumentClass }): boolean {
-  return args.riskTier === "high"
-    || args.riskTier === "critical"
-    || args.documentClass === "validation-protocol"
-    || args.documentClass === "audit-package"
-    || args.documentClass === "deviation-investigation"
-    || args.documentClass === "risk-analysis";
+  void args;
+  return true;
 }
 
 function requiresElectronicSignature(args: { riskTier: CateoRiskTier; documentClass: CateoDocumentClass }): boolean {
@@ -107,8 +92,8 @@ export function buildCateoApprovalMatrix(record: CateoCaseRecord, artifacts: Cat
   const humanReviewRequired = requiresHumanReview({ workflowMode, serviceTier, riskTier, documentClass });
   const qaRequired = requiresQaApproval({ riskTier, documentClass });
   const esignRequired = requiresElectronicSignature({ riskTier, documentClass });
-  const manualReviewComplete = hasReviewerSignoff(artifacts) || releaseStatus === "available";
-  const qaApprovalComplete = hasApprovedSignoff(artifacts) || releaseStatus === "available";
+  const manualReviewComplete = record.releaseControl?.state === "TECHNICAL_REVIEWED" || record.releaseControl?.state === "APPROVED";
+  const qaApprovalComplete = record.releaseControl?.state === "APPROVED";
   const partResolved = Boolean(record.context.partResolution?.partNumber ?? record.input.partNumber);
   const steps: CateoApprovalMatrixStep[] = [
     {

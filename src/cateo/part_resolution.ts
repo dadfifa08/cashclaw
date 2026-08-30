@@ -5,11 +5,8 @@ import type { CateoAssistInput, CateoPartCatalogEntry, CateoPartResolution, Cate
 const PART_NUMBER_PATTERN = /\b[A-Z0-9]{2,}(?:[-_/][A-Z0-9]{2,})+[A-Z0-9-_/]*\b/g;
 const SOURCE_LIMIT = 12;
 const SEARCH_QUERY_LIMIT = 10;
-const SEARCH_MODEL_CANDIDATES = [
-  process.env.CATEO_PART_SEARCH_MODEL?.trim(),
-  "gpt-4o-mini-search-preview",
-  "gpt-4.1-mini",
-].filter((value): value is string => Boolean(value));
+const DEFAULT_OPENAI_TIMEOUT_MS = 25_000;
+const CURRENT_SEARCH_FALLBACK_MODEL = "gpt-5.4-mini";
 
 interface RawVerifiedSource {
   title?: string | null;
@@ -43,6 +40,42 @@ interface RawPartResolution {
 const unique = (values: Array<string | undefined | null>) => [
   ...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))),
 ];
+
+function searchModelCandidates(config: CashClawConfig): string[] {
+  return unique([
+    process.env.CATEO_PART_SEARCH_MODEL,
+    config.pilot?.hostedRoleModels?.lead,
+    config.llm.model,
+    CURRENT_SEARCH_FALLBACK_MODEL,
+  ]);
+}
+
+function openAIRequestTimeoutMs(): number {
+  const configured = Number(process.env.CATEO_OPENAI_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured < 1_000) {
+    return DEFAULT_OPENAI_TIMEOUT_MS;
+  }
+  return Math.min(120_000, Math.round(configured));
+}
+
+async function fetchOpenAIResponse(init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutMs = openAIRequestTimeoutMs();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch("https://api.openai.com/v1/responses", {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`OpenAI research request timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function clampConfidence(value: unknown, fallback: number): number {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -160,7 +193,7 @@ function heuristicResolution(input: CateoAssistInput): CateoPartResolution {
     confidencePct: confidenceBase,
     needsClarification: !partNumber || confidenceBase < 80,
     clarifyingQuestion: !partNumber || confidenceBase < 80
-      ? "I need the exact manufacturer part number before I can build the controlled artifact package. What part number or nameplate marking is on the component?"
+      ? "I need the exact manufacturer part number before I can provide the next safe troubleshooting step. What part number or nameplate marking is on the component?"
       : undefined,
     evidence: unique([
       partNumber ? `Detected candidate part number ${partNumber} in the submitted context.` : undefined,
@@ -278,14 +311,15 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
     Authorization: `Bearer ${config.llm.apiKey}`,
   };
 
-  for (const model of SEARCH_MODEL_CANDIDATES) {
+  for (const model of searchModelCandidates(config)) {
     try {
-      const response = await fetch("https://api.openai.com/v1/responses", {
+      const response = await fetchOpenAIResponse({
         method: "POST",
         headers,
         body: JSON.stringify({
           model,
-          tools: [{ type: "web_search_preview" }],
+          tools: [{ type: "web_search" }],
+          store: false,
           max_output_tokens: 1800,
           text: {
             format: {
@@ -374,7 +408,7 @@ async function searchWithOpenAI(config: CashClawConfig, input: CateoAssistInput,
       });
 
       if (!response.ok) {
-        throw new Error(`OpenAI part search failed for ${model}: ${response.status} ${await response.text()}`);
+        throw new Error(`OpenAI part search failed for ${model} with status ${response.status}.`);
       }
 
       const payload = await response.json() as Record<string, unknown>;
@@ -443,14 +477,15 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
     "Do not change the part number. Keep sources diverse and do not return empty verifiedSources unless the web search genuinely failed.",
   ].filter(Boolean).join("\n\n");
 
-  for (const model of SEARCH_MODEL_CANDIDATES) {
+  for (const model of searchModelCandidates(config)) {
     try {
-      const response = await fetch("https://api.openai.com/v1/responses", {
+      const response = await fetchOpenAIResponse({
         method: "POST",
         headers,
         body: JSON.stringify({
           model,
-          tools: [{ type: "web_search_preview" }],
+          tools: [{ type: "web_search" }],
+          store: false,
           max_output_tokens: 1500,
           text: {
             format: {
@@ -505,7 +540,7 @@ async function backfillVerifiedSources(config: CashClawConfig, input: CateoAssis
       });
 
       if (!response.ok) {
-        throw new Error(`OpenAI source backfill failed for ${model}: ${response.status} ${await response.text()}`);
+        throw new Error(`OpenAI source backfill failed for ${model} with status ${response.status}.`);
       }
 
       const payload = await response.json() as Record<string, unknown>;

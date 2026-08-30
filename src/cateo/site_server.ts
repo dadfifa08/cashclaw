@@ -6,7 +6,7 @@ import { handleCateoInternalApi, INTERNAL_CATEO_PREFIX } from "./http_api.js";
 import { handleCateoSitePublicApi } from "./public_api.js";
 import { createInternalRequestVerifier, getInternalServiceToken } from "../system/service_auth.js";
 import { readRequestBody } from "../system/request_body.js";
-import { getAssistJob, listAssistBacklog, submitAssistJob, submitCompletedAssistJob, subscribeAssistJob } from "./site_jobs.js";
+import { getAssistJob, getAssistJobByIdempotency, listAssistBacklog, submitAssistJob, submitCompletedAssistJob, subscribeAssistJob } from "./site_jobs.js";
 import type { AssistBacklogSnapshot, AssistJobEvent, AssistJobSnapshot } from "./site_jobs.js";
 import { CateoPilotQuotaError, getPilotProfile, reservePilotQuota, settlePilotQuota, upsertPilotProfile, type CateoProfileSnapshot } from "./profiles.js";
 import { findMatchingValidatedProcedure } from "./service.js";
@@ -18,6 +18,7 @@ const JOBS_PREFIX = `${INTERNAL_CATEO_PREFIX}/jobs/assist`;
 const JOB_STREAM_SUFFIX = "/stream";
 const REQUESTER_HEADER = "x-cateo-client-id";
 const PROFILE_HEADER = "x-cateo-profile-id";
+const IDEMPOTENCY_HEADER = "x-cateo-idempotency-key";
 const REQUESTER_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const PROFILE_ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const SSE_KEEPALIVE_MS = 15000;
@@ -58,6 +59,7 @@ interface PublicChatResponse {
 
 interface PublicQueueJob {
   jobId: string;
+  conversationId?: string;
   requesterId: string;
   acceptedSequence: number;
   title: string;
@@ -200,6 +202,13 @@ function getProfileId(req: http.IncomingMessage): string | null {
   return PROFILE_ID_PATTERN.test(profileId) ? profileId : null;
 }
 
+function getIdempotencyKey(req: http.IncomingMessage): string | undefined {
+  const header = req.headers[IDEMPOTENCY_HEADER];
+  const raw = Array.isArray(header) ? header[0] : header;
+  const value = raw?.trim();
+  return value && REQUESTER_ID_PATTERN.test(value) ? value : undefined;
+}
+
 function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | undefined {
   const result = job.result;
   if (!result) {
@@ -214,8 +223,8 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
       nextActions: result.interaction.nextActions ?? [],
       confidence: result.interaction.confidence ?? "medium",
       artifactCount: result.interaction.artifactCount ?? result.artifacts.length,
-      releaseStatus: result.interaction.releaseStatus === "clarification-required" ? "clarification-required" : "available",
-      requiresEngineerReview: false,
+      releaseStatus: result.interaction.releaseStatus,
+      requiresEngineerReview: result.interaction.requiresEngineerReview,
       clarifyingQuestion: result.interaction.clarifyingQuestion,
       detailLevel: result.interaction.detailLevel,
       sections: result.interaction.sections,
@@ -242,6 +251,7 @@ function toPublicChatResponse(job: AssistJobSnapshot): PublicChatResponse | unde
 function toPublicJob(job: AssistJobSnapshot): PublicQueueJob {
   return {
     jobId: job.jobId,
+    conversationId: job.conversationId,
     requesterId: job.requesterId,
     acceptedSequence: job.acceptedSequence,
     title: job.title,
@@ -488,14 +498,7 @@ export async function startCateoSiteBridge(
       try {
         if (url.pathname === "/healthz") {
           const config = loadConfig();
-          json(res, {
-            ok: true,
-            configured: !!config,
-            internalApiPrefix: INTERNAL_CATEO_PREFIX,
-            jobsPrefix: JOBS_PREFIX,
-            localOnlyListener: settings.baseUrl,
-            pilotEnabled: config ? getPilotConfig(config).enabled : false,
-          });
+          json(res, { ok: true, configured: !!config });
           return;
         }
 
@@ -563,6 +566,13 @@ export async function startCateoSiteBridge(
           }
 
           try {
+            const idempotencyKey = getIdempotencyKey(req);
+            const priorJob = idempotencyKey ? getAssistJobByIdempotency(requesterId, idempotencyKey) : null;
+            if (priorJob) {
+              const backlog = listAssistBacklog(requesterId);
+              json(res, { ok: true, message: summarizeQueueJob(priorJob), job: toPublicJob(priorJob), backlog: toPublicBacklog(backlog), profile: currentProfileSnapshot(priorJob.profileId, requesterId) ?? sessionProfile }, priorJob.status === "completed" ? 200 : 202);
+              return;
+            }
             assertSubmissionAllowed(requesterId, req.socket.remoteAddress ?? undefined);
             const reservation = reservePilotQuota(config, sessionProfile.profileId, requesterId, requestId);
             try {
@@ -575,15 +585,17 @@ export async function startCateoSiteBridge(
                   displayName: reservation.profile.displayName,
                   organization: reservation.profile.organization,
                   serviceTier: reservation.profile.serviceTier,
-                  requiresEngineerReview: false,
+                  requiresEngineerReview: true,
+                  conversationId: body.conversationContext?.conversationId,
                 },
               });
               if (immediate) {
                 const job = submitCompletedAssistJob(body, immediate, requesterId, requestId, {
                   profile: reservation.profile,
                   quotaReservationId: reservation.reservationId,
-                  requiresEngineerReview: false,
+                  requiresEngineerReview: true,
                   statusDetail: "Validated troubleshooting procedure returned immediately from the internal catalog.",
+                  idempotencyKey,
                 });
                 settlePilotQuota(config, reservation.profile.profileId, reservation.reservationId, { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, "completed", requestId);
                 noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
@@ -595,6 +607,8 @@ export async function startCateoSiteBridge(
               const job = submitAssistJob(body, requesterId, requestId, {
                 profile: reservation.profile,
                 quotaReservationId: reservation.reservationId,
+                requiresEngineerReview: true,
+                idempotencyKey,
               });
               noteSubmission(requesterId, req.socket.remoteAddress ?? undefined);
               const backlog = listAssistBacklog(requesterId);

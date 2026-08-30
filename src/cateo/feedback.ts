@@ -3,7 +3,8 @@ import path from "node:path";
 import { getConfigDir } from "../config.js";
 import { appendAuditEvent } from "../security/audit.js";
 import { readProtectedJson, writeProtectedJson } from "../security/secure_store.js";
-import { createRevision, loadArtifactRecord, loadCaseRecord, saveCaseRecord } from "./store.js";
+import { loadArtifactRecord, loadCaseRecord, saveCaseRecord } from "./store.js";
+import { recordCustomerRejection } from "./release_policy.js";
 import type {
   CateoArtifactRecord,
   CateoProcedureFeedbackDecision,
@@ -13,7 +14,6 @@ import type {
 } from "./types.js";
 
 const FEEDBACK_DB_VERSION = "cateo-feedback-v1";
-const AUTO_APPLY_ACTOR = "Cateo crowdsource pipeline";
 
 interface FeedbackStoreFile {
   version: string;
@@ -58,10 +58,6 @@ function contributorLabel(record: CateoProcedureFeedbackRecord): string | undefi
   return record.submitterName || (record.submitterUsername ? `@${record.submitterUsername}` : undefined);
 }
 
-function shouldCreateCrowdRevision(record: CateoProcedureFeedbackRecord): boolean {
-  return record.userAction === "reject" || record.rating !== "helpful";
-}
-
 export function listProcedureFeedback(status?: CateoProcedureFeedbackStatus): CateoProcedureFeedbackRecord[] {
   return loadStore().items
     .filter((item) => !status || item.status === status)
@@ -72,93 +68,15 @@ export function listProcedureFeedbackForConversation(conversationId: string): Ca
   return listProcedureFeedback().filter((item) => item.conversationId === conversationId);
 }
 
-function buildDecisionNote(record: CateoProcedureFeedbackRecord, note: string | undefined): string {
-  const details = [
-    `Feedback ${record.feedbackId}`,
-    `rating=${record.rating}`,
-    record.partNumber ? `part=${record.partNumber}` : undefined,
-    record.issueType ? `issue=${record.issueType}` : undefined,
-    record.businessType ? `business=${record.businessType}` : undefined,
-    contributorLabel(record) ? `submittedBy=${contributorLabel(record)}` : undefined,
-    `comments=${record.comments}`,
-  ].filter(Boolean).join(" | ");
-  return note?.trim() ? `${note.trim()} | ${details}` : details;
-}
-
-function reviseArtifactForFeedback(artifact: CateoArtifactRecord, record: CateoProcedureFeedbackRecord, actor: string, note: string | undefined, requestId?: string) {
-  const latest = artifact.revisions.at(-1);
-  if (!latest) {
-    return null;
-  }
-  const now = new Date().toISOString();
-  const metadata = latest.metadata
-    ? {
-        ...latest.metadata,
-        taxonomyTags: unique([...latest.metadata.taxonomyTags, "feedback-reviewed", record.rating, record.issueType, record.businessType]),
-        analytics: {
-          ...latest.metadata.analytics,
-          estimatedRevisionCount: latest.revisionNumber + 1,
-        },
-        documentControl: {
-          ...latest.metadata.documentControl,
-          changeReason: `Crowdsource feedback ${record.feedbackId} applied to initially AI-generated output`,
-        },
-      }
-    : latest.metadata;
-
-  const updated = createRevision({
-    record: artifact,
-    createdBy: actor,
-    summary: latest.summary,
-    approvalState: latest.approvalState,
-    content: latest.content,
-    note: buildDecisionNote(record, note),
-    signoffs: [
-      ...latest.signoffs,
-      {
-        actor,
-        role: "crowdsource-feedback",
-        meaning: "User-submitted feedback was applied to the AI-generated artifact lineage.",
-        state: latest.approvalState,
-        signedAt: now,
-      },
-    ],
-    provenance: {
-      ...latest.provenance,
-      createdAt: now,
-      createdBy: actor,
-      requestId,
-    },
-    metadata,
-  });
-
-  const revision = updated.revisions.at(-1);
-  if (!revision) {
-    return null;
-  }
-  return {
-    artifactId: updated.artifactId,
-    revisionId: revision.revisionId,
-    revisionNumber: revision.revisionNumber,
-  };
-}
-
 function finalizeFeedbackRecord(args: {
   current: CateoProcedureFeedbackRecord;
   action: "approve" | "reject";
   actor: string;
   note?: string;
   requestId?: string;
-  applyRevision?: boolean;
 }): CateoProcedureFeedbackRecord {
   const { current, action, actor, note, requestId } = args;
-  const releasedRevisionRefs = action === "approve" && args.applyRevision
-    ? current.artifactIds
-        .map((artifactId) => loadArtifactRecord(artifactId))
-        .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact))
-        .map((artifact) => reviseArtifactForFeedback(artifact, current, actor, note, requestId))
-        .filter((entry): entry is NonNullable<ReturnType<typeof reviseArtifactForFeedback>> => Boolean(entry))
-    : [];
+  const releasedRevisionRefs: CateoProcedureFeedbackDecision["releasedRevisionRefs"] = [];
 
   const now = new Date().toISOString();
   const decision: CateoProcedureFeedbackDecision = {
@@ -185,9 +103,9 @@ function finalizeFeedbackRecord(args: {
   appendAuditEvent({
     actor: action === "approve" ? "system" : "operator",
     category: "cateo_feedback",
-    action: action === "approve" && actor === AUTO_APPLY_ACTOR ? "auto-apply" : action,
+    action,
     outcome: "success",
-    message: `Feedback ${current.feedbackId} ${action === "approve" && actor === AUTO_APPLY_ACTOR ? "auto-applied" : `${action}d`}`,
+    message: `Feedback ${current.feedbackId} ${action}d`,
     requestId,
     metadata: {
       feedbackId: current.feedbackId,
@@ -218,11 +136,18 @@ export function submitProcedureFeedback(input: {
   systemName?: string;
   partNumber?: string;
   issueType?: string;
+  idempotencyKey?: string;
 }, requestId?: string): CateoProcedureFeedbackRecord {
   const now = new Date().toISOString();
   const store = loadStore();
+  const idempotencyKey = input.idempotencyKey?.trim();
+  const existing = idempotencyKey ? store.items.find((item) => item.idempotencyKey === idempotencyKey && item.conversationId === input.conversationId) : undefined;
+  if (existing) {
+    return existing;
+  }
   const baseRecord: CateoProcedureFeedbackRecord = {
     feedbackId: crypto.randomUUID(),
+    idempotencyKey,
     conversationId: input.conversationId,
     caseId: input.caseId,
     artifactIds: unique(input.artifactIds),
@@ -257,20 +182,27 @@ export function submitProcedureFeedback(input: {
     ]),
   };
 
-  const autoApplyNote = [
-    "Applied automatically from user-submitted feedback against the initially AI-generated Cateo output.",
-    contributorLabel(baseRecord) ? `Contributor: ${contributorLabel(baseRecord)}.` : undefined,
-    baseRecord.requestReevaluation ? "A full reevaluation was requested from the same conversation context." : undefined,
-  ].filter(Boolean).join(" ");
-
-  const record = finalizeFeedbackRecord({
-    current: baseRecord,
-    action: "approve",
-    actor: AUTO_APPLY_ACTOR,
-    note: autoApplyNote,
-    requestId,
-    applyRevision: shouldCreateCrowdRevision(baseRecord),
-  });
+  const record = baseRecord;
+  if (record.userAction === "reject") {
+    const caseRecord = loadCaseRecord(record.caseId);
+    if (caseRecord) {
+      const artifacts = record.artifactIds
+        .map((artifactId) => loadArtifactRecord(artifactId))
+        .filter((artifact): artifact is CateoArtifactRecord => Boolean(artifact));
+      recordCustomerRejection({
+        caseRecord,
+        artifacts,
+        actorId: record.userId || record.requesterId || "anonymous-customer",
+        actorDisplayName: contributorLabel(record) || "Customer",
+        reason: record.comments,
+        idempotencyKey: idempotencyKey || `feedback:${record.feedbackId}`,
+      });
+      if (caseRecord.interaction) {
+        caseRecord.interaction = { ...caseRecord.interaction, releaseStatus: "pending-engineer-review", requiresEngineerReview: true };
+      }
+      saveCaseRecord(caseRecord);
+    }
+  }
 
   store.items = [record, ...store.items].slice(0, 5000);
   store.updatedAt = now;
@@ -322,7 +254,6 @@ export function reviewProcedureFeedback(input: {
     actor: input.actor,
     note: input.note,
     requestId,
-    applyRevision: input.action === "approve",
   });
 
   store.items[index] = updated;

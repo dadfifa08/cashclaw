@@ -455,6 +455,85 @@ describe("Cateo site bridge", () => {
     });
     expect(foreignLookup.status).toBe(404);
   });
+
+  it("returns a resumable customer transcript without internal case, job, or artifact data", async () => {
+    ({ server, baseUrl } = await bootBridge());
+    const conversationId = "conversation-customer-safe";
+    const input = {
+      symptomDescription: "The inspection station reports fault F-220.",
+      errorCode: "F-220",
+      partNumber: "MXR-2045-A1",
+      conversationContext: {
+        schemaVersion: "cateo-transcript-v1",
+        conversationId,
+        maxTurns: 16,
+        maxCharacters: 12000,
+        truncated: false,
+        turns: [],
+      },
+    };
+    const submit = await bridgeFetch(baseUrl, "/internal/cateo/jobs/assist", {
+      method: "POST",
+      contentType: "application/json",
+      clientId: "client-safe",
+      body: JSON.stringify(input),
+    });
+    const submitted = await submit.json() as { job: { jobId: string } };
+    let status = "";
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const poll = await bridgeFetch(baseUrl, `/internal/cateo/jobs/assist/${submitted.job.jobId}`, { clientId: "client-safe" });
+      const payload = await poll.json() as { job: { status: string } };
+      status = payload.job.status;
+      if (status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(status).toBe("completed");
+
+    const turnBody = JSON.stringify({
+      conversationId,
+      jobId: submitted.job.jobId,
+      promptText: input.symptomDescription,
+      clientMessageId: "client-message-safe-1",
+      input,
+    });
+    const queued = await bridgeFetch(baseUrl, "/internal/cateo/site/conversations/queue-turn", {
+      method: "POST",
+      contentType: "application/json",
+      clientId: "client-safe",
+      body: turnBody,
+    });
+    expect(queued.status).toBe(200);
+    const repeated = await bridgeFetch(baseUrl, "/internal/cateo/site/conversations/queue-turn", {
+      method: "POST",
+      contentType: "application/json",
+      clientId: "client-safe",
+      body: turnBody,
+    });
+    expect((await repeated.json() as { idempotent?: boolean }).idempotent).toBe(true);
+
+    const state = await bridgeFetch(baseUrl, `/internal/cateo/site/conversations/${conversationId}/customer`, { clientId: "client-safe" });
+    expect(state.status).toBe(200);
+    const customer = await state.json() as { conversation: { conversationId: string; status: string; messages: Array<{ role: string; text: string }> } };
+    expect(customer.conversation.conversationId).toBe(conversationId);
+    expect(customer.conversation.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(customer.conversation.messages[1]?.text).toMatch(/enough verified information/i);
+    expect(JSON.stringify(customer)).not.toMatch(/artifact|caseId|jobId|checkpoint|retrieval|embedding|promptVersion|confidence|approval|human-reviewed/i);
+
+    const resumed = await bridgeFetch(baseUrl, `/internal/cateo/site/conversations/${conversationId}/customer`, { clientId: "client-safe" });
+    expect(await resumed.json()).toEqual(customer);
+    const foreign = await bridgeFetch(baseUrl, `/internal/cateo/site/conversations/${conversationId}/customer`, { clientId: "client-foreign" });
+    expect(foreign.status).toBe(404);
+
+    const followUp = await bridgeFetch(baseUrl, `/internal/cateo/site/conversations/${conversationId}/follow-up-context`, { clientId: "client-safe" });
+    const followUpPayload = await followUp.json() as { followUp: { transcript: { turns: Array<{ role: string; content: string }> } } };
+    expect(followUpPayload.followUp.transcript.turns.map((turn) => turn.role)).toEqual(["user", "assistant"]);
+    expect(followUpPayload.followUp.transcript.turns[0]?.content).toContain("F-220");
+    const { listCaseCatalogRows, loadCaseRecord } = await import("../src/cateo/store.js");
+    const internalCase = loadCaseRecord(listCaseCatalogRows()[0]?.caseId ?? "");
+    expect(internalCase?.dynamicMetadata?.fields.errorCode.value).toBe("F-220");
+    expect(internalCase?.datasetCandidate?.state).toBe("UNREVIEWED");
+    expect(internalCase?.datasetCandidate?.eligibility).toEqual({ train: false, development: false, test: false });
+  });
 });
 
 

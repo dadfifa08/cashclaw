@@ -345,19 +345,54 @@ describe("Cateo internal API", () => {
     });
     expect(assist.status).toBe(200);
     const assistPayload = await assist.json() as {
+      caseId: string;
       summary: string;
-      interaction: { message: string; artifactCount: number; confidence: string };
+      interaction: { message: string; artifactCount: number; confidence: string; releaseStatus: string; requiresEngineerReview?: boolean };
       artifacts: Array<{ artifactId: string; revisions: Array<{ approvalState: string }> }>;
       context: { attachments: Array<{ width?: number; height?: number; kind: string }>; digitalTwin?: { status?: string } };
     };
     expect(assistPayload.summary).toBe(assistPayload.interaction.message);
     expect(assistPayload.interaction.message).toContain("Bearing wear");
     expect(assistPayload.interaction.artifactCount).toBeGreaterThan(1);
-    expect(assistPayload.artifacts[0]?.revisions[0]?.approvalState).toBe("reviewed");
+    expect(assistPayload.artifacts[0]?.revisions[0]?.approvalState).toBe("draft");
+    expect(assistPayload.interaction.releaseStatus).toBe("pending-engineer-review");
+    expect(assistPayload.interaction.requiresEngineerReview).toBe(true);
     expect(assistPayload.context.attachments[0]?.kind).toBe("image");
     expect(assistPayload.context.attachments[0]?.width).toBe(1);
     expect(assistPayload.context.attachments[0]?.height).toBe(1);
     expect(assistPayload.context.digitalTwin?.status).toBe("pass");
+
+    const { submitProcedureFeedback, reviewProcedureFeedback } = await import("../src/cateo/feedback.js");
+    const { loadArtifactRecord, loadCaseRecord } = await import("../src/cateo/store.js");
+    const artifactIds = assistPayload.artifacts.map((artifact) => artifact.artifactId);
+    const revisionCountsBeforeFeedback = artifactIds.map((id) => loadArtifactRecord(id)?.revisions.length);
+    const feedback = submitProcedureFeedback({
+      conversationId: "conversation-feedback-test",
+      caseId: assistPayload.caseId,
+      artifactIds,
+      requesterId: "requester-feedback",
+      rating: "needs-correction",
+      comments: "The first action is unsafe for this configuration.",
+      userAction: "reject",
+      idempotencyKey: "feedback-request-1",
+    });
+    expect(feedback.status).toBe("pending-review");
+    expect(loadCaseRecord(assistPayload.caseId)?.releaseControl?.state).toBe("REJECTED");
+    expect(artifactIds.map((id) => loadArtifactRecord(id)?.revisions.length)).toEqual(revisionCountsBeforeFeedback);
+    const repeatedFeedback = submitProcedureFeedback({
+      conversationId: "conversation-feedback-test",
+      caseId: assistPayload.caseId,
+      artifactIds,
+      requesterId: "requester-feedback",
+      rating: "needs-correction",
+      comments: "The first action is unsafe for this configuration.",
+      userAction: "reject",
+      idempotencyKey: "feedback-request-1",
+    });
+    expect(repeatedFeedback.feedbackId).toBe(feedback.feedbackId);
+    reviewProcedureFeedback({ feedbackId: feedback.feedbackId, action: "approve", actor: "Feedback Administrator", note: "Feedback triaged; content still requires revision." });
+    expect(loadCaseRecord(assistPayload.caseId)?.releaseControl?.state).toBe("REJECTED");
+    expect(artifactIds.map((id) => loadArtifactRecord(id)?.revisions.length)).toEqual(revisionCountsBeforeFeedback);
 
     const artifactId = assistPayload.artifacts[0]?.artifactId;
     const reviseBody = JSON.stringify({ artifactId, editor: "qa-reviewer", note: "Added clarification", contentPatch: { followUpActions: ["Route to QA", "Confirm lubrication state"] } });

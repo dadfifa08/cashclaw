@@ -359,6 +359,27 @@ export interface CateoAttachmentEvidence {
   notes: string[];
 }
 
+export type CateoConversationTurnRole = "user" | "assistant" | "system" | "tool";
+export type CateoConversationTurnKind = "request" | "instruction" | "clarification" | "observation" | "correction" | "system" | "tool-result";
+
+export interface CateoConversationContextTurn {
+  messageId: string;
+  role: CateoConversationTurnRole;
+  kind: CateoConversationTurnKind;
+  content: string;
+  occurredAt: number;
+}
+
+export interface CateoConversationContext {
+  schemaVersion: "cateo-transcript-v1";
+  conversationId: string;
+  maxTurns: number;
+  maxCharacters: number;
+  truncated: boolean;
+  turns: CateoConversationContextTurn[];
+  pendingClarification?: string;
+}
+
 export interface CateoAssistInput {
   title?: string;
   query?: string;
@@ -387,6 +408,8 @@ export interface CateoAssistInput {
     version?: string;
     taskClass?: CateoTaskClass;
   };
+  /** Server-assembled only. Browser-submitted transcripts are never authoritative. */
+  conversationContext?: CateoConversationContext;
 }
 
 export interface CateoDigitalTwinDimensionResult {
@@ -827,6 +850,118 @@ export interface CateoCaseReviewWorkflow {
   quality: CateoQualityReviewRecord;
 }
 
+export type CateoReleaseState = "UNREVIEWED" | "TECHNICAL_REVIEWED" | "REJECTED" | "APPROVED";
+export type CateoGroundingStatus = "MISSING" | "PARTIAL" | "VERIFIED";
+
+export interface CateoControlledSourceReference {
+  sourceId: string;
+  revision: string;
+  locator?: string;
+  rightsClassification: "rights-cleared" | "licensed" | "customer-authorized";
+}
+
+export interface CateoReleaseTransition {
+  transitionId: string;
+  idempotencyKey: string;
+  actorId: string;
+  actorDisplayName: string;
+  actorRole: string;
+  occurredAt: string;
+  priorState: CateoReleaseState | null;
+  newState: CateoReleaseState;
+  reason: string;
+  contentHash: string;
+  artifactRevisionIds: string[];
+  policyVersion: string;
+  schemaVersion: string;
+  promptVersion?: string;
+  retrievalVersion?: string;
+  modelVersions: string[];
+}
+
+export interface CateoCaseReleaseControl {
+  schemaVersion: "cateo-release-control-v1";
+  policyVersion: string;
+  state: CateoReleaseState;
+  version: number;
+  currentContentHash: string;
+  rejectedContentHashes: string[];
+  sourceGrounding: {
+    status: CateoGroundingStatus;
+    sources: CateoControlledSourceReference[];
+  };
+  technicalReview?: {
+    actorId: string;
+    actorDisplayName: string;
+    contentHash: string;
+    reviewedAt: string;
+  };
+  qualityApproval?: {
+    actorId: string;
+    actorDisplayName: string;
+    contentHash: string;
+    approvedAt: string;
+  };
+  transitions: CateoReleaseTransition[];
+  processedIdempotencyKeys: string[];
+}
+
+export type CateoMetadataStatus = "UNKNOWN" | "PROVISIONAL" | "CONFIRMED" | "CONFLICTED" | "NOT_APPLICABLE";
+export type CateoMetadataSource = "USER_STATED" | "USER_CORRECTED" | "DOCUMENT_GROUNDED" | "SYSTEM_OBSERVED" | "MODEL_INFERRED";
+
+export interface CateoMetadataHistoryEntry {
+  value: unknown;
+  status: CateoMetadataStatus;
+  source: CateoMetadataSource;
+  sourceMessageId?: string;
+  timestamp: string;
+  version: number;
+  confidence?: number;
+  supersededAt?: string;
+  reason?: string;
+}
+
+export interface CateoCaseMetadataField {
+  value: unknown;
+  status: CateoMetadataStatus;
+  source: CateoMetadataSource;
+  sourceMessageId?: string;
+  timestamp: string;
+  version: number;
+  confidence?: number;
+  correctionHistory: CateoMetadataHistoryEntry[];
+  conflictingValues?: unknown[];
+}
+
+export interface CateoDynamicCaseMetadata {
+  schemaVersion: "cateo-dynamic-case-metadata-v1";
+  version: number;
+  updatedAt: string;
+  fields: Record<string, CateoCaseMetadataField>;
+  processedMessageIds: string[];
+  pendingClarification?: string;
+}
+
+export interface CateoDatasetCandidate {
+  schemaVersion: "cateo-dataset-candidate-v1";
+  candidateId: string;
+  state: "UNREVIEWED" | "REJECTED" | "APPROVED";
+  createdAt: string;
+  updatedAt: string;
+  conversationId?: string;
+  caseId: string;
+  instructionRevisionIds: string[];
+  sourceIds: string[];
+  sourceRevisions: string[];
+  deidentificationStatus: "NOT_REVIEWED" | "REVIEWED";
+  eligibility: {
+    train: boolean;
+    development: boolean;
+    test: boolean;
+  };
+  operationalOutcome?: "UNKNOWN" | "RESOLVED" | "UNRESOLVED" | "ESCALATED";
+}
+
 export interface CateoArtifactRevision {
   revisionId: string;
   revisionNumber: number;
@@ -877,6 +1012,9 @@ export interface CateoCaseRecord {
   usage?: CateoUsageSummary;
   trace: CateoReasoningTrace;
   reviewWorkflow?: CateoCaseReviewWorkflow;
+  releaseControl?: CateoCaseReleaseControl;
+  dynamicMetadata?: CateoDynamicCaseMetadata;
+  datasetCandidate?: CateoDatasetCandidate;
 }
 
 export interface CateoRoutingDecision {
@@ -1168,6 +1306,7 @@ export interface CateoProcedureFeedbackDecision {
 
 export interface CateoProcedureFeedbackRecord {
   feedbackId: string;
+  idempotencyKey?: string;
   conversationId: string;
   caseId: string;
   artifactIds: string[];
