@@ -16,6 +16,7 @@ const CUSTOMER_FIELD_LABELS: Record<string, string> = {
   symptom: "the reported problem",
   errorCode: "the error code",
   instrument: "the instrument or model",
+  occurrenceContext: "when the problem occurs",
   manufacturer: "the manufacturer",
   module: "the module or subsystem",
   applicableVersion: "the applicable software or hardware version",
@@ -62,6 +63,24 @@ function explicitCorrection(text: string): boolean {
   return /^(?:correction\b|actually\b|to correct that\b|i meant\b|not\b)/i.test(text.trim());
 }
 
+function naturalInstrumentReference(text: string): string | undefined {
+  const value = find(
+    text,
+    /\bmy\s+([A-Z0-9][A-Z0-9 ._/-]{0,80}?)\s+(?:(?:is|went)\s+(?:down|offline|failing|broken|stopped|not\s+working)|(?:has|gives|shows|reports)\b)/i,
+  );
+  if (!value) return undefined;
+
+  const genericTerms = new Set(["analyzer", "device", "equipment", "instrument", "machine", "system"]);
+  return genericTerms.has(value.toLowerCase()) ? undefined : value;
+}
+
+function occurrenceContext(text: string): string | undefined {
+  return find(
+    text,
+    /\b(?:during|while|at)\s+((?:initial\s+)?(?:startup|start-up|boot(?:up)?|initialization|shutdown|calibration|self-test|operation|processing|maintenance))\b/i,
+  );
+}
+
 function extractCandidates(text: string, input?: CateoAssistInput): CandidateValue[] {
   const candidates: CandidateValue[] = [];
   const add = (key: string, value: unknown, options: Partial<CandidateValue> = {}) => {
@@ -74,7 +93,8 @@ function extractCandidates(text: string, input?: CateoAssistInput): CandidateVal
     : undefined;
   add("symptom", correctedSymptom ?? (explicitCorrection(text) ? undefined : clean(input?.symptomDescription) ?? clean(text)));
   add("errorCode", clean(input?.errorCode) ?? find(text, /\b(?:error|alarm|fault|code)(?:\s+code)?\s*(?:is|=|:|#)?\s*([A-Z][A-Z0-9._-]*\d[A-Z0-9._-]*|\d{2,}[A-Z0-9._-]*)\b/i));
-  add("instrument", clean(input?.machine?.model) ?? clean(input?.asset?.model) ?? find(text, /\b(?:(?:instrument|machine|analyzer|equipment)(?:\s+(?:model|type))?|model)\s*(?:is|=|:)\s*([A-Z0-9][A-Z0-9 ._/-]{1,80})/i));
+  add("instrument", clean(input?.machine?.model) ?? clean(input?.asset?.model) ?? find(text, /\b(?:(?:instrument|machine|analyzer|equipment)(?:\s+(?:model|type))?|model)\s*(?:is|=|:)\s*([A-Z0-9][A-Z0-9 ._/-]{1,80})/i) ?? naturalInstrumentReference(text));
+  add("occurrenceContext", occurrenceContext(text));
   add("manufacturer", clean(input?.machine?.manufacturer) ?? find(text, /\b(?:manufacturer|make)\s*(?:is|=|:)?\s*([A-Z0-9][A-Z0-9 ._/-]{1,60})/i));
   add("module", find(text, /\b(?:module|subsystem|assembly)\s*(?:is|=|:)?\s*([A-Z0-9][A-Z0-9 ._/-]{1,80})/i));
   add("applicableVersion", find(text, /\b(?:software|firmware|hardware|version|revision|rev)\s*(?:version|is|=|:)?\s*([A-Z0-9][A-Z0-9._/-]{0,40})/i));

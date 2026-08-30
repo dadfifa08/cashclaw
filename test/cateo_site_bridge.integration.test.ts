@@ -460,7 +460,7 @@ describe("Cateo site bridge", () => {
     ({ server, baseUrl } = await bootBridge());
     const conversationId = "conversation-customer-safe";
     const input = {
-      symptomDescription: "The inspection station reports fault F-220.",
+      symptomDescription: "My Alinity i is down. It reports fault F-220 during startup.",
       errorCode: "F-220",
       partNumber: "MXR-2045-A1",
       conversationContext: {
@@ -525,9 +525,19 @@ describe("Cateo site bridge", () => {
     expect(foreign.status).toBe(404);
 
     const followUp = await bridgeFetch(baseUrl, `/internal/cateo/site/conversations/${conversationId}/follow-up-context`, { clientId: "client-safe" });
-    const followUpPayload = await followUp.json() as { followUp: { transcript: { turns: Array<{ role: string; content: string }> } } };
+    const followUpPayload = await followUp.json() as {
+      followUp: {
+        transcript: { turns: Array<{ role: string; content: string }> };
+        preserved: { machineModel?: string; errorCode?: string; occurrenceContext?: string };
+      };
+    };
     expect(followUpPayload.followUp.transcript.turns.map((turn) => turn.role)).toEqual(["user", "assistant"]);
     expect(followUpPayload.followUp.transcript.turns[0]?.content).toContain("F-220");
+    expect(followUpPayload.followUp.preserved).toMatchObject({
+      machineModel: "Alinity i",
+      errorCode: "F-220",
+      occurrenceContext: "startup",
+    });
     const { listCaseCatalogRows, loadCaseRecord } = await import("../src/cateo/store.js");
     const internalCase = loadCaseRecord(listCaseCatalogRows()[0]?.caseId ?? "");
     expect(internalCase?.dynamicMetadata?.fields.errorCode.value).toBe("F-220");

@@ -3,6 +3,33 @@ import { accumulateConversationMetadata, attachCaseMetadataAndDatasetCandidate }
 import type { CateoArtifactRecord, CateoCaseRecord } from "../src/cateo/types.js";
 
 describe("conversation-driven case metadata", () => {
+  it("extracts the equipment and occurrence context from a natural customer report", () => {
+    const metadata = accumulateConversationMetadata({
+      messageId: "message-natural-report",
+      text: "My Alinity i is down. It gives me error code 3500 during startup.",
+      input: { symptomDescription: "My Alinity i is down. It gives me error code 3500 during startup." },
+      timestamp: "2026-08-29T10:00:00.000Z",
+    });
+
+    expect(metadata.fields.instrument).toMatchObject({
+      value: "Alinity i",
+      status: "CONFIRMED",
+      source: "USER_STATED",
+      sourceMessageId: "message-natural-report",
+      version: 1,
+      confidence: 1,
+    });
+    expect(metadata.fields.occurrenceContext).toMatchObject({
+      value: "startup",
+      status: "CONFIRMED",
+      source: "USER_STATED",
+      sourceMessageId: "message-natural-report",
+      version: 1,
+      confidence: 1,
+    });
+    expect(metadata.fields.errorCode.value).toBe("3500");
+  });
+
   it("accumulates structured facts and observations idempotently across turns", () => {
     const first = accumulateConversationMetadata({
       messageId: "message-1",

@@ -1131,12 +1131,12 @@ export async function findMatchingValidatedProcedure(
   const actor = options.actor ?? "system";
   const requester = options.requester ? { ...options.requester } : undefined;
   const normalizedInput = normalizeAssistInput(input);
-  const mediaEnhanced = await enrichAssistInputWithOpenAIMedia(config, normalizedInput, options.requestId);
-  const enrichedInput = mediaEnhanced.input;
   const caseId = crypto.randomUUID();
-  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(enrichedInput));
-  const attachmentEvidence = ingestMediaAttachments(caseId, enrichedInput.attachments, options.requestId);
-  const partResolution = await resolveCateoPart(config, sanitizedInput, options.requestId);
+  // Reuse lookup is a side-effect-free preflight. Media analysis and evidence
+  // ingestion belong to the accepted generation job so they occur only once.
+  const sanitizedInput = normalizeAssistInput(sanitizeAssistInputForPersistence(normalizedInput));
+  const attachmentEvidence: ReturnType<typeof ingestMediaAttachments> = [];
+  const partResolution = await resolveCateoPart(config, sanitizedInput, options.requestId, { allowExternalResearch: false });
   if (partResolution.needsClarification) {
     return null;
   }

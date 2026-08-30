@@ -258,6 +258,12 @@ function buildConversationState(conversation: NonNullable<ReturnType<typeof load
 }
 function buildConversationFollowUpContext(conversation: NonNullable<ReturnType<typeof loadConversationRecord>>, viewer: { requesterId?: string; userId?: string; profileId?: string; admin?: boolean }) {
   const caseRecord = latestConversationCase(conversation);
+  const metadataString = (key: string, fallback?: string) => {
+    const field = caseRecord?.dynamicMetadata?.fields[key];
+    if (field?.status === "CONFLICTED") return undefined;
+    if (typeof field?.value === "string" && field.value.trim()) return field.value.trim();
+    return fallback;
+  };
   const artifacts = (caseRecord?.artifacts ?? [])
     .map((artifactId) => loadArtifactRecord(artifactId))
     .filter((artifact): artifact is NonNullable<ReturnType<typeof loadArtifactRecord>> => Boolean(artifact))
@@ -275,11 +281,13 @@ function buildConversationFollowUpContext(conversation: NonNullable<ReturnType<t
       partNumber: caseRecord?.context.partResolution?.partNumber ?? caseRecord?.input.partNumber,
       businessType: caseRecord?.input.businessType ?? caseRecord?.context.businessType,
       issueType: caseRecord?.context.issueType ?? caseRecord?.input.issueType ?? caseRecord?.input.errorCode,
+      errorCode: metadataString("errorCode", caseRecord?.input.errorCode ?? caseRecord?.context.failureCode?.code),
       assetId: caseRecord?.context.asset?.assetId,
       assetType: caseRecord?.context.asset?.assetType,
-      machineModel: caseRecord?.context.machine?.model,
+      machineModel: metadataString("instrument", caseRecord?.input.machine?.model ?? caseRecord?.context.machine?.model),
       manufacturer: caseRecord?.context.machine?.manufacturer,
       serialNumber: caseRecord?.context.machine?.serialNumber,
+      occurrenceContext: metadataString("occurrenceContext"),
       workOrderId: caseRecord?.context.workOrder?.workOrderId,
       geography: caseRecord?.context.machine?.geography ?? caseRecord?.context.asset?.geography,
       responseDetail: caseRecord?.input.responseDetail,
